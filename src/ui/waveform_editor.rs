@@ -18,7 +18,7 @@ impl WaveformEditor {
 
         // Background
         painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 14, 20));
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Theme::BORDER));
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Theme::BORDER), egui::StrokeKind::Outside);
 
         if cue.waveform.is_empty() || cue.duration_secs <= 0.0 {
             painter.text(

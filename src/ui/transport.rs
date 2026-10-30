@@ -32,7 +32,7 @@ impl TransportBar {
                         .strong(),
                 )
                 .fill(Theme::GO_BTN)
-                .rounding(6.0),
+                .corner_radius(6.0),
             );
             if go_resp.clicked() {
                 action = Some(TransportAction::Go);
@@ -47,7 +47,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("⏹").size(18.0))
                         .fill(Theme::STOP_BTN)
-                        .rounding(6.0),
+                        .corner_radius(6.0),
                 )
                 .on_hover_text("Stop selected (S)")
                 .clicked()
@@ -61,7 +61,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("⏸").size(18.0))
                         .fill(Theme::PAUSE_BTN)
-                        .rounding(6.0),
+                        .corner_radius(6.0),
                 )
                 .on_hover_text("Pause selected (P)")
                 .clicked()
@@ -75,7 +75,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("▶").size(18.0))
                         .fill(Color32::from_rgb(40, 100, 60))
-                        .rounding(6.0),
+                        .corner_radius(6.0),
                 )
                 .on_hover_text("Resume selected (R)")
                 .clicked()
@@ -97,7 +97,7 @@ impl TransportBar {
                                 RichText::new("ALL STOP").color(Theme::STOP_BTN).size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 20, 20))
-                            .rounding(4.0),
+                            .corner_radius(4.0),
                         )
                         .on_hover_text("Stop all cues (Escape)")
                         .clicked()
@@ -111,7 +111,7 @@ impl TransportBar {
                                 RichText::new("ALL PAUSE").color(Theme::PAUSE_BTN).size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 40, 10))
-                            .rounding(4.0),
+                            .corner_radius(4.0),
                         )
                         .on_hover_text("Pause all (Shift+P)")
                         .clicked()
@@ -125,7 +125,7 @@ impl TransportBar {
                                 RichText::new("ALL RESUME").color(Theme::ACCENT2).size(11.0),
                             )
                             .fill(Color32::from_rgb(15, 50, 30))
-                            .rounding(4.0),
+                            .corner_radius(4.0),
                         )
                         .on_hover_text("Resume all (Shift+R)")
                         .clicked()

@@ -1,6 +1,6 @@
 // Visual theme — QLab-inspired dark design
 
-use egui::{Color32, FontId, Rounding, Shadow, Stroke, Style, Visuals};
+use egui::{Color32, CornerRadius, Shadow, Stroke, Style};
 
 pub struct Theme;
 
@@ -31,14 +31,14 @@ impl Theme {
     pub fn apply(ctx: &egui::Context) {
         let mut style = Style::default();
 
-        // Rounding
-        style.visuals.window_rounding   = Rounding::same(8.0);
-        style.visuals.menu_rounding     = Rounding::same(6.0);
-        style.visuals.widgets.noninteractive.rounding = Rounding::same(4.0);
-        style.visuals.widgets.inactive.rounding  = Rounding::same(4.0);
-        style.visuals.widgets.hovered.rounding   = Rounding::same(4.0);
-        style.visuals.widgets.active.rounding    = Rounding::same(4.0);
-        style.visuals.widgets.open.rounding      = Rounding::same(4.0);
+        // Corner radius (egui 0.31: Rounding → CornerRadius, uses u8)
+        let cr4 = CornerRadius::same(4);
+        style.visuals.window_corner_radius = CornerRadius::same(8);
+        style.visuals.widgets.noninteractive.corner_radius = cr4;
+        style.visuals.widgets.inactive.corner_radius  = cr4;
+        style.visuals.widgets.hovered.corner_radius   = cr4;
+        style.visuals.widgets.active.corner_radius    = cr4;
+        style.visuals.widgets.open.corner_radius      = cr4;
 
         // Colors
         style.visuals.dark_mode = true;
@@ -47,29 +47,28 @@ impl Theme {
         style.visuals.extreme_bg_color   = Self::BG_DARK;
         style.visuals.faint_bg_color     = Self::BG_ROW_ALT;
         style.visuals.window_shadow      = Shadow::NONE;
-        style.visuals.window_stroke      = Stroke::new(1.0, Self::BORDER);
+        style.visuals.window_stroke      = Stroke::new(1.0_f32, Self::BORDER);
 
         // Widget colors
-        style.visuals.widgets.noninteractive.bg_fill  = Self::BG_ROW;
-        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Self::TEXT_DIM);
+        style.visuals.widgets.noninteractive.bg_fill   = Self::BG_ROW;
+        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Self::TEXT_DIM);
         style.visuals.widgets.inactive.bg_fill         = Self::BG_ROW;
-        style.visuals.widgets.inactive.fg_stroke       = Stroke::new(1.0, Self::TEXT);
+        style.visuals.widgets.inactive.fg_stroke       = Stroke::new(1.0_f32, Self::TEXT);
         style.visuals.widgets.hovered.bg_fill          = Color32::from_rgb(50, 50, 65);
-        style.visuals.widgets.hovered.fg_stroke        = Stroke::new(1.5, Self::ACCENT);
+        style.visuals.widgets.hovered.fg_stroke        = Stroke::new(1.5_f32, Self::ACCENT);
         style.visuals.widgets.active.bg_fill           = Self::BG_SELECTED;
-        style.visuals.widgets.active.fg_stroke         = Stroke::new(1.5, Self::ACCENT);
+        style.visuals.widgets.active.fg_stroke         = Stroke::new(1.5_f32, Self::ACCENT);
         style.visuals.selection.bg_fill                = Self::BG_SELECTED;
-        style.visuals.selection.stroke                 = Stroke::new(1.0, Self::ACCENT);
+        style.visuals.selection.stroke                 = Stroke::new(1.0_f32, Self::ACCENT);
 
-        // Spacing
-        style.spacing.item_spacing      = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding    = egui::vec2(10.0, 5.0);
-        style.spacing.window_margin     = egui::Margin::same(8.0);
+        // Spacing (egui 0.31: Margin::same/symmetric take i8)
+        style.spacing.item_spacing   = egui::vec2(6.0, 4.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.window_margin  = egui::Margin::same(8_i8);
 
         ctx.set_style(style);
 
-        // Typography
-        let mut fonts = egui::FontDefinitions::default();
+        let fonts = egui::FontDefinitions::default();
         ctx.set_fonts(fonts);
     }
 }
