@@ -1,9 +1,9 @@
-// MIDI input — listens for Note On, CC, SysEx from connected controllers
+// src/midi/input.rs — MIDI вход и MIDI выход для отправки управляющих команд и Raw Hex
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use midir::{MidiInput, MidiInputConnection};
+use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MidiMessage {
@@ -45,16 +45,10 @@ impl MidiInputManager {
             .filter_map(|p| midi_in.port_name(p).ok())
             .collect();
 
-        info!("MIDI ports: {:?}", names);
-
-        // Connect to first available port
         let port = match ports.first() {
             Some(p) => p.clone(),
             None => return (names, None),
         };
-
-        let port_name = midi_in.port_name(&port).unwrap_or_default();
-        info!("Connecting to MIDI port: {port_name}");
 
         let conn = midi_in
             .connect(
@@ -78,6 +72,66 @@ impl MidiInputManager {
             out.push(m);
         }
         out
+    }
+}
+
+pub struct MidiOutputManager {
+    pub port_names: Vec<String>,
+    pub current_port: Option<String>,
+    connection: Option<MidiOutputConnection>,
+}
+
+impl MidiOutputManager {
+    pub fn new() -> Self {
+        let mut mgr = Self {
+            port_names: Vec::new(),
+            current_port: None,
+            connection: None,
+        };
+        mgr.refresh_and_connect(None);
+        mgr
+    }
+
+    pub fn refresh_and_connect(&mut self, preferred_port: Option<&str>) {
+        let Ok(midi_out) = MidiOutput::new("CueLabs Output") else {
+            return;
+        };
+        let ports = midi_out.ports();
+        self.port_names = ports
+            .iter()
+            .filter_map(|p| midi_out.port_name(p).ok())
+            .collect();
+
+        let target_port = if let Some(pref) = preferred_port {
+            ports
+                .iter()
+                .find(|p| midi_out.port_name(p).ok().as_deref() == Some(pref))
+                .or_else(|| ports.first())
+        } else {
+            ports.first()
+        };
+
+        if let Some(p) = target_port {
+            let pname = midi_out.port_name(p).unwrap_or_default();
+            if let Ok(conn) = midi_out.connect(p, "cuelabs-out") {
+                info!("Connected MIDI Output: {}", pname);
+                self.current_port = Some(pname);
+                self.connection = Some(conn);
+            }
+        }
+    }
+
+    pub fn send_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if let Some(ref mut conn) = self.connection {
+            conn.send(bytes)
+                .map_err(|e| anyhow::anyhow!("MIDI send error: {e}"))?;
+        } else {
+            warn!("No MIDI Output port connected; bytes {:02X?} not sent", bytes);
+        }
+        Ok(())
     }
 }
 

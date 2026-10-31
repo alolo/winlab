@@ -1,4 +1,4 @@
-// Asset manager — copies audio files into project folder on save
+// src/project/asset_manager.rs — менеджер копирования аудио в папку assets проекта
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,6 @@ impl AssetManager {
         self.project_path = Some(path);
     }
 
-    /// Copy a file into project assets dir, return new path
     pub fn import_file(&self, src: &Path) -> Result<PathBuf> {
         let project_path = self
             .project_path
@@ -38,7 +37,7 @@ impl AssetManager {
         let dst = assets_dir.join(file_name);
 
         if dst == src {
-            return Ok(dst); // already in project folder
+            return Ok(dst);
         }
 
         if dst.exists() {
@@ -51,7 +50,7 @@ impl AssetManager {
         Ok(dst)
     }
 
-    /// Make path relative to project directory
+    #[allow(dead_code)]
     pub fn make_relative(&self, abs: &Path) -> PathBuf {
         if let Some(proj) = &self.project_path {
             if let Some(proj_dir) = proj.parent() {
@@ -63,7 +62,7 @@ impl AssetManager {
         abs.to_path_buf()
     }
 
-    /// Resolve relative path back to absolute
+    #[allow(dead_code)]
     pub fn resolve(&self, rel: &Path) -> PathBuf {
         if rel.is_absolute() {
             return rel.to_path_buf();

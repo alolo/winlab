@@ -1,5 +1,4 @@
-// Session report — auto-generated log of each playback session
-
+// src/export/session_report.rs — лог сессии воспроизведения
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -12,7 +11,7 @@ pub struct PlayEvent {
     pub cue_number: String,
     pub cue_name: String,
     pub duration_played_secs: f64,
-    pub action: String, // "Play", "Stop", "Pause", "Resume"
+    pub action: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

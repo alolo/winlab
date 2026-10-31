@@ -2,6 +2,3 @@
 
 pub mod input;
 pub mod mapping;
-
-pub use input::*;
-pub use mapping::*;

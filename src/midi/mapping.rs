@@ -1,5 +1,5 @@
 // MIDI CC mapping — maps MIDI messages to application actions
-
+#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;

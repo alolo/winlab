@@ -1,10 +1,9 @@
-// OSC server — listens for and sends OSC messages
+// src/osc/server.rs — OSC сервер для удаленного управления шоу
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rosc::{OscMessage, OscPacket, OscType};
-use std::net::{SocketAddrV4, UdpSocket};
-use std::str::FromStr;
+use std::net::UdpSocket;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -13,6 +12,7 @@ pub struct OscEvent {
     pub args: Vec<OscType>,
 }
 
+#[allow(dead_code)]
 pub struct OscServer {
     pub event_rx: Receiver<OscEvent>,
     pub send_tx: Sender<OscEvent>,
@@ -32,7 +32,6 @@ impl OscServer {
 
         let send_addr_clone = send_addr.clone();
 
-        // Receiver thread
         {
             let socket_recv = socket.try_clone()?;
             let tx = event_tx.clone();
@@ -56,7 +55,6 @@ impl OscServer {
             });
         }
 
-        // Sender thread
         {
             let send_socket = UdpSocket::bind("0.0.0.0:0")?;
             std::thread::spawn(move || {
@@ -90,6 +88,7 @@ impl OscServer {
         out
     }
 
+    #[allow(dead_code)]
     pub fn send(&self, addr: &str, args: Vec<OscType>) {
         let _ = self.send_tx.try_send(OscEvent {
             addr: addr.to_string(),

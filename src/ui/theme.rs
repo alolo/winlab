@@ -1,9 +1,8 @@
 // Visual theme — QLab-inspired dark design
-
 use egui::{Color32, CornerRadius, Shadow, Stroke, Style};
 
 pub struct Theme;
-
+#[allow(dead_code)]
 impl Theme {
     // Palette
     pub const BG_DARK: Color32      = Color32::from_rgb(18, 18, 22);
@@ -72,3 +71,5 @@ impl Theme {
         ctx.set_fonts(fonts);
     }
 }
+
+

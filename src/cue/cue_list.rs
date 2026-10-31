@@ -1,8 +1,8 @@
-// CueLabs — список кью
+// src/cue/cue_list.rs — список кью
 
+use crate::cue::{Cue, CueState, CueType};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::cue::{Cue, CueState, CueType, MidiMessageKind, GroupMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CueList {
@@ -12,7 +12,10 @@ pub struct CueList {
 
 impl CueList {
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), cues: vec![] }
+        Self {
+            name: name.to_string(),
+            cues: vec![],
+        }
     }
 
     pub fn add(&mut self, cue: Cue) {
@@ -45,7 +48,10 @@ impl CueList {
 
     pub fn pause_all(&mut self) {
         for c in &mut self.cues {
-            if c.state == CueState::Playing {
+            if matches!(
+                c.state,
+                CueState::Playing | CueState::FadingIn | CueState::FadingOut
+            ) {
                 c.state = CueState::Paused;
             }
         }
@@ -68,22 +74,36 @@ impl CueList {
 
     pub fn move_up(&mut self, id: Uuid) {
         if let Some(i) = self.cues.iter().position(|c| c.id == id) {
-            if i > 0 { self.cues.swap(i, i - 1); self.renumber(); }
+            if i > 0 {
+                self.cues.swap(i, i - 1);
+                self.renumber();
+            }
         }
     }
 
     pub fn move_down(&mut self, id: Uuid) {
         let len = self.cues.len();
         if let Some(i) = self.cues.iter().position(|c| c.id == id) {
-            if i + 1 < len { self.cues.swap(i, i + 1); self.renumber(); }
+            if i + 1 < len {
+                self.cues.swap(i, i + 1);
+                self.renumber();
+            }
         }
     }
 
-    /// Все аудиофайлы в проекте (для выбора target в Pause/Play/Stop/Fade)
-    pub fn audio_targets(&self) -> Vec<(Uuid, String)> {
-        self.cues.iter()
-            .filter(|c| matches!(c.cue_type, CueType::Audio))
-            .map(|c| (c.id, format!("{} — {}", c.number, c.name)))
+    /// Все аудио-кью в проекте (для выбора target в Play / Pause / Stop / Fade)
+    pub fn audio_targets(&self) -> Vec<(Uuid, String, std::path::PathBuf)> {
+        self.cues
+            .iter()
+            .filter(|c| matches!(&c.cue_type, CueType::Audio) || !c.file_path.as_os_str().is_empty())
+            .map(|c| {
+                let fname = c
+                    .file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("no file");
+                (c.id, format!("#{} — {} ({})", c.number, c.name, fname), c.file_path.clone())
+            })
             .collect()
     }
 }

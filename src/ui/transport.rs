@@ -1,4 +1,4 @@
-// Transport bar — GO, STOP, PAUSE buttons and master volume
+// src/ui/transport.rs — панель транспорта: GO, STOP, PAUSE и мастер-громкость
 
 use crate::ui::theme::Theme;
 use egui::*;
@@ -22,7 +22,7 @@ impl TransportBar {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
 
-            // GO button — big green
+            // Кнопка GO
             let go_resp = ui.add_sized(
                 [80.0, 44.0],
                 Button::new(
@@ -32,7 +32,7 @@ impl TransportBar {
                         .strong(),
                 )
                 .fill(Theme::GO_BTN)
-                .corner_radius(6.0),
+                .corner_radius(6_u8),
             );
             if go_resp.clicked() {
                 action = Some(TransportAction::Go);
@@ -47,7 +47,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("⏹").size(18.0))
                         .fill(Theme::STOP_BTN)
-                        .corner_radius(6.0),
+                        .corner_radius(6_u8),
                 )
                 .on_hover_text("Stop selected (S)")
                 .clicked()
@@ -61,7 +61,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("⏸").size(18.0))
                         .fill(Theme::PAUSE_BTN)
-                        .corner_radius(6.0),
+                        .corner_radius(6_u8),
                 )
                 .on_hover_text("Pause selected (P)")
                 .clicked()
@@ -75,7 +75,7 @@ impl TransportBar {
                     [60.0, 44.0],
                     Button::new(RichText::new("▶").size(18.0))
                         .fill(Color32::from_rgb(40, 100, 60))
-                        .corner_radius(6.0),
+                        .corner_radius(6_u8),
                 )
                 .on_hover_text("Resume selected (R)")
                 .clicked()
@@ -97,7 +97,7 @@ impl TransportBar {
                                 RichText::new("ALL STOP").color(Theme::STOP_BTN).size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 20, 20))
-                            .corner_radius(4.0),
+                            .corner_radius(4_u8),
                         )
                         .on_hover_text("Stop all cues (Escape)")
                         .clicked()
@@ -111,7 +111,7 @@ impl TransportBar {
                                 RichText::new("ALL PAUSE").color(Theme::PAUSE_BTN).size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 40, 10))
-                            .corner_radius(4.0),
+                            .corner_radius(4_u8),
                         )
                         .on_hover_text("Pause all (Shift+P)")
                         .clicked()
@@ -125,7 +125,7 @@ impl TransportBar {
                                 RichText::new("ALL RESUME").color(Theme::ACCENT2).size(11.0),
                             )
                             .fill(Color32::from_rgb(15, 50, 30))
-                            .corner_radius(4.0),
+                            .corner_radius(4_u8),
                         )
                         .on_hover_text("Resume all (Shift+R)")
                         .clicked()
@@ -139,10 +139,14 @@ impl TransportBar {
             ui.add(Separator::default().vertical());
             ui.add_space(8.0);
 
-            // Active cue indicator
+            // Индикатор активных кью
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                let color = if active_count > 0 { Theme::TEXT_ACTIVE } else { Theme::TEXT_DIM };
+                let color = if active_count > 0 {
+                    Theme::TEXT_ACTIVE
+                } else {
+                    Theme::TEXT_DIM
+                };
                 ui.label(
                     RichText::new(format!("● {active_count} active"))
                         .color(color)
@@ -150,7 +154,7 @@ impl TransportBar {
                 );
             });
 
-            // Master volume
+            // Мастер-громкость
             ui.add_space(12.0);
             ui.add(Separator::default().vertical());
             ui.add_space(8.0);
@@ -161,7 +165,7 @@ impl TransportBar {
                     Slider::new(master_vol, 0.0..=1.0)
                         .show_value(true)
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                        .text("")
+                        .text(""),
                 );
             });
         });

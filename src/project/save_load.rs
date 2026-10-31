@@ -1,10 +1,10 @@
-// Project file save/load (.cuelabs JSON format)
+// src/project/save_load.rs — сохранение и загрузка проектов .clabs
 
 use crate::cue::CueList;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSettings {
@@ -63,10 +63,12 @@ impl Project {
         Ok(project)
     }
 
+    #[allow(dead_code)]
     pub fn project_dir(path: &Path) -> Option<PathBuf> {
         path.parent().map(|p| p.to_path_buf())
     }
 
+    #[allow(dead_code)]
     pub fn assets_dir(project_path: &Path) -> PathBuf {
         let dir = project_path
             .parent()
