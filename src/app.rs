@@ -388,7 +388,14 @@ impl CueLabsApp {
     }
 
     fn handle_drag_drop(&mut self, dragged_id: Uuid, target_idx: usize) {
-        // 1) Если цель — группа, кладём туда как в папку
+        let Some(target_id) = self.cue_list.cues.get(target_idx).map(|c| c.id) else {
+            return;
+        };
+        if dragged_id == target_id {
+            return;
+        }
+
+        // 1) Если цель — сама папка группы, кладём dragged_id в конец этой группы
         let is_group = self
             .cue_list
             .cues
@@ -397,47 +404,72 @@ impl CueLabsApp {
             .unwrap_or(false);
 
         if is_group {
-            let group_id = self.cue_list.cues[target_idx].id;
-            if dragged_id == group_id {
-                return;
-            }
-
-            // Если уже в какой-то группе — вычищаем из старой
             for c in &mut self.cue_list.cues {
                 if let CueType::Group { children, .. } = &mut c.cue_type {
                     children.retain(|x| *x != dragged_id);
                 }
             }
-
-            // Добавляем в целевую
             if let Some(target) = self.cue_list.cues.get_mut(target_idx) {
                 if let CueType::Group { children, .. } = &mut target.cue_type {
                     children.push(dragged_id);
                 }
             }
-            self.expanded_groups.insert(group_id);
+            self.expanded_groups.insert(target_id);
+            self.cue_list.renumber();
             self.status_msg = "Added cue to group via drag-and-drop".to_string();
             return;
         }
 
-        // 2) Иначе — обычная перестановка
+        // 2) Проверяем, находится ли target_id внутри какой-либо группы
+        let parent_group_id = self.cue_list.cues.iter().find_map(|c| {
+            if let CueType::Group { children, .. } = &c.cue_type {
+                if children.contains(&target_id) {
+                    return Some(c.id);
+                }
+            }
+            None
+        });
+
+        // Сначала убираем dragged_id из всех групп
+        for c in &mut self.cue_list.cues {
+            if let CueType::Group { children, .. } = &mut c.cue_type {
+                children.retain(|x| *x != dragged_id);
+            }
+        }
+
+        if let Some(gid) = parent_group_id {
+            // Если уронили на элемент внутри группы — вставляем внутрь этой же группы на нужную позицию
+            if let Some(group_cue) = self.cue_list.find_mut(gid) {
+                if let CueType::Group { children, .. } = &mut group_cue.cue_type {
+                    let ins_pos = children
+                        .iter()
+                        .position(|&x| x == target_id)
+                        .unwrap_or(children.len());
+                    children.insert(ins_pos, dragged_id);
+                }
+            }
+            self.cue_list.renumber();
+            return;
+        }
+
+        // 3) Обычная перестановка на верхнем уровне
         if let Some(from_idx) = self.cue_list.cues.iter().position(|c| c.id == dragged_id) {
             let item = self.cue_list.cues.remove(from_idx);
-            let insert_idx = if target_idx > from_idx {
-                target_idx - 1
-            } else {
-                target_idx
-            };
+            let new_target_idx = self
+                .cue_list
+                .cues
+                .iter()
+                .position(|c| c.id == target_id)
+                .unwrap_or(self.cue_list.cues.len());
             self.cue_list
                 .cues
-                .insert(insert_idx.min(self.cue_list.cues.len()), item);
+                .insert(new_target_idx.min(self.cue_list.cues.len()), item);
             self.cue_list.renumber();
         }
     }
 
     fn next_cue_id(&self, current_id: Uuid) -> Option<Uuid> {
-        let pos = self.cue_list.cues.iter().position(|c| c.id == current_id)?;
-        self.cue_list.cues.get(pos + 1).map(|c| c.id)
+        self.cue_list.next_in_structure(current_id)
     }
 
     fn poll_pending_triggers(&mut self) {
@@ -606,37 +638,29 @@ impl CueLabsApp {
     }
 
     fn select_next(&mut self) {
-        if self.cue_list.cues.is_empty() {
+        let order = self.cue_list.visual_order_ids();
+        if order.is_empty() {
             return;
         }
         self.selected = Some(match self.selected {
-            None => self.cue_list.cues[0].id,
+            None => order[0],
             Some(cur) => {
-                let pos = self
-                    .cue_list
-                    .cues
-                    .iter()
-                    .position(|c| c.id == cur)
-                    .unwrap_or(0);
-                self.cue_list.cues[(pos + 1).min(self.cue_list.cues.len() - 1)].id
+                let pos = order.iter().position(|&id| id == cur).unwrap_or(0);
+                order[(pos + 1).min(order.len() - 1)]
             }
         });
     }
 
     fn select_prev(&mut self) {
-        if self.cue_list.cues.is_empty() {
+        let order = self.cue_list.visual_order_ids();
+        if order.is_empty() {
             return;
         }
         self.selected = Some(match self.selected {
-            None => self.cue_list.cues[0].id,
+            None => order[0],
             Some(cur) => {
-                let pos = self
-                    .cue_list
-                    .cues
-                    .iter()
-                    .position(|c| c.id == cur)
-                    .unwrap_or(0);
-                self.cue_list.cues[pos.saturating_sub(1)].id
+                let pos = order.iter().position(|&id| id == cur).unwrap_or(0);
+                order[pos.saturating_sub(1)]
             }
         });
     }
@@ -1327,54 +1351,11 @@ impl eframe::App for CueLabsApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    let title = if self.project.settings.name.is_empty() {
+                    let title = if self.project.settings.name.trim().is_empty() {
                         "Untitled Project"
                     } else {
-                        &self.project.settings.name
+                        self.project.settings.name.as_str()
                     };
-
-                    if self.renaming_project {
-                        let resp = ui.text_edit_singleline(&mut self.project_name_buf);
-                        resp.request_focus();
-                        if resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                            self.project.settings.name = self.project_name_buf.clone();
-                            self.renaming_project = false;
-                        }
-                    } else {
-                        let title_resp =
-                            ui.heading(egui::RichText::new(title).color(Theme::TEXT).size(14.0));
-                        // Двойной клик по названию проекта меняет название
-                        if title_resp.double_clicked() {
-                            self.project_name_buf = self.project.settings.name.clone();
-                            self.renaming_project = true;
-                        }
-                    }
-
-                    if self.renaming_project {
-                        if ui.input(|i| i.pointer.any_click()) {
-                            if ctx.memory(|m| m.focused()).is_none() {
-                                self.project.settings.name = self.project_name_buf.clone();
-                                self.renaming_project = false;
-                            }
-                        }
-                    }
-
-                    if self.renaming_project {
-                        let resp = ui.text_edit_singleline(&mut self.project_name_buf);
-                        resp.request_focus();
-                        if resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                            self.project.settings.name = self.project_name_buf.clone();
-                            self.renaming_project = false;
-                        }
-                        if ui.input(|i| i.pointer.any_click())
-                            && !resp.rect.contains(
-                                ui.input(|i| i.pointer.interact_pos().unwrap_or_default()),
-                            )
-                        {
-                            self.project.settings.name = self.project_name_buf.clone();
-                            self.renaming_project = false;
-                        }
-                    }
 
                     ui.add_space(16.0);
 
@@ -1506,23 +1487,24 @@ impl eframe::App for CueLabsApp {
                             self.handle_drag_drop(dragged_id, target_idx);
                         }
                         CueTableAction::AssignTarget(dragged_id, target_id) => {
-                            // Сначала (ДО взятия mutable borrow) достаём имя перетаскиваемого cue
-                            let dragged_name = self
+                            let dragged_info = self
                                 .cue_list
                                 .find(dragged_id)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_default();
+                                .map(|c| (c.name.clone(), c.file_path.clone()));
 
                             let mut status_msg: Option<String> = None;
-                            if let Some(target_cue) = self.cue_list.find_mut(target_id) {
+                            if let (Some((dragged_name, dragged_path)), Some(target_cue)) =
+                                (dragged_info, self.cue_list.find_mut(target_id))
+                            {
                                 match &mut target_cue.cue_type {
                                     CueType::Play { target_id: tid }
                                     | CueType::Pause { target_id: tid }
                                     | CueType::Stop { target_id: tid }
                                     | CueType::Fade { target_id: tid, .. } => {
                                         *tid = Some(dragged_id);
+                                        target_cue.file_path = dragged_path;
                                         status_msg = Some(format!(
-                                            "Target set: #{} → {}",
+                                            "🎯 Target set: #{} → {}",
                                             target_cue.number, dragged_name
                                         ));
                                     }

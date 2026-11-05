@@ -1,4 +1,4 @@
-// src/ui/cue_table.rs — таблица событий с мультивыбором, Drag-and-Drop и сворачиванием групп
+// src/ui/cue_table.rs — таблица событий с мультивыбором, Drag-and-Drop на колонку Target и редактированием
 #![allow(float_literal_f32_fallback)]
 use crate::cue::{ContinueMode, Cue, CueColor, CueState, CueType};
 use crate::ui::theme::Theme;
@@ -6,7 +6,7 @@ use egui::*;
 use std::collections::HashSet;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EditField {
     Name,
     PreWait,
@@ -85,7 +85,10 @@ impl CueTable {
         }
 
         let mut dropped_target_idx: Option<usize> = None;
+        let mut assign_target_cue_id: Option<Uuid> = None;
         let dragged_id = ui.data(|d| d.get_temp::<Uuid>(Id::new("dragged_cue_id")));
+        let pointer_pos = ui.ctx().pointer_latest_pos();
+        let any_click = ui.input(|i| i.pointer.any_click());
 
         let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -124,6 +127,7 @@ impl CueTable {
                     }
 
                     let mut name_clicked = false;
+                    let mut target_col_rect = Rect::NOTHING;
 
                     let resp = ui.horizontal(|ui| {
                         if indent > 0 {
@@ -157,6 +161,7 @@ impl CueTable {
                             .rect_filled(strip_rect, 0.0_f32, cue.color.to_egui());
                         ui.add_space(3.0);
 
+                        // Cue #
                         ui.add_sized(
                             [col_widths[0], row_h],
                             Label::new(
@@ -167,6 +172,7 @@ impl CueTable {
                             ),
                         );
 
+                        // Type
                         ui.add_sized(
                             [col_widths[1], row_h],
                             Label::new(
@@ -180,24 +186,42 @@ impl CueTable {
                             ),
                         );
 
+                        // Name (редактирование без моргания при клике мимо)
                         let is_editing_name =
                             matches!(editing, Some((id, EditField::Name, _)) if *id == cue_id);
                         if is_editing_name {
                             if let Some((_, _, ref mut buf)) = editing {
+                                let focus_flag_id =
+                                    Id::new(("edit_focus_init", cue_id, EditField::Name));
+                                let need_focus = ui
+                                    .data(|d| d.get_temp::<bool>(focus_flag_id))
+                                    .unwrap_or(true);
+
                                 let r = ui.add_sized(
                                     [col_widths[2], row_h - 4.0],
                                     TextEdit::singleline(buf).font(TextStyle::Body),
                                 );
-                                r.request_focus();
-                                if r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                                    action = Some(CueTableAction::EditConfirm(
-                                        cue_id,
-                                        EditField::Name,
-                                        buf.clone(),
-                                    ));
-                                }
-                                if ui.input(|i| i.key_pressed(Key::Escape)) {
-                                    action = Some(CueTableAction::EditCancel);
+
+                                if need_focus {
+                                    r.request_focus();
+                                    ui.data_mut(|d| d.insert_temp(focus_flag_id, false));
+                                } else {
+                                    let clicked_outside = any_click
+                                        && pointer_pos.map_or(false, |pos| !r.rect.contains(pos));
+                                    if clicked_outside
+                                        || r.lost_focus()
+                                        || ui.input(|i| i.key_pressed(Key::Enter))
+                                    {
+                                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
+                                        action = Some(CueTableAction::EditConfirm(
+                                            cue_id,
+                                            EditField::Name,
+                                            buf.clone(),
+                                        ));
+                                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
+                                        action = Some(CueTableAction::EditCancel);
+                                    }
                                 }
                             }
                         } else {
@@ -213,6 +237,9 @@ impl CueTable {
                                 .sense(Sense::click()),
                             );
                             if name_label.double_clicked() {
+                                let focus_flag_id =
+                                    Id::new(("edit_focus_init", cue_id, EditField::Name));
+                                ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
                                 action = Some(CueTableAction::StartEdit(
                                     cue_id,
                                     EditField::Name,
@@ -223,15 +250,18 @@ impl CueTable {
                             }
                         }
 
+                        // File / Target (сохраняем точный прямоугольник ячейки для Drag-and-Drop таргета)
                         let target_desc = Self::describe_target(cue, &cue_names);
-                        ui.add_sized(
+                        let target_resp = ui.add_sized(
                             [col_widths[3], row_h],
                             Label::new(
                                 RichText::new(target_desc).color(Theme::TEXT_DIM).size(11.0),
                             )
                             .truncate(),
                         );
+                        target_col_rect = target_resp.rect;
 
+                        // Pre-Wait
                         Self::wait_cell(
                             ui,
                             cue_id,
@@ -242,8 +272,11 @@ impl CueTable {
                             Theme::ACCENT,
                             editing,
                             &mut action,
+                            any_click,
+                            pointer_pos,
                         );
 
+                        // Duration
                         ui.add_sized(
                             [col_widths[5], row_h],
                             Label::new(
@@ -254,6 +287,7 @@ impl CueTable {
                             ),
                         );
 
+                        // Post-Wait
                         Self::wait_cell(
                             ui,
                             cue_id,
@@ -264,8 +298,11 @@ impl CueTable {
                             Theme::ACCENT2,
                             editing,
                             &mut action,
+                            any_click,
+                            pointer_pos,
                         );
 
+                        // Status
                         ui.add_sized([col_widths[7], row_h], |ui: &mut Ui| {
                             let (rect, resp) = ui.allocate_exact_size(
                                 vec2(col_widths[7], row_h - 8.0),
@@ -302,6 +339,7 @@ impl CueTable {
                             resp
                         });
 
+                        // Continue
                         ui.push_id(("continue_combo", cue_id), |ui| {
                             egui::ComboBox::from_id_salt("cont")
                                 .width(col_widths[8] - 8.0)
@@ -319,6 +357,14 @@ impl CueTable {
                     });
 
                     let is_group = matches!(&cue.cue_type, CueType::Group { .. });
+                    let is_targetable = matches!(
+                        &cue.cue_type,
+                        CueType::Play { .. }
+                            | CueType::Pause { .. }
+                            | CueType::Stop { .. }
+                            | CueType::Fade { .. }
+                    );
+
                     let left_offset = if is_group && indent == 0 { 18.0 } else { 0.0 };
                     let interact_rect = Rect::from_min_max(
                         pos2(
@@ -342,19 +388,42 @@ impl CueTable {
 
                     if row_resp.drag_started() {
                         ui.data_mut(|d| d.insert_temp(Id::new("dragged_cue_id"), cue_id));
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                    }
+                    if row_resp.dragged() {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                     }
 
+                    // Проверка наведения при перетаскивании (без 3 секунд!)
                     if let Some(pid) = dragged_id {
-                        if (row_resp.hovered() || ui.rect_contains_pointer(row_rect))
-                            && pid != cue_id
-                        {
-                            dropped_target_idx = Some(cue_idx);
-                            ui.painter().rect_stroke(
-                                row_rect,
-                                2.0_f32,
-                                Stroke::new(2.0, Theme::ACCENT2),
-                                StrokeKind::Inside,
-                            );
+                        if pid != cue_id {
+                            let over_target_col = is_targetable
+                                && pointer_pos.map_or(false, |pos| target_col_rect.contains(pos));
+
+                            if over_target_col {
+                                // Навели именно на колонку Target у Play/Pause/Stop/Fade
+                                assign_target_cue_id = Some(cue_id);
+                                ui.painter().rect_filled(
+                                    target_col_rect,
+                                    3.0_f32,
+                                    Color32::from_rgba_unmultiplied(60, 220, 130, 55),
+                                );
+                                ui.painter().rect_stroke(
+                                    target_col_rect,
+                                    3.0_f32,
+                                    Stroke::new(2.0_f32, Theme::ACCENT2),
+                                    StrokeKind::Inside,
+                                );
+                            } else if row_resp.hovered() || ui.rect_contains_pointer(row_rect) {
+                                // Навели на саму строку — перестановка или добавление в группу
+                                dropped_target_idx = Some(cue_idx);
+                                ui.painter().rect_stroke(
+                                    row_rect,
+                                    2.0_f32,
+                                    Stroke::new(2.0_f32, Theme::ACCENT),
+                                    StrokeKind::Inside,
+                                );
+                            }
                         }
                     }
 
@@ -383,6 +452,9 @@ impl CueTable {
                             ui.close_menu();
                         }
                         if ui.button("✏  Rename").clicked() {
+                            let focus_flag_id =
+                                Id::new(("edit_focus_init", cue_id, EditField::Name));
+                            ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
                             action = Some(CueTableAction::StartEdit(
                                 cue_id,
                                 EditField::Name,
@@ -410,7 +482,7 @@ impl CueTable {
                         });
                     });
 
-                    // Обрабатываем клик (включая Shift / Ctrl) напрямую без внешнего замыкания
+                    // Обрабатываем клик (включая Shift / Ctrl)
                     if name_clicked || row_resp.clicked() {
                         let shift = ui.input(|i| i.modifiers.shift);
                         let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
@@ -456,19 +528,29 @@ impl CueTable {
                 }
             });
 
+        // Плавающая плашка за курсором во время перетаскивания
         if let Some(drag_id) = dragged_id {
-            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+            if let Some(pos) = pointer_pos {
                 if let Some(dragged_cue) = cues.iter().find(|c| c.id == drag_id) {
-                    let ghost_rect = Rect::from_center_size(pos, vec2(260.0, 24.0));
+                    let badge_text = if assign_target_cue_id.is_some() {
+                        format!(
+                            "🎯 Set Target: #{} {}",
+                            dragged_cue.number, dragged_cue.name
+                        )
+                    } else {
+                        format!("↕ Move: #{} {}", dragged_cue.number, dragged_cue.name)
+                    };
+                    let ghost_rect =
+                        Rect::from_center_size(pos + vec2(0.0, -18.0), vec2(260.0, 24.0));
                     ui.painter().rect_filled(
                         ghost_rect,
                         4.0,
-                        Color32::from_rgba_unmultiplied(90, 170, 255, 200),
+                        Color32::from_rgba_unmultiplied(40, 80, 140, 220),
                     );
                     ui.painter().text(
                         ghost_rect.center(),
                         Align2::CENTER_CENTER,
-                        format!("#{} {}", dragged_cue.number, dragged_cue.name),
+                        badge_text,
                         FontId::proportional(12.0),
                         Color32::WHITE,
                     );
@@ -479,8 +561,12 @@ impl CueTable {
         // Завершение перетаскивания при отпускании кнопки мыши
         if ui.input(|i| i.pointer.any_released()) {
             let removed_drag = ui.data_mut(|d| d.remove_temp::<Uuid>(Id::new("dragged_cue_id")));
-            if let (Some(dragged_id), Some(target_idx)) = (removed_drag, dropped_target_idx) {
-                action = Some(CueTableAction::MoveToGroupOrIndex(dragged_id, target_idx));
+            if let Some(dragged_id) = removed_drag {
+                if let Some(target_cue_id) = assign_target_cue_id {
+                    action = Some(CueTableAction::AssignTarget(dragged_id, target_cue_id));
+                } else if let Some(target_idx) = dropped_target_idx {
+                    action = Some(CueTableAction::MoveToGroupOrIndex(dragged_id, target_idx));
+                }
             }
         }
 
@@ -498,20 +584,36 @@ impl CueTable {
         accent: Color32,
         editing: &mut Option<(Uuid, EditField, String)>,
         action: &mut Option<CueTableAction>,
+        any_click: bool,
+        pointer_pos: Option<Pos2>,
     ) {
         let is_editing = matches!(editing, Some((id, f, _)) if *id == cue_id && *f == field);
         if is_editing {
             if let Some((_, _, ref mut buf)) = editing {
+                let focus_flag_id = Id::new(("edit_focus_init", cue_id, field));
+                let need_focus = ui
+                    .data(|d| d.get_temp::<bool>(focus_flag_id))
+                    .unwrap_or(true);
+
                 let r = ui.add_sized(
                     [width, row_h - 4.0],
                     TextEdit::singleline(buf).font(TextStyle::Monospace),
                 );
-                r.request_focus();
-                if r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                    *action = Some(CueTableAction::EditConfirm(cue_id, field, buf.clone()));
-                }
-                if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    *action = Some(CueTableAction::EditCancel);
+
+                if need_focus {
+                    r.request_focus();
+                    ui.data_mut(|d| d.insert_temp(focus_flag_id, false));
+                } else {
+                    let clicked_outside =
+                        any_click && pointer_pos.map_or(false, |pos| !r.rect.contains(pos));
+                    if clicked_outside || r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter))
+                    {
+                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
+                        *action = Some(CueTableAction::EditConfirm(cue_id, field, buf.clone()));
+                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
+                        *action = Some(CueTableAction::EditCancel);
+                    }
                 }
             }
         } else {
@@ -531,6 +633,8 @@ impl CueTable {
                 .sense(Sense::click()),
             );
             if label.double_clicked() {
+                let focus_flag_id = Id::new(("edit_focus_init", cue_id, field));
+                ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
                 *action = Some(CueTableAction::StartEdit(
                     cue_id,
                     field,
@@ -564,7 +668,7 @@ impl CueTable {
                         .unwrap_or("—")
                         .to_string()
                 } else {
-                    "All / None".to_string()
+                    "🎯 Drop target here".to_string()
                 }
             }
             CueType::Midi {
