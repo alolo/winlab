@@ -22,15 +22,15 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::new("cuelabs=debug,warn"))
         .init();
 
-let options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default()
-        .with_title("CueLabs")
-        .with_inner_size([1400.0, 900.0])
-        .with_min_inner_size([900.0, 600.0])
-        .with_drag_and_drop(true) // ← перенесли сюда
-        .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
-    ..Default::default()
-};
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("CueLabs")
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([900.0, 600.0])
+            .with_drag_and_drop(true)
+            .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
+        ..Default::default()
+    };
 
     eframe::run_native(
         "CueLabs",

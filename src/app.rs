@@ -67,6 +67,7 @@ pub struct CueLabsApp {
     hotkeys: HotkeyConfig,
 
     selected: Option<Uuid>,
+    selected_ids: HashSet<Uuid>,
     editing: Option<(Uuid, EditField, String)>,
     expanded_groups: HashSet<Uuid>,
     active_panel: Panel,
@@ -104,6 +105,7 @@ impl CueLabsApp {
             report: SessionReport::new("Untitled Project"),
             hotkeys: HotkeyConfig::default(),
             selected: None,
+            selected_ids: HashSet::new(),
             editing: None,
             expanded_groups: HashSet::new(),
             active_panel: Panel::Inspector,
@@ -1357,6 +1359,23 @@ impl eframe::App for CueLabsApp {
                         }
                     }
 
+                    if self.renaming_project {
+                        let resp = ui.text_edit_singleline(&mut self.project_name_buf);
+                        resp.request_focus();
+                        if resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                            self.project.settings.name = self.project_name_buf.clone();
+                            self.renaming_project = false;
+                        }
+                        if ui.input(|i| i.pointer.any_click())
+                            && !resp.rect.contains(
+                                ui.input(|i| i.pointer.interact_pos().unwrap_or_default()),
+                            )
+                        {
+                            self.project.settings.name = self.project_name_buf.clone();
+                            self.renaming_project = false;
+                        }
+                    }
+
                     ui.add_space(16.0);
 
                     if ui.button("🔊 Audio").clicked() {
@@ -1390,14 +1409,28 @@ impl eframe::App for CueLabsApp {
                         });
                     }
                     if ui.button("📁 Group").clicked() {
-                        // Создание группы из выбранного кью
-                        let sel = self.selected;
+                        let mut children: Vec<Uuid> = if !self.selected_ids.is_empty() {
+                            self.cue_list
+                                .cues
+                                .iter()
+                                .filter(|c| self.selected_ids.contains(&c.id))
+                                .map(|c| c.id)
+                                .collect()
+                        } else {
+                            self.selected.into_iter().collect()
+                        };
+
                         self.add_typed_cue(CueType::Group {
                             mode: GroupMode::Normal,
-                            children: sel.into_iter().collect(),
+                            children: std::mem::take(&mut children),
                             fade_in_secs: 0.0,
                             fade_out_secs: 0.0,
                         });
+
+                        if let Some(gid) = self.selected {
+                            self.expanded_groups.insert(gid);
+                        }
+                        self.selected_ids.clear();
                     }
                 });
                 ui.add(egui::Separator::default().horizontal());
@@ -1406,6 +1439,7 @@ impl eframe::App for CueLabsApp {
                     ui,
                     &mut self.cue_list.cues,
                     &mut self.selected,
+                    &mut self.selected_ids,
                     &mut self.editing,
                     &mut self.expanded_groups,
                 );
