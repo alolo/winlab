@@ -102,11 +102,7 @@ fn build_sibling_locations(cues: &[Cue]) -> HashMap<Uuid, (Option<Uuid>, usize)>
     locations
 }
 
-fn collect_structural_reachability(
-    cues: &[Cue],
-    cue_id: Uuid,
-    reachable: &mut HashSet<Uuid>,
-) {
+fn collect_structural_reachability(cues: &[Cue], cue_id: Uuid, reachable: &mut HashSet<Uuid>) {
     if !reachable.insert(cue_id) {
         return;
     }
@@ -204,23 +200,23 @@ impl CueTable {
         let table_width = 26.0 + column_widths.iter().sum::<f32>();
         let display_order = build_display_order(cues, expanded_groups);
         let sibling_locations = build_sibling_locations(cues);
-        let group_child_counts: HashMap<Uuid, usize> = cues.iter().filter_map(|cue| {
-            if let CueType::Group { children, .. } = &cue.cue_type {
-                Some((cue.id, children.len()))
-            } else {
-                None
-            }
-        }).collect();
+        let group_child_counts: HashMap<Uuid, usize> = cues
+            .iter()
+            .filter_map(|cue| {
+                if let CueType::Group { children, .. } = &cue.cue_type {
+                    Some((cue.id, children.len()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let display_ids: Vec<Uuid> = display_order
             .iter()
             .map(|(index, _)| cues[*index].id)
             .collect();
 
         let viewport_rect = ui.available_rect_before_wrap();
-        let header_rect = Rect::from_min_size(
-            viewport_rect.min,
-            vec2(viewport_rect.width(), 28.0),
-        );
+        let header_rect = Rect::from_min_size(viewport_rect.min, vec2(viewport_rect.width(), 28.0));
         let mut row_rects: Vec<Rect> = Vec::with_capacity(display_order.len());
         let mut drop_destination: Option<(Option<Uuid>, usize)> = None;
         let mut drop_line_y: Option<f32> = None;
@@ -299,7 +295,6 @@ impl CueTable {
                         ui.set_min_width(table_width);
                         let mut completed_group_frames: Vec<Rect> = Vec::new();
                         let mut group_frame_stack: Vec<(u8, Rect)> = Vec::new();
-                        let cues_len = cues.len();
                         for &(cue_idx, indent) in &display_order {
                     let cue = &mut cues[cue_idx];
                     let is_selected = selected_ids.contains(&cue.id) || *selected == Some(cue.id);
@@ -615,7 +610,9 @@ impl CueTable {
                                 vec2(column_widths[7], row_h - 8.0),
                                 Sense::hover(),
                             );
-                            if cue.is_active() && cue.effective_duration() > 0.0 {
+                            let fade_post_wait = matches!(&cue.cue_type, CueType::Fade { .. })
+                                && matches!(&cue.state, CueState::Waiting);
+                            if cue.is_active() && cue.effective_duration() > 0.0 && !fade_post_wait {
                                 let progress = cue.progress();
                                 let bar_rect = Rect::from_min_size(
                                     rect.min,
@@ -926,7 +923,8 @@ impl CueTable {
             if let Some(pos) = ui.ctx().pointer_latest_pos() {
                 let label = if state.dragged_ids.len() > 1 {
                     format!("{} selected events", state.dragged_ids.len())
-                } else if let Some(dragged_cue) = cues.iter().find(|cue| cue.id == state.source_id) {
+                } else if let Some(dragged_cue) = cues.iter().find(|cue| cue.id == state.source_id)
+                {
                     if dragged_cue.number.trim().is_empty() {
                         dragged_cue.name.clone()
                     } else {
@@ -972,7 +970,8 @@ impl CueTable {
 
         // Clicking unused table space clears every selection. Row/header widgets
         // are excluded, so normal clicks and column resizing keep their behaviour.
-        let primary_clicked = ui.input(|input| input.pointer.button_clicked(PointerButton::Primary));
+        let primary_clicked =
+            ui.input(|input| input.pointer.button_clicked(PointerButton::Primary));
         if primary_clicked {
             if let Some(position) = ui.ctx().pointer_latest_pos() {
                 let inside_table = viewport_rect.contains(position);
@@ -1189,7 +1188,6 @@ pub fn format_duration(secs: f64) -> String {
     format!("{m:02}:{s:02}.{cs:02}")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{build_sibling_locations, visible_cue_ids};
@@ -1208,11 +1206,19 @@ mod tests {
         });
         let after = Cue::new_typed(CueType::Midi {
             channel: 1,
-            message: crate::cue::MidiMessageKind::NoteOn { note: 60, velocity: 100 },
+            message: crate::cue::MidiMessageKind::NoteOn {
+                note: 60,
+                velocity: 100,
+            },
             raw_hex: String::new(),
         });
         let expected = vec![group.id, child_b.id, child_a.id, after.id];
-        let cues = vec![group.clone(), after.clone(), child_a.clone(), child_b.clone()];
+        let cues = vec![
+            group.clone(),
+            after.clone(),
+            child_a.clone(),
+            child_b.clone(),
+        ];
         let mut expanded = HashSet::new();
         expanded.insert(group.id);
         assert_eq!(visible_cue_ids(&cues, &expanded), expected);
@@ -1229,9 +1235,11 @@ mod tests {
         });
         let after = Cue::new_typed(CueType::Pause { target_id: None });
         let cues = vec![group.clone(), after.clone(), child];
-        assert_eq!(visible_cue_ids(&cues, &HashSet::new()), vec![group.id, after.id]);
+        assert_eq!(
+            visible_cue_ids(&cues, &HashSet::new()),
+            vec![group.id, after.id]
+        );
     }
-
 
     #[test]
     fn sibling_locations_separate_root_rows_from_group_children() {
@@ -1245,7 +1253,13 @@ mod tests {
             fade_out_secs: 0.0,
         });
         let last_root = Cue::new_typed(CueType::Stop { target_id: None });
-        let cues = vec![first_root.clone(), group.clone(), child_a.clone(), child_b.clone(), last_root.clone()];
+        let cues = vec![
+            first_root.clone(),
+            group.clone(),
+            child_a.clone(),
+            child_b.clone(),
+            last_root.clone(),
+        ];
 
         let locations = build_sibling_locations(&cues);
         assert_eq!(locations.get(&first_root.id), Some(&(None, 0)));

@@ -1,5 +1,6 @@
 // src/audio/engine.rs — аудиодвижок с поддержкой Fade In/Out, Start/End, Loop и смены I/O карт
 
+use crate::config::AudioBackend;
 use crate::cue::{ChannelRoute, CueState, FadeCurve, OutputChannelSetting};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -60,6 +61,7 @@ pub enum AudioCommand {
         id: Uuid,
         routes: Vec<ChannelRoute>,
     },
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,40 @@ pub struct PositionUpdate {
     pub id: Uuid,
     pub position_secs: f64,
     pub state: CueState,
+}
+
+fn host_for_backend(backend: AudioBackend) -> Result<Host> {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        let host_id = match backend {
+            AudioBackend::Wasapi => cpal::HostId::Wasapi,
+            AudioBackend::Asio => cpal::HostId::Asio,
+        };
+        return cpal::host_from_id(host_id).map_err(|error| {
+            anyhow::anyhow!(
+                "Could not initialise {} audio host: {}",
+                backend.label(),
+                error
+            )
+        });
+    }
+    #[cfg(all(target_os = "windows", not(feature = "asio")))]
+    {
+        match backend {
+            AudioBackend::Wasapi => Ok(cpal::host_from_id(cpal::HostId::Wasapi)
+                .map_err(|error| anyhow::anyhow!("Could not initialise WASAPI host: {}", error))?),
+            AudioBackend::Asio => Err(anyhow::anyhow!(
+                "ASIO support is not compiled in. Rebuild CueLabs with `--features asio`."
+            )),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        match backend {
+            AudioBackend::Wasapi => Ok(cpal::default_host()),
+            AudioBackend::Asio => Err(anyhow::anyhow!("ASIO backend is only available on Windows")),
+        }
+    }
 }
 
 fn supported_output_channel_layouts(device: &Device) -> Vec<usize> {
@@ -95,8 +131,8 @@ fn preferred_output_config(device: &Device) -> Option<cpal::SupportedStreamConfi
                 (config.sample_format() == cpal::SampleFormat::F32) as u8,
             )
         })?;
-    let min_rate = config.min_sample_rate().0;
-    let max_rate = config.max_sample_rate().0;
+    let min_rate = config.min_sample_rate();
+    let max_rate = config.max_sample_rate();
     let sample_rate = if min_rate <= 48_000 && max_rate >= 48_000 {
         48_000
     } else if min_rate <= 44_100 && max_rate >= 44_100 {
@@ -104,10 +140,11 @@ fn preferred_output_config(device: &Device) -> Option<cpal::SupportedStreamConfi
     } else {
         max_rate
     };
-    Some(config.with_sample_rate(cpal::SampleRate(sample_rate)))
+    Some(config.with_sample_rate(sample_rate))
 }
 
 pub struct AudioEngine {
+    pub backend: AudioBackend,
     pub cmd_tx: Sender<AudioCommand>,
     pub pos_rx: Receiver<PositionUpdate>,
     pub output_devices: Vec<String>,
@@ -122,7 +159,11 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new() -> Result<Self> {
-        let host = cpal::default_host();
+        Self::new_with_backend(AudioBackend::Wasapi)
+    }
+
+    pub fn new_with_backend(backend: AudioBackend) -> Result<Self> {
+        let host = host_for_backend(backend)?;
         let output_devices = Self::list_output_devices(&host);
         let (output_device_channels, output_device_channel_layouts) =
             Self::list_output_device_info(&host);
@@ -130,21 +171,34 @@ impl AudioEngine {
 
         let out_dev = host
             .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("No output audio device found"))?;
-        let out_name = out_dev
-            .name()
-            .unwrap_or_else(|_| "Default Output".to_string());
+            .or_else(|| {
+                host.output_devices()
+                    .ok()
+                    .and_then(|mut devices| devices.next())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("No output audio device found for {}", backend.label())
+            })?;
+        // CPAL 0.18 removed DeviceTrait::name(); Display returns the user-facing device name.
+        let out_name = out_dev.to_string();
         let output_config = preferred_output_config(&out_dev)
             .or_else(|| out_dev.default_output_config().ok())
-            .ok_or_else(|| anyhow::anyhow!("No supported output configuration found"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("No supported output configuration found for {}", out_name)
+            })?;
         let output_channels = output_config.channels() as usize;
 
         let in_name = host
             .default_input_device()
-            .and_then(|d| d.name().ok())
+            .map(|device| device.to_string())
             .unwrap_or_else(|| "Default Input".to_string());
 
-        info!("Audio Output: {}, Input: {}", out_name, in_name);
+        info!(
+            "Audio backend: {}; Output: {}, Input: {}",
+            backend.label(),
+            out_name,
+            in_name
+        );
 
         let (cmd_tx, cmd_rx) = bounded::<AudioCommand>(256);
         let (pos_tx, pos_rx) = bounded::<PositionUpdate>(1024);
@@ -157,6 +211,7 @@ impl AudioEngine {
 
         std::thread::spawn(move || {
             audio_worker(
+                backend,
                 out_dev,
                 output_config,
                 worker_default_device,
@@ -167,6 +222,7 @@ impl AudioEngine {
         });
 
         Ok(Self {
+            backend,
             cmd_tx,
             pos_rx,
             output_devices,
@@ -182,7 +238,7 @@ impl AudioEngine {
 
     fn list_output_devices(host: &Host) -> Vec<String> {
         host.output_devices()
-            .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+            .map(|devices| devices.map(|device| device.to_string()).collect())
             .unwrap_or_default()
     }
 
@@ -193,9 +249,7 @@ impl AudioEngine {
         let mut layouts_by_device = HashMap::new();
         if let Ok(devices) = host.output_devices() {
             for device in devices {
-                let Ok(name) = device.name() else {
-                    continue;
-                };
+                let name = device.to_string();
                 let layouts = supported_output_channel_layouts(&device);
                 let channels = layouts
                     .last()
@@ -223,13 +277,15 @@ impl AudioEngine {
     /// keeping stale channel counts if the Windows endpoint configuration changed
     /// after CueLabs started.
     pub fn refresh_output_device_info(&mut self, device_name: &str) {
-        let host = cpal::default_host();
+        let Ok(host) = host_for_backend(self.backend) else {
+            return;
+        };
         let Ok(devices) = host.output_devices() else {
             return;
         };
         let Some(device) = devices
             .into_iter()
-            .find(|device| device.name().ok().as_deref() == Some(device_name))
+            .find(|device| device.to_string() == device_name)
         else {
             return;
         };
@@ -284,7 +340,7 @@ impl AudioEngine {
 
     fn list_input_devices(host: &Host) -> Vec<String> {
         host.input_devices()
-            .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+            .map(|devices| devices.map(|device| device.to_string()).collect())
             .unwrap_or_default()
     }
 
@@ -336,6 +392,12 @@ impl AudioEngine {
     }
 }
 
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(AudioCommand::Shutdown);
+    }
+}
+
 struct DynamicFade {
     start_vol: f32,
     target_vol: f32,
@@ -349,7 +411,7 @@ struct DynamicFade {
 struct ActivePlayer {
     id: Uuid,
     file: PathBuf,
-    sink: rodio::Sink,
+    sink: rodio::Player,
     start_secs: f64,
     end_secs: f64,
     base_volume: f32,
@@ -362,7 +424,7 @@ struct ActivePlayer {
     output_channels: usize,
     output_device: String,
     uses_global_default: bool,
-    stream_handle: Arc<rodio::OutputStreamHandle>,
+    mixer: rodio::mixer::Mixer,
     output_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
     loop_enabled: bool,
     loop_start: f64,
@@ -405,7 +467,7 @@ struct ChannelRouter<S> {
 
 impl<S> ChannelRouter<S>
 where
-    S: Source<Item = f32>,
+    S: Source,
 {
     fn new(
         source: S,
@@ -413,7 +475,7 @@ where
         output_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
         output_channels: usize,
     ) -> Self {
-        let input_channels = source.channels().max(1) as usize;
+        let input_channels = source.channels().get().max(1) as usize;
         let output_channels = output_channels.max(1);
 
         // Keep the route table aligned with the decoder's real channel count.
@@ -454,7 +516,7 @@ where
 
 impl<S> Iterator for ChannelRouter<S>
 where
-    S: Source<Item = f32>,
+    S: Source,
 {
     type Item = f32;
 
@@ -517,21 +579,22 @@ where
 
 impl<S> Source for ChannelRouter<S>
 where
-    S: Source<Item = f32>,
+    S: Source,
 {
-    fn current_frame_len(&self) -> Option<usize> {
-        self.source.current_frame_len().map(|samples| {
+    fn current_span_len(&self) -> Option<usize> {
+        self.source.current_span_len().map(|samples| {
             (samples / self.input_channels)
                 .saturating_mul(self.output_channels)
                 .saturating_add(self.output_channels.saturating_sub(self.output_index))
         })
     }
 
-    fn channels(&self) -> u16 {
-        self.output_channels.min(u16::MAX as usize) as u16
+    fn channels(&self) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::new(self.output_channels.min(u16::MAX as usize) as u16)
+            .expect("ChannelRouter always has at least one output channel")
     }
 
-    fn sample_rate(&self) -> u32 {
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
         self.source.sample_rate()
     }
 
@@ -541,33 +604,65 @@ where
 }
 
 fn open_sink_at(
-    stream_handle: &rodio::OutputStreamHandle,
+    mixer: &rodio::mixer::Mixer,
     file_path: &PathBuf,
     offset_secs: f64,
     initial_vol: f32,
     output_channels: usize,
     routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
-) -> Option<rodio::Sink> {
+) -> Option<rodio::Player> {
     let file = std::fs::File::open(file_path).ok()?;
-    let sink = rodio::Sink::try_new(stream_handle).ok()?;
-    let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
-    let source = decoder
-        .skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)))
-        .convert_samples::<f32>();
+    let player = rodio::Player::connect_new(mixer);
+    let decoder = rodio::Decoder::try_from(file).ok()?;
+    let source = decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)));
     let routed = ChannelRouter::new(source, routes, output_settings, output_channels);
-    sink.set_volume(initial_vol);
-    sink.append(routed);
-    sink.play();
-    Some(sink)
+    player.set_volume(initial_vol);
+    player.append(routed);
+    player.play();
+    Some(player)
 }
 
 struct DeviceOutput {
     // Keeping the stream alive is required for the device's output callback.
-    _stream: rodio::OutputStream,
-    handle: Arc<rodio::OutputStreamHandle>,
+    _stream: rodio::MixerDeviceSink,
+    mixer: rodio::mixer::Mixer,
     channels: usize,
     settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
+}
+
+fn build_device_output(
+    device: &Device,
+    config: cpal::SupportedStreamConfig,
+    device_name: &str,
+    default_device_name: &str,
+    default_settings: &Arc<RwLock<Vec<OutputChannelSetting>>>,
+) -> Option<DeviceOutput> {
+    let channels = (config.channels() as usize).max(1);
+    let sample_rate = config.sample_rate();
+    let sample_format = config.sample_format();
+    info!(
+        "Opening output '{}' with {} channels @ {} Hz ({:?})",
+        device_name, channels, sample_rate, sample_format
+    );
+    let mut stream = rodio::DeviceSinkBuilder::default()
+        .with_device(device.clone())
+        .with_supported_config(&config)
+        .open_stream()
+        .ok()?;
+    stream.log_on_drop(false);
+    let mixer = stream.mixer().clone();
+    let settings = if device_name == default_device_name {
+        default_settings.clone()
+    } else {
+        Arc::new(RwLock::new(vec![OutputChannelSetting::default(); channels]))
+    };
+    Some(DeviceOutput {
+        _stream: stream,
+        mixer,
+        channels,
+        settings,
+    })
 }
 
 fn open_device_output(
@@ -579,22 +674,16 @@ fn open_device_output(
     let devices = host.output_devices().ok()?;
     let device = devices
         .into_iter()
-        .find(|device| device.name().ok().as_deref() == Some(device_name))?;
+        .find(|device| device.to_string() == device_name)?;
     let config =
         preferred_output_config(&device).or_else(|| device.default_output_config().ok())?;
-    let channels = (config.channels() as usize).max(1);
-    let (stream, handle) = rodio::OutputStream::try_from_device_config(&device, config).ok()?;
-    let settings = if device_name == default_device_name {
-        default_settings.clone()
-    } else {
-        Arc::new(RwLock::new(vec![OutputChannelSetting::default(); channels]))
-    };
-    Some(DeviceOutput {
-        _stream: stream,
-        handle: Arc::new(handle),
-        channels,
-        settings,
-    })
+    build_device_output(
+        &device,
+        config,
+        device_name,
+        default_device_name,
+        default_settings,
+    )
 }
 
 fn ensure_device_output(
@@ -604,7 +693,7 @@ fn ensure_device_output(
     default_device_name: &str,
     default_settings: &Arc<RwLock<Vec<OutputChannelSetting>>>,
 ) -> Option<(
-    Arc<rodio::OutputStreamHandle>,
+    rodio::mixer::Mixer,
     usize,
     Arc<RwLock<Vec<OutputChannelSetting>>>,
 )> {
@@ -617,13 +706,14 @@ fn ensure_device_output(
         output.settings = default_settings.clone();
     }
     Some((
-        output.handle.clone(),
+        output.mixer.clone(),
         output.channels,
         output.settings.clone(),
     ))
 }
 
 fn audio_worker(
+    backend: AudioBackend,
     initial_device: Device,
     initial_config: cpal::SupportedStreamConfig,
     initial_device_name: String,
@@ -631,34 +721,47 @@ fn audio_worker(
     pos_tx: Sender<PositionUpdate>,
     output_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
 ) {
-    let initial_channels = (initial_config.channels() as usize).max(1);
-    let (initial_stream, initial_handle) =
-        match rodio::OutputStream::try_from_device_config(&initial_device, initial_config) {
-            Ok(stream) => stream,
-            Err(error) => {
-                error!("Could not open initial audio output stream: {}", error);
-                return;
-            }
-        };
+    let host = match host_for_backend(backend) {
+        Ok(host) => host,
+        Err(error) => {
+            error!(
+                "Could not initialise {} audio host in worker: {}",
+                backend.label(),
+                error
+            );
+            return;
+        }
+    };
+    let Some(initial_output) = build_device_output(
+        &initial_device,
+        initial_config,
+        &initial_device_name,
+        &initial_device_name,
+        &output_settings,
+    ) else {
+        error!(
+            "Could not open initial {} audio output stream",
+            backend.label()
+        );
+        return;
+    };
 
     let mut streams = HashMap::new();
-    streams.insert(
-        initial_device_name.clone(),
-        DeviceOutput {
-            _stream: initial_stream,
-            handle: Arc::new(initial_handle),
-            channels: initial_channels,
-            settings: output_settings.clone(),
-        },
-    );
+    streams.insert(initial_device_name.clone(), initial_output);
     let mut default_device_name = initial_device_name;
-    let host = cpal::default_host();
     let mut players: Vec<ActivePlayer> = Vec::new();
     let tick = Duration::from_millis(5);
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                AudioCommand::Shutdown => {
+                    for player in &players {
+                        player.sink.stop();
+                    }
+                    players.clear();
+                    return;
+                }
                 AudioCommand::SetOutputDevice(dev_name) => {
                     // Stop cues that follow the global default, but leave cues pinned
                     // to an explicit per-cue device running on their own streams.
@@ -732,7 +835,7 @@ fn audio_worker(
                     }
                     player.sink.stop();
                     if let Some(new_sink) = open_sink_at(
-                        player.stream_handle.as_ref(),
+                        &player.mixer,
                         &player.file,
                         player.loop_start,
                         player.current_volume,
@@ -870,7 +973,7 @@ fn handle_command(
 
             let uses_global_default = output_device.is_none();
             let device_name = output_device.unwrap_or_else(|| default_device_name.to_string());
-            let Some((stream_handle, output_channels, output_settings)) = ensure_device_output(
+            let Some((mixer, output_channels, output_settings)) = ensure_device_output(
                 streams,
                 &device_name,
                 host,
@@ -884,7 +987,7 @@ fn handle_command(
             let initial_volume = if fade_in_secs > 0.0 { 0.0 } else { volume };
             let route_state = Arc::new(RwLock::new(channel_routes));
             let Some(sink) = open_sink_at(
-                stream_handle.as_ref(),
+                &mixer,
                 &file,
                 start_secs,
                 initial_volume,
@@ -935,7 +1038,7 @@ fn handle_command(
                 output_channels,
                 output_device: device_name,
                 uses_global_default,
-                stream_handle,
+                mixer,
                 output_settings,
                 loop_enabled,
                 loop_start,
@@ -981,7 +1084,7 @@ fn handle_command(
                 let position = position_secs.clamp(min_position, max_position);
                 player.sink.stop();
                 if let Some(new_sink) = open_sink_at(
-                    player.stream_handle.as_ref(),
+                    &player.mixer,
                     &player.file,
                     position,
                     player.current_volume,
@@ -1063,7 +1166,9 @@ fn handle_command(
             }
         }
 
-        AudioCommand::SetOutputDevice(_) | AudioCommand::SetInputDevice(_) => {}
+        AudioCommand::SetOutputDevice(_)
+        | AudioCommand::SetInputDevice(_)
+        | AudioCommand::Shutdown => {}
     }
 }
 
@@ -1087,7 +1192,11 @@ mod channel_router_tests {
             },
         ]));
         let output_settings = Arc::new(RwLock::new(vec![OutputChannelSetting::default(); 4]));
-        let source = SamplesBuffer::new(2, 48_000, vec![0.25_f32, 0.75_f32]);
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            vec![0.25_f32, 0.75_f32],
+        );
         let router = ChannelRouter::new(source, routes, output_settings, 4);
         let output: Vec<f32> = router.take(4).collect();
 
@@ -1109,7 +1218,11 @@ mod channel_router_tests {
             },
         ]));
         let output_settings = Arc::new(RwLock::new(vec![OutputChannelSetting::default(); 2]));
-        let source = SamplesBuffer::new(2, 48_000, vec![0.5_f32, 0.75_f32]);
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            vec![0.5_f32, 0.75_f32],
+        );
         let router = ChannelRouter::new(source, routes, output_settings, 2);
         let output: Vec<f32> = router.take(2).collect();
 

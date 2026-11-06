@@ -67,8 +67,8 @@ pub fn get_duration(path: &Path) -> f64 {
             if let Some(dur) = d.total_duration() {
                 return dur.as_secs_f64();
             }
-            let channels = d.channels().max(1) as f64;
-            let rate = d.sample_rate().max(1) as f64;
+            let channels = d.channels().get().max(1) as f64;
+            let rate = d.sample_rate().get().max(1) as f64;
             let total_samples = d.count() as f64;
             total_samples / (channels * rate)
         }
@@ -85,6 +85,6 @@ pub fn get_channel_count(path: &Path) -> usize {
         return 0;
     };
     rodio::Decoder::new(std::io::BufReader::new(file))
-        .map(|decoder| decoder.channels().max(1) as usize)
+        .map(|decoder| decoder.channels().get().max(1) as usize)
         .unwrap_or(0)
 }

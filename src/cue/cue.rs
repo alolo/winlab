@@ -629,3 +629,27 @@ impl Cue {
         (self.effective_end_secs() - self.position_secs).max(0.0)
     }
 }
+
+#[cfg(test)]
+mod fade_status_tests {
+    use super::*;
+
+    #[test]
+    fn fade_status_uses_runtime_elapsed_time() {
+        let mut cue = Cue::new_typed(CueType::Fade {
+            target_id: None,
+            fade_in: true,
+            duration_secs: 4.0,
+            stop_on_finish: false,
+            target_volume: None,
+            fade_curve: FadeCurve::Linear,
+            custom_fade_points: default_custom_fade_points(),
+        });
+        cue.state = CueState::FadingIn;
+        cue.duration_secs = 4.0;
+        cue.position_secs = 1.5;
+
+        assert!((cue.progress() - 0.375).abs() < 0.001);
+        assert!((cue.remaining_secs() - 2.5).abs() < 0.001);
+    }
+}

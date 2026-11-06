@@ -105,6 +105,32 @@ impl MidiControlBinding {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioBackend {
+    /// Windows shared-mode audio through the system audio engine.
+    #[default]
+    Wasapi,
+    /// Windows low-latency direct hardware backend. Requires an installed ASIO driver.
+    Asio,
+}
+
+impl AudioBackend {
+    pub const ALL: &'static [AudioBackend] = &[AudioBackend::Wasapi, AudioBackend::Asio];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioBackend::Wasapi => {
+                if cfg!(target_os = "windows") {
+                    "WASAPI (Shared)"
+                } else {
+                    "System Default"
+                }
+            }
+            AudioBackend::Asio => "ASIO",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
@@ -139,6 +165,8 @@ impl Default for HotkeyConfig {
 #[serde(default)]
 pub struct AppSettings {
     pub hotkeys: HotkeyConfig,
+    #[serde(default)]
+    pub audio_backend: AudioBackend,
     pub audio_output_device: Option<String>,
     pub audio_input_device: Option<String>,
     pub osc_listen_port: u16,
@@ -161,6 +189,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             hotkeys: HotkeyConfig::default(),
+            audio_backend: AudioBackend::Wasapi,
             audio_output_device: None,
             audio_input_device: None,
             osc_listen_port: 7700,

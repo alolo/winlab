@@ -370,16 +370,26 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             .map(|(_, label, _)| label.as_str())
             .unwrap_or("None / All Active");
 
-        ui.label(RichText::new("Target Cue / Group:").color(Theme::TEXT_DIM).size(11.0));
+        ui.label(
+            RichText::new("Target Cue / Group:")
+                .color(Theme::TEXT_DIM)
+                .size(11.0),
+        );
         egui::ComboBox::from_id_salt("target_cue_or_group")
             .width(240.0)
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
-                if ui.selectable_label(target_id.is_none(), "None / All Active").clicked() {
+                if ui
+                    .selectable_label(target_id.is_none(), "None / All Active")
+                    .clicked()
+                {
                     *target_id = None;
                 }
                 for (tid, label, file_path) in cue_targets {
-                    if ui.selectable_label(*target_id == Some(*tid), label).clicked() {
+                    if ui
+                        .selectable_label(*target_id == Some(*tid), label)
+                        .clicked()
+                    {
                         *target_id = Some(*tid);
                         if let Some(path) = file_path {
                             *cue_file_path = path.clone();
@@ -474,8 +484,15 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 ui.label(format!("Interface: {}", audio.current_device));
                 ui.label(format!("Active stream outputs: {}", output_channels));
                 let layouts = audio.output_channel_layouts_for_device(None);
-                let layouts_text = if layouts.is_empty() { "not reported".to_string() }
-                    else { layouts.iter().map(|count| format!("{} ch", count)).collect::<Vec<_>>().join(", ") };
+                let layouts_text = if layouts.is_empty() {
+                    "not reported".to_string()
+                } else {
+                    layouts
+                        .iter()
+                        .map(|count| format!("{} ch", count))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 ui.label(format!("Driver-supported layouts: {}", layouts_text));
                 ui.add_space(6.0);
 
@@ -483,40 +500,49 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     .id_salt("io_hardware_outputs_scroll")
                     .max_height(260.0)
                     .show(ui, |ui| {
-                    for (index, setting) in output_settings.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            changed |= ui.checkbox(&mut setting.active, "Active").changed();
-                            ui.add_sized(
-                                [78.0, 22.0],
-                                Label::new(RichText::new(format!("Output {}", index + 1)).strong()),
-                            );
-                            let slider_changed = ui.add(
-                                Slider::new(&mut setting.gain_db, -60.0..=18.0)
-                                    .show_value(false),
-                            ).changed();
-                            if slider_changed {
-                                ui.ctx().data_mut(|data| data.insert_temp(
-                                    Id::new(("global_output_gain_db", index)).with("gain_db_text"),
-                                    format!("{:.1}", setting.gain_db),
-                                ));
-                            }
-                            changed |= slider_changed;
-                            changed |= Self::gain_db_input(
-                                ui,
-                                Id::new(("global_output_gain_db", index)),
-                                &mut setting.gain_db,
-                            );
-                            ui.label("dB");
-                        });
-                    }
-                });
+                        for (index, setting) in output_settings.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                changed |= ui.checkbox(&mut setting.active, "Active").changed();
+                                ui.add_sized(
+                                    [78.0, 22.0],
+                                    Label::new(
+                                        RichText::new(format!("Output {}", index + 1)).strong(),
+                                    ),
+                                );
+                                let slider_changed = ui
+                                    .add(
+                                        Slider::new(&mut setting.gain_db, -60.0..=18.0)
+                                            .show_value(false),
+                                    )
+                                    .changed();
+                                if slider_changed {
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(
+                                            Id::new(("global_output_gain_db", index))
+                                                .with("gain_db_text"),
+                                            format!("{:.1}", setting.gain_db),
+                                        )
+                                    });
+                                }
+                                changed |= slider_changed;
+                                changed |= Self::gain_db_input(
+                                    ui,
+                                    Id::new(("global_output_gain_db", index)),
+                                    &mut setting.gain_db,
+                                );
+                                ui.label("dB");
+                            });
+                        }
+                    });
             });
 
             Self::section(&mut cols[1], "Track channel routing", |ui| {
                 if let Some(cue) = cue_opt.as_deref_mut() {
                     if !matches!(&cue.cue_type, CueType::Audio) {
-                        ui.label(RichText::new("Select an audio cue to configure its source channels")
-                            .color(Theme::TEXT_DIM));
+                        ui.label(
+                            RichText::new("Select an audio cue to configure its source channels")
+                                .color(Theme::TEXT_DIM),
+                        );
                         return;
                     }
                     let cue_id = cue.id;
@@ -526,21 +552,29 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         ui.label("Output device");
                         egui::ComboBox::from_id_salt(("cue_output_device", cue_id))
                             .width(190.0)
-                            .selected_text(selected_device.clone().unwrap_or_else(|| {
-                                format!("Global default ({})", global_device)
-                            }))
+                            .selected_text(
+                                selected_device.clone().unwrap_or_else(|| {
+                                    format!("Global default ({})", global_device)
+                                }),
+                            )
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(
-                                    selected_device.is_none(),
-                                    format!("Global default ({})", global_device),
-                                ).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        selected_device.is_none(),
+                                        format!("Global default ({})", global_device),
+                                    )
+                                    .clicked()
+                                {
                                     selected_device = None;
                                 }
                                 for device in audio.output_devices.clone() {
-                                    if ui.selectable_label(
-                                        selected_device.as_deref() == Some(device.as_str()),
-                                        &device,
-                                    ).clicked() {
+                                    if ui
+                                        .selectable_label(
+                                            selected_device.as_deref() == Some(device.as_str()),
+                                            &device,
+                                        )
+                                        .clicked()
+                                    {
                                         selected_device = Some(device);
                                     }
                                 }
@@ -556,23 +590,47 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     let output_channels = audio
                         .output_channels_for_device(cue.io.output_device.as_deref())
                         .max(1);
-                    ui.label(RichText::new(format!("Available outputs for this track: {}", output_channels))
-                        .color(Theme::TEXT_DIM).size(11.0));
-                    let track_layouts = audio.output_channel_layouts_for_device(cue.io.output_device.as_deref());
+                    ui.label(
+                        RichText::new(format!(
+                            "Available outputs for this track: {}",
+                            output_channels
+                        ))
+                        .color(Theme::TEXT_DIM)
+                        .size(11.0),
+                    );
+                    let track_layouts =
+                        audio.output_channel_layouts_for_device(cue.io.output_device.as_deref());
                     if !track_layouts.is_empty() {
-                        ui.label(RichText::new(format!("Driver layouts: {}", track_layouts.iter()
-                            .map(|count| format!("{} ch", count)).collect::<Vec<_>>().join(", ")))
-                            .color(Theme::TEXT_DIM).size(10.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "Driver layouts: {}",
+                                track_layouts
+                                    .iter()
+                                    .map(|count| format!("{} ch", count))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                            .color(Theme::TEXT_DIM)
+                            .size(10.0),
+                        );
                     }
-                    ui.label(RichText::new("Device selection applies the next time this cue is started.")
-                        .color(Theme::TEXT_DIM).size(10.0));
+                    ui.label(
+                        RichText::new(
+                            "Device selection applies the next time this cue is started.",
+                        )
+                        .color(Theme::TEXT_DIM)
+                        .size(10.0),
+                    );
                     let input_channels = cue.audio_channels;
                     if input_channels == 0 {
-                        ui.label(RichText::new("Could not detect this track's audio channel format")
-                            .color(Theme::TEXT_DIM));
+                        ui.label(
+                            RichText::new("Could not detect this track's audio channel format")
+                                .color(Theme::TEXT_DIM),
+                        );
                         return;
                     }
-                    cue.io.ensure_channel_routes(input_channels, output_channels);
+                    cue.io
+                        .ensure_channel_routes(input_channels, output_channels);
                     let format = match input_channels {
                         1 => "Mono",
                         2 => "Stereo",
@@ -580,58 +638,77 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         8 => "8-channel / 7.1 typical",
                         _ => "Multichannel",
                     };
-                    ui.label(RichText::new(format!("{} · {} source channels", format, input_channels))
-                        .color(Theme::ACCENT));
+                    ui.label(
+                        RichText::new(format!("{} · {} source channels", format, input_channels))
+                            .color(Theme::ACCENT),
+                    );
                     ui.add_space(6.0);
 
                     egui::ScrollArea::vertical()
                         .id_salt(("io_track_routes_scroll", cue_id))
                         .max_height(300.0)
                         .show(ui, |ui| {
-                        for (source_index, route) in cue.io.channel_routes.iter_mut().enumerate() {
-                            ui.horizontal(|ui| {
-                                changed |= ui.checkbox(&mut route.active, "Active").changed();
-                                let source_name = match (input_channels, source_index) {
-                                    (1, 0) => "Mono (1)".to_string(),
-                                    (2, 0) => "Left (1)".to_string(),
-                                    (2, 1) => "Right (2)".to_string(),
-                                    (_, index) => format!("Channel {}", index + 1),
-                                };
-                                ui.add_sized([92.0, 22.0], Label::new(source_name));
+                            for (source_index, route) in
+                                cue.io.channel_routes.iter_mut().enumerate()
+                            {
+                                ui.horizontal(|ui| {
+                                    changed |= ui.checkbox(&mut route.active, "Active").changed();
+                                    let source_name = match (input_channels, source_index) {
+                                        (1, 0) => "Mono (1)".to_string(),
+                                        (2, 0) => "Left (1)".to_string(),
+                                        (2, 1) => "Right (2)".to_string(),
+                                        (_, index) => format!("Channel {}", index + 1),
+                                    };
+                                    ui.add_sized([92.0, 22.0], Label::new(source_name));
 
-                                egui::ComboBox::from_id_salt(("cue_output_route", cue_id, source_index))
+                                    egui::ComboBox::from_id_salt((
+                                        "cue_output_route",
+                                        cue_id,
+                                        source_index,
+                                    ))
                                     .width(105.0)
                                     .selected_text(format!("Output {}", route.output_channel + 1))
                                     .show_ui(ui, |ui| {
                                         for output_index in 0..output_channels {
-                                            changed |= ui.selectable_value(
-                                                &mut route.output_channel,
-                                                output_index,
-                                                format!("Output {}", output_index + 1),
-                                            ).changed();
+                                            changed |= ui
+                                                .selectable_value(
+                                                    &mut route.output_channel,
+                                                    output_index,
+                                                    format!("Output {}", output_index + 1),
+                                                )
+                                                .changed();
                                         }
                                     });
 
-                                let slider_changed = ui.add(
-                                    Slider::new(&mut route.gain_db, -60.0..=18.0)
-                                        .show_value(false),
-                                ).changed();
-                                if slider_changed {
-                                    ui.ctx().data_mut(|data| data.insert_temp(
-                                        Id::new(("track_output_gain_db", cue_id, source_index)).with("gain_db_text"),
-                                        format!("{:.1}", route.gain_db),
-                                    ));
-                                }
-                                changed |= slider_changed;
-                                changed |= Self::gain_db_input(
-                                    ui,
-                                    Id::new(("track_output_gain_db", cue_id, source_index)),
-                                    &mut route.gain_db,
-                                );
-                                ui.label("dB");
-                            });
-                        }
-                    });
+                                    let slider_changed = ui
+                                        .add(
+                                            Slider::new(&mut route.gain_db, -60.0..=18.0)
+                                                .show_value(false),
+                                        )
+                                        .changed();
+                                    if slider_changed {
+                                        ui.ctx().data_mut(|data| {
+                                            data.insert_temp(
+                                                Id::new((
+                                                    "track_output_gain_db",
+                                                    cue_id,
+                                                    source_index,
+                                                ))
+                                                .with("gain_db_text"),
+                                                format!("{:.1}", route.gain_db),
+                                            )
+                                        });
+                                    }
+                                    changed |= slider_changed;
+                                    changed |= Self::gain_db_input(
+                                        ui,
+                                        Id::new(("track_output_gain_db", cue_id, source_index)),
+                                        &mut route.gain_db,
+                                    );
+                                    ui.label("dB");
+                                });
+                            }
+                        });
 
                     if let Some(left) = cue.io.channel_routes.first() {
                         cue.io.left_enabled = left.active;
@@ -642,8 +719,10 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         cue.io.right_gain_db = right.gain_db;
                     }
                 } else {
-                    ui.label(RichText::new("Select an audio cue to configure its source channels")
-                        .color(Theme::TEXT_DIM));
+                    ui.label(
+                        RichText::new("Select an audio cue to configure its source channels")
+                            .color(Theme::TEXT_DIM),
+                    );
                 }
             });
         });
@@ -799,9 +878,11 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
 
             Self::section(&mut cols[1], "Ready MIDI Code (Hex / SysEx)", |ui| {
                 ui.label(
-                    RichText::new("Enter raw MIDI bytes in Hex (e.g. 90 3C 7F or F0 7F 7F 06 02 F7):")
-                        .color(Theme::TEXT_DIM)
-                        .size(11.0),
+                    RichText::new(
+                        "Enter raw MIDI bytes in Hex (e.g. 90 3C 7F or F0 7F 7F 06 02 F7):",
+                    )
+                    .color(Theme::TEXT_DIM)
+                    .size(11.0),
                 );
                 if ui
                     .add(
@@ -818,13 +899,12 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     }
                 }
 
-                let bytes_to_send = if !raw_hex.trim().is_empty()
-                    && matches!(message, MidiMessageKind::Raw(_))
-                {
-                    MidiMessageKind::parse_hex(raw_hex)
-                } else {
-                    message.to_bytes(*channel)
-                };
+                let bytes_to_send =
+                    if !raw_hex.trim().is_empty() && matches!(message, MidiMessageKind::Raw(_)) {
+                        MidiMessageKind::parse_hex(raw_hex)
+                    } else {
+                        message.to_bytes(*channel)
+                    };
 
                 ui.horizontal(|ui| {
                     ui.label(
@@ -845,13 +925,21 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         let (rect, _) = ui.allocate_exact_size(vec2(300.0, 72.0), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, Theme::BG_DARK);
-        painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, Theme::BORDER), StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.0_f32, Theme::BORDER),
+            StrokeKind::Inside,
+        );
         let points: Vec<Pos2> = (0..=48)
             .map(|index| {
                 let t = index as f32 / 48.0;
                 let progress = curve.apply(t);
                 let level = if fade_in { progress } else { 1.0 - progress };
-                pos2(rect.left() + t * rect.width(), rect.bottom() - level * rect.height())
+                pos2(
+                    rect.left() + t * rect.width(),
+                    rect.bottom() - level * rect.height(),
+                )
             })
             .collect();
         painter.add(Shape::line(points, Stroke::new(2.0_f32, Theme::ACCENT)));
@@ -892,8 +980,13 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         if response.dragged() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let x = ((pointer.x - rect.left()) / rect.width()).clamp(0.01, 0.99);
-                let displayed_level = (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                let y = if fade_in { displayed_level } else { 1.0 - displayed_level };
+                let displayed_level =
+                    (1.0 - (pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                let y = if fade_in {
+                    displayed_level
+                } else {
+                    1.0 - displayed_level
+                };
                 if points.len() < 2 {
                     *points = vec![[0.0, 0.0], [1.0, 1.0]];
                 }
@@ -915,13 +1008,17 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             .map(|point| {
                 pos2(
                     rect.left() + point[0].clamp(0.0, 1.0) * rect.width(),
-                    rect.bottom() - (if fade_in { point[1] } else { 1.0 - point[1] })
-                        .clamp(0.0, 1.0) * rect.height(),
+                    rect.bottom()
+                        - (if fade_in { point[1] } else { 1.0 - point[1] }).clamp(0.0, 1.0)
+                            * rect.height(),
                 )
             })
             .collect();
         if curve_points.len() >= 2 {
-            painter.add(Shape::line(curve_points, Stroke::new(2.0_f32, Theme::ACCENT)));
+            painter.add(Shape::line(
+                curve_points,
+                Stroke::new(2.0_f32, Theme::ACCENT),
+            ));
         }
 
         ui.horizontal(|ui| {
@@ -937,7 +1034,12 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     }
 
     fn section(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
-        ui.label(RichText::new(title).color(Theme::ACCENT).size(11.5).strong());
+        ui.label(
+            RichText::new(title)
+                .color(Theme::ACCENT)
+                .size(11.5)
+                .strong(),
+        );
         ui.indent(title, |ui| {
             content(ui);
         });
@@ -945,7 +1047,9 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
 
     fn gain_db_input(ui: &mut Ui, id: Id, value: &mut f32) -> bool {
         let text_id = id.with("gain_db_text");
-        let mut text = ui.ctx().data(|data| data.get_temp::<String>(text_id))
+        let mut text = ui
+            .ctx()
+            .data(|data| data.get_temp::<String>(text_id))
             .unwrap_or_else(|| format!("{:.1}", *value));
         let response = ui.add_sized(
             [66.0, 22.0],
