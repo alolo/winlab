@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct AssetManager {
     pub project_path: Option<PathBuf>,
@@ -18,36 +18,58 @@ impl AssetManager {
     }
 
     pub fn import_file(&self, src: &Path) -> Result<PathBuf> {
-        let project_path = self
-            .project_path
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No project path set — save project first"))?;
+        // An unsaved project has no assets directory yet. Keep the original file
+        // reference for now; save_project() will migrate it after the project is named.
+        let Some(project_path) = self.project_path.as_ref() else {
+            return Ok(src.to_path_buf());
+        };
 
         let assets_dir = project_path
             .parent()
             .unwrap_or(Path::new("."))
             .join("assets");
-
         std::fs::create_dir_all(&assets_dir)?;
 
         let file_name = src
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+        let mut destination = assets_dir.join(file_name);
 
-        let dst = assets_dir.join(file_name);
-
-        if dst == src {
-            return Ok(dst);
+        if destination.as_path() == src || Self::same_file(src, &destination) {
+            return Ok(destination);
         }
 
-        if dst.exists() {
-            warn!("Asset {:?} already exists, skipping copy", dst);
-            return Ok(dst);
+        // Avoid silently reusing an unrelated asset with the same filename.
+        if destination.exists() {
+            let stem = src
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("audio");
+            let extension = src.extension().and_then(|value| value.to_str());
+            let mut suffix = 2_u32;
+            loop {
+                let name = match extension {
+                    Some(extension) => format!("{stem}_{suffix}.{extension}"),
+                    None => format!("{stem}_{suffix}"),
+                };
+                destination = assets_dir.join(name);
+                if !destination.exists() {
+                    break;
+                }
+                suffix += 1;
+            }
         }
 
-        std::fs::copy(src, &dst)?;
-        info!("Asset imported: {:?} → {:?}", src, dst);
-        Ok(dst)
+        std::fs::copy(src, &destination)?;
+        info!("Asset imported: {:?} → {:?}", src, destination);
+        Ok(destination)
+    }
+
+    fn same_file(left: &Path, right: &Path) -> bool {
+        match (left.canonicalize(), right.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
     }
 
     #[allow(dead_code)]

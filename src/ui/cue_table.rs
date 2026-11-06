@@ -1,19 +1,168 @@
-// src/ui/cue_table.rs — таблица событий с мультивыбором, Drag-and-Drop на колонку Target и редактированием
+// src/ui/cue_table.rs
 #![allow(float_literal_f32_fallback)]
 use crate::cue::{ContinueMode, Cue, CueColor, CueState, CueType};
 use crate::ui::theme::Theme;
 use egui::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
+    Number,
     Name,
     PreWait,
     PostWait,
 }
 
+/// Returns the cue IDs in the same order in which rows are currently shown.
+/// Navigation therefore follows the visible project tree, never cue numbering or
+/// the backing flat vector order.
+pub fn visible_cue_ids(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<Uuid> {
+    build_display_order(cues, expanded_groups)
+        .into_iter()
+        .map(|(index, _)| cues[index].id)
+        .collect()
+}
+
+fn build_display_order(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<(usize, u8)> {
+    let child_ids: HashSet<Uuid> = cues
+        .iter()
+        .filter_map(|cue| match &cue.cue_type {
+            CueType::Group { children, .. } => Some(children.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    let mut order = Vec::new();
+    let mut visible_visited = HashSet::new();
+    let mut structurally_reachable = HashSet::new();
+
+    // First walk all real roots. Structural reachability is tracked separately
+    // from visibility: children of a collapsed group are intentionally hidden,
+    // not orphaned, and must never be appended by the fallback pass below.
+    for (index, cue) in cues.iter().enumerate() {
+        if !child_ids.contains(&cue.id) {
+            collect_structural_reachability(cues, cue.id, &mut structurally_reachable);
+            if visible_visited.insert(cue.id) {
+                order.push((index, 0));
+                append_group_children(
+                    cues,
+                    cue.id,
+                    1,
+                    expanded_groups,
+                    &mut visible_visited,
+                    &mut order,
+                );
+            }
+        }
+    }
+
+    // Detached malformed components (for example a cycle with no root) remain
+    // reachable, but each component gets only one visible fallback root.
+    for (index, cue) in cues.iter().enumerate() {
+        if !structurally_reachable.contains(&cue.id) {
+            collect_structural_reachability(cues, cue.id, &mut structurally_reachable);
+            if visible_visited.insert(cue.id) {
+                order.push((index, 0));
+                append_group_children(
+                    cues,
+                    cue.id,
+                    1,
+                    expanded_groups,
+                    &mut visible_visited,
+                    &mut order,
+                );
+            }
+        }
+    }
+    order
+}
+
+fn build_sibling_locations(cues: &[Cue]) -> HashMap<Uuid, (Option<Uuid>, usize)> {
+    let mut locations = HashMap::new();
+    let mut child_ids = HashSet::new();
+
+    for cue in cues {
+        if let CueType::Group { children, .. } = &cue.cue_type {
+            for (index, child_id) in children.iter().copied().enumerate() {
+                child_ids.insert(child_id);
+                locations.entry(child_id).or_insert((Some(cue.id), index));
+            }
+        }
+    }
+
+    let mut root_index = 0usize;
+    for cue in cues {
+        if !child_ids.contains(&cue.id) {
+            locations.entry(cue.id).or_insert((None, root_index));
+            root_index += 1;
+        }
+    }
+    locations
+}
+
+fn collect_structural_reachability(
+    cues: &[Cue],
+    cue_id: Uuid,
+    reachable: &mut HashSet<Uuid>,
+) {
+    if !reachable.insert(cue_id) {
+        return;
+    }
+    if let Some(cue) = cues.iter().find(|cue| cue.id == cue_id) {
+        if let CueType::Group { children, .. } = &cue.cue_type {
+            for child_id in children {
+                collect_structural_reachability(cues, *child_id, reachable);
+            }
+        }
+    }
+}
+
+fn append_group_children(
+    cues: &[Cue],
+    group_id: Uuid,
+    depth: u8,
+    expanded_groups: &HashSet<Uuid>,
+    visited: &mut HashSet<Uuid>,
+    order: &mut Vec<(usize, u8)>,
+) {
+    if !expanded_groups.contains(&group_id) {
+        return;
+    }
+    let Some(group) = cues.iter().find(|cue| cue.id == group_id) else {
+        return;
+    };
+    let CueType::Group { children, .. } = &group.cue_type else {
+        return;
+    };
+    for child_id in children {
+        if !visited.insert(*child_id) {
+            continue;
+        }
+        if let Some(index) = cues.iter().position(|cue| cue.id == *child_id) {
+            order.push((index, depth));
+            append_group_children(
+                cues,
+                *child_id,
+                depth.saturating_add(1),
+                expanded_groups,
+                visited,
+                order,
+            );
+        }
+    }
+}
+
 pub struct CueTable;
+
+#[derive(Debug, Clone)]
+struct CueDragState {
+    source_id: Uuid,
+    start_pos: Pos2,
+    dragged_ids: Vec<Uuid>,
+    active: bool,
+}
 
 impl CueTable {
     pub fn show(
@@ -21,99 +170,227 @@ impl CueTable {
         cues: &mut Vec<Cue>,
         selected: &mut Option<Uuid>,
         selected_ids: &mut HashSet<Uuid>,
+        selection_anchor: &mut Option<Uuid>,
         editing: &mut Option<(Uuid, EditField, String)>,
+        editing_focus_pending: &mut bool,
+        column_widths: &mut [f32; 9],
         expanded_groups: &mut HashSet<Uuid>,
     ) -> Option<CueTableAction> {
         let mut action = None;
 
         let cue_names: std::collections::HashMap<Uuid, String> = cues
             .iter()
-            .map(|c| (c.id, format!("#{} {}", c.number, c.name)))
-            .collect();
-
-        // Дочерние элементы групп, чтобы не дублировать их на верхнем уровне таблицы
-        let child_ids: HashSet<Uuid> = cues
-            .iter()
-            .filter_map(|c| match &c.cue_type {
-                CueType::Group { children, .. } => Some(children.iter().copied()),
-                _ => None,
+            .map(|c| {
+                let label = if c.number.trim().is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("#{} {}", c.number, c.name)
+                };
+                (c.id, label)
             })
-            .flatten()
+            .collect();
+        let targetable_ids: HashSet<Uuid> = cues
+            .iter()
+            .filter(|cue| {
+                matches!(&cue.cue_type, CueType::Audio | CueType::Group { .. })
+                    || !cue.file_path.as_os_str().is_empty()
+            })
+            .map(|cue| cue.id)
             .collect();
 
         let row_h = 28.0_f32;
-        let col_widths = [44.0_f32, 75.0, 210.0, 165.0, 68.0, 78.0, 68.0, 95.0, 125.0];
-
-        // Заголовки таблицы
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            for (label, w) in [
-                ("Cue", col_widths[0]),
-                ("Type", col_widths[1]),
-                ("Name", col_widths[2]),
-                ("File / Target", col_widths[3]),
-                ("Pre-Wait", col_widths[4]),
-                ("Duration", col_widths[5]),
-                ("Post-Wait", col_widths[6]),
-                ("Status", col_widths[7]),
-                ("Continue", col_widths[8]),
-            ] {
-                ui.add_sized(
-                    [w, 20.0],
-                    Label::new(RichText::new(label).color(Theme::TEXT_DIM).size(11.0)),
-                );
-            }
-        });
-        ui.add(Separator::default().horizontal());
-
-        // Формируем порядок отображения: (индекс в cues, уровень отступа, Uuid)
-        let mut display_order: Vec<(usize, u8, Uuid)> = Vec::new();
-        for (idx, cue) in cues.iter().enumerate() {
-            if child_ids.contains(&cue.id) {
-                continue;
-            }
-            display_order.push((idx, 0, cue.id));
+        // The 26 px gutter is shared by header and rows: 18 px for the group
+        // disclosure slot, 5 px for the color strip, and 3 px breathing room.
+        let table_width = 26.0 + column_widths.iter().sum::<f32>();
+        let display_order = build_display_order(cues, expanded_groups);
+        let sibling_locations = build_sibling_locations(cues);
+        let group_child_counts: HashMap<Uuid, usize> = cues.iter().filter_map(|cue| {
             if let CueType::Group { children, .. } = &cue.cue_type {
-                if expanded_groups.contains(&cue.id) {
-                    for child_id in children {
-                        if let Some(cidx) = cues.iter().position(|c| c.id == *child_id) {
-                            display_order.push((cidx, 1, *child_id));
-                        }
-                    }
-                }
+                Some((cue.id, children.len()))
+            } else {
+                None
             }
-        }
+        }).collect();
+        let display_ids: Vec<Uuid> = display_order
+            .iter()
+            .map(|(index, _)| cues[*index].id)
+            .collect();
 
-        let mut dropped_target_idx: Option<usize> = None;
-        let mut assign_target_cue_id: Option<Uuid> = None;
-        let dragged_id = ui.data(|d| d.get_temp::<Uuid>(Id::new("dragged_cue_id")));
-        let pointer_pos = ui.ctx().pointer_latest_pos();
-        let any_click = ui.input(|i| i.pointer.any_click());
+        let viewport_rect = ui.available_rect_before_wrap();
+        let header_rect = Rect::from_min_size(
+            viewport_rect.min,
+            vec2(viewport_rect.width(), 28.0),
+        );
+        let mut row_rects: Vec<Rect> = Vec::with_capacity(display_order.len());
+        let mut drop_destination: Option<(Option<Uuid>, usize)> = None;
+        let mut drop_line_y: Option<f32> = None;
+        let drag_state_id = Id::new("cue_table_drag_state");
+        let mut drag_state = ui
+            .data(|data| data.get_temp::<Option<CueDragState>>(drag_state_id))
+            .flatten();
 
-        let scroll_output = egui::ScrollArea::vertical()
+        // One horizontal scroll area contains both header and rows. This keeps
+        // every header aligned with its column even after horizontal scrolling.
+        egui::ScrollArea::horizontal()
+            .id_salt("cue_table_horizontal_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for &(cue_idx, indent, cue_id) in &display_order {
-                    let is_selected = selected_ids.contains(&cue_id) || *selected == Some(cue_id);
+                ui.set_min_width(table_width);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(26.0);
+                    let labels = [
+                        "Cue", "Type", "Name", "File / Target", "Pre-Wait",
+                        "Duration", "Post-Wait", "Status", "Continue",
+                    ];
+                    for (index, label) in labels.iter().enumerate() {
+                        const RESIZE_HANDLE_WIDTH: f32 = 14.0;
+                        ui.add_sized(
+                            [(column_widths[index] - RESIZE_HANDLE_WIDTH).max(24.0), 22.0],
+                            Label::new(RichText::new(*label).color(Theme::TEXT_DIM).size(11.0)),
+                        );
+                        let (handle_rect, resize_response) = ui.allocate_exact_size(
+                            vec2(RESIZE_HANDLE_WIDTH, 22.0),
+                            Sense::drag(),
+                        );
+                        let start_id = Id::new(("cue_column_resize_start", index));
+                        if resize_response.drag_started() {
+                            let start_x = ui.ctx().pointer_latest_pos()
+                                .map(|position| position.x)
+                                .unwrap_or(handle_rect.center().x);
+                            ui.data_mut(|data| {
+                                data.insert_temp(start_id, (column_widths[index], start_x));
+                            });
+                        }
+                        if resize_response.dragged() {
+                            if let (Some((start_width, start_x)), Some(pointer)) = (
+                                ui.data(|data| data.get_temp::<(f32, f32)>(start_id)),
+                                ui.ctx().pointer_latest_pos(),
+                            ) {
+                                column_widths[index] = (start_width + pointer.x - start_x)
+                                    .clamp(44.0, 600.0);
+                            }
+                            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                        } else if resize_response.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                        }
+                        if resize_response.drag_stopped() {
+                            ui.data_mut(|data| {
+                                let _ = data.remove_temp::<(f32, f32)>(start_id);
+                            });
+                        }
+                        ui.painter().line_segment(
+                            [pos2(handle_rect.center().x, handle_rect.top() + 3.0),
+                             pos2(handle_rect.center().x, handle_rect.bottom() - 3.0)],
+                            Stroke::new(1.5, if resize_response.hovered() || resize_response.dragged() {
+                                Theme::ACCENT
+                            } else {
+                                Theme::BORDER
+                            }),
+                        );
+                    }
+                });
+                ui.add(Separator::default().horizontal());
+
+                egui::ScrollArea::vertical()
+                    .id_salt("cue_table_vertical_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(table_width);
+                        let mut completed_group_frames: Vec<Rect> = Vec::new();
+                        let mut group_frame_stack: Vec<(u8, Rect)> = Vec::new();
+                        let cues_len = cues.len();
+                        for &(cue_idx, indent) in &display_order {
                     let cue = &mut cues[cue_idx];
-
+                    let is_selected = selected_ids.contains(&cue.id) || *selected == Some(cue.id);
                     let row_start = ui.cursor().min;
-                    let row_rect =
-                        Rect::from_min_size(row_start, vec2(ui.available_width(), row_h));
+                    let row_rect = Rect::from_min_size(row_start, vec2(table_width, row_h));
+                    row_rects.push(row_rect);
 
+                    // Close frames for groups whose visible subtree has ended.
+                    while group_frame_stack.last().map(|(depth, _)| *depth >= indent).unwrap_or(false) {
+                        if let Some((_, rect)) = group_frame_stack.pop() {
+                            completed_group_frames.push(rect);
+                        }
+                    }
+                    for (_, frame_rect) in group_frame_stack.iter_mut() {
+                        *frame_rect = frame_rect.union(row_rect);
+                    }
+                    let is_group_row = matches!(&cue.cue_type, CueType::Group { .. });
+                    // Every group gets its own green frame. A collapsed group
+                    // naturally closes after its header row; an expanded group
+                    // encloses all visible descendants.
+                    if is_group_row {
+                        group_frame_stack.push((indent, row_rect));
+                    }
+
+                    // Фон
                     let base_bg = Self::row_bg(cue, is_selected, cue_idx);
                     ui.painter().rect_filled(row_rect, 0.0_f32, base_bg);
 
-                    // 10% прозрачность цвета строки
+                    // Тонировка цветом (теперь с alpha=26)
                     if let Some(cue_tint) = cue.color.row_bg_egui() {
                         ui.painter().rect_filled(row_rect, 0.0_f32, cue_tint);
                     }
 
-                    if dragged_id == Some(cue_id) {
+                    // Start a row drag from any cell, including labels, target,
+                    // pre/post-wait, status, and the group disclosure area. This
+                    // does not depend on which child widget owns the pointer.
+                    let pointer_pos = ui.ctx().pointer_latest_pos();
+                    let primary_pressed = ui.input(|input| {
+                        input.pointer.button_pressed(PointerButton::Primary)
+                    });
+                    if drag_state.is_none() && primary_pressed
+                        && pointer_pos.map(|position| row_rect.contains(position)).unwrap_or(false)
+                    {
+                        drag_state = pointer_pos.map(|start_pos| CueDragState {
+                            source_id: cue.id,
+                            start_pos,
+                            dragged_ids: Vec::new(),
+                            active: false,
+                        });
+                    }
+                    if let Some(state) = drag_state.as_mut() {
+                        if !state.active
+                            && ui.input(|input| input.pointer.button_down(PointerButton::Primary))
+                        {
+                            if let Some(position) = pointer_pos {
+                                if state.start_pos.distance(position) >= 6.0 {
+                                    state.dragged_ids = if selected_ids.contains(&state.source_id)
+                                        && selected_ids.len() > 1
+                                    {
+                                        display_ids.iter()
+                                            .filter(|id| selected_ids.contains(*id))
+                                            .copied()
+                                            .collect()
+                                    } else {
+                                        *selected = Some(state.source_id);
+                                        selected_ids.clear();
+                                        selected_ids.insert(state.source_id);
+                                        *selection_anchor = Some(state.source_id);
+                                        vec![state.source_id]
+                                    };
+                                    state.active = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let active_drag_ids: Vec<Uuid> = drag_state.as_ref()
+                        .filter(|state| state.active)
+                        .map(|state| state.dragged_ids.clone())
+                        .unwrap_or_default();
+                    if active_drag_ids.contains(&cue.id) {
                         ui.painter().rect_filled(
                             row_rect,
                             2.0_f32,
-                            Color32::from_rgba_unmultiplied(90, 170, 255, 40),
+                            Color32::from_rgba_unmultiplied(90, 170, 255, 55),
+                        );
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            2.0_f32,
+                            Stroke::new(1.5_f32, Theme::ACCENT),
+                            StrokeKind::Inside,
                         );
                     }
 
@@ -126,107 +403,143 @@ impl CueTable {
                         );
                     }
 
-                    let mut name_clicked = false;
-                    let mut target_col_rect = Rect::NOTHING;
-
-                    let resp = ui.horizontal(|ui| {
-                        if indent > 0 {
-                            ui.add_space(indent as f32 * 16.0);
-                        }
-
+                    // Background row interaction spans every visible column. It is
+                    // registered before controls so static cells remain draggable.
+                    let row_resp = ui.interact(
+                        row_rect,
+                        Id::new(("cue_row_click", cue.id)),
+                        Sense::click_and_drag(),
+                    );
+                    let mut target_cell_rect = Rect::NOTHING;
+                    let mut cue_number_rect = Rect::NOTHING;
+                    let mut name_cell_rect = Rect::NOTHING;
+                    let mut pre_wait_rect = Rect::NOTHING;
+                    let mut post_wait_rect = Rect::NOTHING;
+                    let mut continue_cell_rect = Rect::NOTHING;
+                    let _resp = ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        // Reserve a real horizontal disclosure slot for every row.
+                        // ui.add_space() is vertical in egui, so it cannot align columns.
                         let is_group = matches!(&cue.cue_type, CueType::Group { .. });
-                        if is_group && indent == 0 {
-                            let open = expanded_groups.contains(&cue_id);
-                            let arrow = if open { "▼" } else { "▶" };
-                            let btn = ui.add_sized(
-                                [18.0, row_h - 6.0],
-                                Button::new(RichText::new(arrow).size(11.0))
-                                    .frame(false)
-                                    .fill(Color32::TRANSPARENT),
-                            );
-                            if btn.clicked() {
+                        let (arrow_rect, arrow_response) = ui.allocate_exact_size(
+                            vec2(18.0, row_h),
+                            if is_group { Sense::click() } else { Sense::hover() },
+                        );
+                        if is_group {
+                            let open = expanded_groups.contains(&cue.id);
+                            let center = arrow_rect.center();
+                            let points = if open {
+                                vec![
+                                    pos2(center.x - 5.0, center.y - 2.5),
+                                    pos2(center.x + 5.0, center.y - 2.5),
+                                    pos2(center.x, center.y + 4.5),
+                                ]
+                            } else {
+                                vec![
+                                    pos2(center.x - 2.5, center.y - 5.0),
+                                    pos2(center.x - 2.5, center.y + 5.0),
+                                    pos2(center.x + 4.5, center.y),
+                                ]
+                            };
+                            ui.painter().add(Shape::convex_polygon(
+                                points,
+                                Theme::TEXT_DIM,
+                                Stroke::NONE,
+                            ));
+                            if arrow_response.clicked() {
                                 if open {
-                                    expanded_groups.remove(&cue_id);
+                                    expanded_groups.remove(&cue.id);
                                 } else {
-                                    expanded_groups.insert(cue_id);
+                                    expanded_groups.insert(cue.id);
                                 }
                             }
-                        } else {
-                            ui.add_space(18.0);
                         }
 
+                        // Цветная полоска слева
                         let (strip_rect, _) =
                             ui.allocate_exact_size(vec2(5.0, row_h), Sense::hover());
                         ui.painter()
                             .rect_filled(strip_rect, 0.0_f32, cue.color.to_egui());
-                        ui.add_space(3.0);
+                        ui.allocate_exact_size(vec2(3.0, row_h), Sense::hover());
 
-                        // Cue #
-                        ui.add_sized(
-                            [col_widths[0], row_h],
-                            Label::new(
-                                RichText::new(&cue.number)
-                                    .color(Theme::ACCENT)
-                                    .monospace()
-                                    .size(12.0),
-                            ),
-                        );
-
-                        // Type
-                        ui.add_sized(
-                            [col_widths[1], row_h],
-                            Label::new(
-                                RichText::new(format!(
-                                    "{} {}",
-                                    cue.cue_type.icon(),
-                                    cue.cue_type.label()
-                                ))
-                                .color(Theme::TEXT)
-                                .size(11.5),
-                            ),
-                        );
-
-                        // Name (редактирование без моргания при клике мимо)
-                        let is_editing_name =
-                            matches!(editing, Some((id, EditField::Name, _)) if *id == cue_id);
-                        if is_editing_name {
+                        // Cue number — double-click to edit; an empty value is allowed.
+                        let is_editing_number =
+                            matches!(editing, Some((id, EditField::Number, _)) if *id == cue.id);
+                        if is_editing_number {
                             if let Some((_, _, ref mut buf)) = editing {
-                                let focus_flag_id =
-                                    Id::new(("edit_focus_init", cue_id, EditField::Name));
-                                let need_focus = ui
-                                    .data(|d| d.get_temp::<bool>(focus_flag_id))
-                                    .unwrap_or(true);
-
-                                let r = ui.add_sized(
-                                    [col_widths[2], row_h - 4.0],
-                                    TextEdit::singleline(buf).font(TextStyle::Body),
+                                let response = ui.add_sized(
+                                    [column_widths[0], row_h - 4.0],
+                                    TextEdit::singleline(buf).font(TextStyle::Monospace),
                                 );
-
-                                if need_focus {
-                                    r.request_focus();
-                                    ui.data_mut(|d| d.insert_temp(focus_flag_id, false));
-                                } else {
-                                    let clicked_outside = any_click
-                                        && pointer_pos.map_or(false, |pos| !r.rect.contains(pos));
-                                    if clicked_outside
-                                        || r.lost_focus()
-                                        || ui.input(|i| i.key_pressed(Key::Enter))
-                                    {
-                                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
-                                        action = Some(CueTableAction::EditConfirm(
-                                            cue_id,
-                                            EditField::Name,
-                                            buf.clone(),
-                                        ));
-                                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
-                                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
-                                        action = Some(CueTableAction::EditCancel);
-                                    }
+                                cue_number_rect = response.rect;
+                                if *editing_focus_pending {
+                                    response.request_focus();
+                                    *editing_focus_pending = false;
+                                }
+                                if response.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    action = Some(CueTableAction::EditConfirm(
+                                        cue.id, EditField::Number, buf.clone(),
+                                    ));
+                                }
+                                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                    action = Some(CueTableAction::EditCancel);
                                 }
                             }
                         } else {
+                            let number_label = ui.add_sized(
+                                [column_widths[0], row_h],
+                                Label::new(
+                                    RichText::new(&cue.number)
+                                        .color(Theme::ACCENT)
+                                        .monospace()
+                                        .size(12.0),
+                                )
+                                .selectable(false)
+                                .sense(Sense::hover()),
+                            );
+                            cue_number_rect = number_label.rect;
+                        }
+
+                        // Type
+                        ui.add_sized(
+                            [column_widths[1], row_h],
+                            Label::new(
+                                RichText::new(cue.cue_type.icon())
+                                    .color(Theme::TEXT)
+                                    .size(15.0),
+                            ).selectable(false).sense(Sense::hover()),
+                        );
+
+                        // Name — двойной клик по имени запускает редактирование
+                        let is_editing_name =
+                            matches!(editing, Some((id, EditField::Name, _)) if *id == cue.id);
+                        if is_editing_name {
+                            if let Some((_, _, ref mut buf)) = editing {
+                                ui.add_space(indent as f32 * 16.0);
+                                let r = ui.add_sized(
+                                    [(column_widths[2] - indent as f32 * 16.0).max(24.0), row_h - 4.0],
+                                    TextEdit::singleline(buf).font(TextStyle::Body),
+                                );
+                                name_cell_rect = r.rect;
+                                if *editing_focus_pending {
+                                    r.request_focus();
+                                    *editing_focus_pending = false;
+                                }
+                                if r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    action = Some(CueTableAction::EditConfirm(
+                                        cue.id,
+                                        EditField::Name,
+                                        buf.clone(),
+                                    ));
+                                }
+                                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                    action = Some(CueTableAction::EditCancel);
+                                }
+                            }
+                        } else {
+                            ui.add_space(indent as f32 * 16.0);
                             let name_label = ui.add_sized(
-                                [col_widths[2], row_h],
+                                [(column_widths[2] - indent as f32 * 16.0).max(24.0), row_h],
                                 Label::new(
                                     RichText::new(&cue.name)
                                         .color(Self::name_color(cue))
@@ -234,78 +547,72 @@ impl CueTable {
                                         .strong(),
                                 )
                                 .truncate()
-                                .sense(Sense::click()),
+                                .selectable(false)
+                                .sense(Sense::hover()),
                             );
-                            if name_label.double_clicked() {
-                                let focus_flag_id =
-                                    Id::new(("edit_focus_init", cue_id, EditField::Name));
-                                ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
-                                action = Some(CueTableAction::StartEdit(
-                                    cue_id,
-                                    EditField::Name,
-                                    cue.name.clone(),
-                                ));
-                            } else if name_label.clicked() {
-                                name_clicked = true;
-                            }
+                            name_cell_rect = name_label.rect;
                         }
 
-                        // File / Target (сохраняем точный прямоугольник ячейки для Drag-and-Drop таргета)
+                        // File / Target
                         let target_desc = Self::describe_target(cue, &cue_names);
-                        let target_resp = ui.add_sized(
-                            [col_widths[3], row_h],
+                        let target_cell = ui.add_sized(
+                            [column_widths[3], row_h],
                             Label::new(
                                 RichText::new(target_desc).color(Theme::TEXT_DIM).size(11.0),
                             )
-                            .truncate(),
+                            .truncate()
+                            .selectable(false)
+                            .sense(Sense::hover()),
                         );
-                        target_col_rect = target_resp.rect;
+                        target_cell_rect = target_cell.rect;
 
-                        // Pre-Wait
-                        Self::wait_cell(
+                        // Pre-Wait (двойной клик = редактирование)
+                        pre_wait_rect = Self::wait_cell(
                             ui,
-                            cue_id,
+                            cue.id,
                             EditField::PreWait,
                             cue.pre_wait_secs,
-                            col_widths[4],
+                            column_widths[4],
                             row_h,
                             Theme::ACCENT,
                             editing,
+                            editing_focus_pending,
                             &mut action,
-                            any_click,
-                            pointer_pos,
+                            indent,
                         );
 
                         // Duration
                         ui.add_sized(
-                            [col_widths[5], row_h],
+                            [column_widths[5], row_h],
                             Label::new(
                                 RichText::new(format_duration(cue.effective_duration()))
                                     .color(Theme::TEXT_DIM)
                                     .monospace()
                                     .size(11.0),
-                            ),
+                            )
+                            .selectable(false)
+                            .sense(Sense::hover()),
                         );
 
                         // Post-Wait
-                        Self::wait_cell(
+                        post_wait_rect = Self::wait_cell(
                             ui,
-                            cue_id,
+                            cue.id,
                             EditField::PostWait,
                             cue.post_wait_secs,
-                            col_widths[6],
+                            column_widths[6],
                             row_h,
                             Theme::ACCENT2,
                             editing,
+                            editing_focus_pending,
                             &mut action,
-                            any_click,
-                            pointer_pos,
+                            indent,
                         );
 
                         // Status
-                        ui.add_sized([col_widths[7], row_h], |ui: &mut Ui| {
+                        ui.add_sized([column_widths[7], row_h], |ui: &mut Ui| {
                             let (rect, resp) = ui.allocate_exact_size(
-                                vec2(col_widths[7], row_h - 8.0),
+                                vec2(column_widths[7], row_h - 8.0),
                                 Sense::hover(),
                             );
                             if cue.is_active() && cue.effective_duration() > 0.0 {
@@ -340,9 +647,9 @@ impl CueTable {
                         });
 
                         // Continue
-                        ui.push_id(("continue_combo", cue_id), |ui| {
+                        let continue_response = ui.push_id(("continue_combo", cue.id), |ui| {
                             egui::ComboBox::from_id_salt("cont")
-                                .width(col_widths[8] - 8.0)
+                                .width(column_widths[8])
                                 .selected_text(cue.continue_mode.label())
                                 .show_ui(ui, |ui| {
                                     for mode in ContinueMode::ALL {
@@ -352,118 +659,185 @@ impl CueTable {
                                             mode.label(),
                                         );
                                     }
-                                });
+                                })
                         });
+                        continue_cell_rect = continue_response.response.rect;
+                        ui.spacing_mut().item_spacing.x = 8.0;
                     });
 
-                    let is_group = matches!(&cue.cue_type, CueType::Group { .. });
-                    let is_targetable = matches!(
-                        &cue.cue_type,
-                        CueType::Play { .. }
-                            | CueType::Pause { .. }
-                            | CueType::Stop { .. }
-                            | CueType::Fade { .. }
-                    );
-
-                    let left_offset = if is_group && indent == 0 { 18.0 } else { 0.0 };
-                    let interact_rect = Rect::from_min_max(
-                        pos2(
-                            resp.response.rect.left() + left_offset,
-                            resp.response.rect.top(),
-                        ),
-                        pos2(
-                            resp.response.rect.left()
-                                + left_offset
-                                + col_widths[0]
-                                + col_widths[1]
-                                + 30.0,
-                            resp.response.rect.bottom(),
-                        ),
-                    );
-                    let row_resp = ui.interact(
-                        interact_rect,
-                        Id::new(("cue_row_click", cue_id)),
-                        Sense::click_and_drag(),
-                    );
-
-                    if row_resp.drag_started() {
-                        ui.data_mut(|d| d.insert_temp(Id::new("dragged_cue_id"), cue_id));
-                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                    }
-                    if row_resp.dragged() {
-                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                    let pointer_position = pointer_pos;
+                    let pointer_clicked_in_row = ui.input(|input| {
+                        input.pointer.button_clicked(PointerButton::Primary)
+                    }) && pointer_position
+                        .map(|position| row_rect.contains(position))
+                        .unwrap_or(false);
+                    // A ComboBox popup is rendered on its own foreground layer.
+                    // Do not use the row's manual pointer fallback when the click
+                    // belongs to that popup, otherwise selecting a Continue mode
+                    // also selects the row underneath it.
+                    let click_is_on_row_layer = pointer_position
+                        .and_then(|position| ui.ctx().layer_id_at(position))
+                        .map(|layer| layer == ui.layer_id())
+                        .unwrap_or(false);
+                    let clicked_continue_control = pointer_position
+                        .map(|position| continue_cell_rect.contains(position))
+                        .unwrap_or(false);
+                    if (row_resp.clicked() || (pointer_clicked_in_row && click_is_on_row_layer))
+                        && !clicked_continue_control
+                    {
+                        let modifiers = ui.input(|input| input.modifiers);
+                        Self::apply_selection(
+                            cue.id,
+                            &display_ids,
+                            selected,
+                            selected_ids,
+                            selection_anchor,
+                            modifiers,
+                        );
                     }
 
-                    // Проверка наведения при перетаскивании (без 3 секунд!)
-                    if let Some(pid) = dragged_id {
-                        if pid != cue_id {
-                            let over_target_col = is_targetable
-                                && pointer_pos.map_or(false, |pos| target_col_rect.contains(pos));
-
-                            if over_target_col {
-                                // Навели именно на колонку Target у Play/Pause/Stop/Fade
-                                assign_target_cue_id = Some(cue_id);
-                                ui.painter().rect_filled(
-                                    target_col_rect,
-                                    3.0_f32,
-                                    Color32::from_rgba_unmultiplied(60, 220, 130, 55),
-                                );
-                                ui.painter().rect_stroke(
-                                    target_col_rect,
-                                    3.0_f32,
-                                    Stroke::new(2.0_f32, Theme::ACCENT2),
-                                    StrokeKind::Inside,
-                                );
-                            } else if row_resp.hovered() || ui.rect_contains_pointer(row_rect) {
-                                // Навели на саму строку — перестановка или добавление в группу
-                                dropped_target_idx = Some(cue_idx);
-                                ui.painter().rect_stroke(
-                                    row_rect,
-                                    2.0_f32,
-                                    Stroke::new(2.0_f32, Theme::ACCENT),
-                                    StrokeKind::Inside,
-                                );
+                    let row_double_clicked = ui.input(|input| {
+                        input.pointer.button_double_clicked(PointerButton::Primary)
+                    }) && click_is_on_row_layer && pointer_position
+                        .map(|position| row_rect.contains(position))
+                        .unwrap_or(false);
+                    if row_resp.double_clicked() || row_double_clicked {
+                        if let Some(position) = pointer_position {
+                            if cue_number_rect.contains(position) {
+                                action = Some(CueTableAction::StartEdit(
+                                    cue.id,
+                                    EditField::Number,
+                                    cue.number.clone(),
+                                ));
+                            } else if name_cell_rect.contains(position) {
+                                action = Some(CueTableAction::StartEdit(
+                                    cue.id,
+                                    EditField::Name,
+                                    cue.name.clone(),
+                                ));
+                            } else if pre_wait_rect.contains(position) {
+                                action = Some(CueTableAction::StartEdit(
+                                    cue.id,
+                                    EditField::PreWait,
+                                    format!("{:.2}", cue.pre_wait_secs),
+                                ));
+                            } else if post_wait_rect.contains(position) {
+                                action = Some(CueTableAction::StartEdit(
+                                    cue.id,
+                                    EditField::PostWait,
+                                    format!("{:.2}", cue.post_wait_secs),
+                                ));
                             }
                         }
                     }
 
-                    let cue_name_clone = cue.name.clone();
+                    if drag_state.as_ref().map(|state| state.active).unwrap_or(false) {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                        if let Some(position) = pointer_pos.filter(|position| row_rect.contains(*position)) {
+                            if !active_drag_ids.contains(&cue.id) {
+                                let (parent_id, sibling_index) = sibling_locations
+                                    .get(&cue.id)
+                                    .copied()
+                                    .unwrap_or((None, 0));
+                                if is_group_row {
+                                    // Only the central band of a group row means
+                                    // "drop into group". Its upper/lower bands are
+                                    // explicit before/after insertion zones.
+                                    let relative_y = position.y - row_rect.top();
+                                    let group_band = row_h * 0.28;
+                                    if relative_y >= group_band && relative_y <= row_h - group_band {
+                                        let child_count = group_child_counts.get(&cue.id).copied().unwrap_or(0);
+                                        drop_destination = Some((Some(cue.id), child_count));
+                                        drop_line_y = None;
+                                        ui.painter().rect_stroke(
+                                            row_rect,
+                                            2.0_f32,
+                                            Stroke::new(2.0_f32, Theme::ACCENT2),
+                                            StrokeKind::Inside,
+                                        );
+                                    } else {
+                                        let before = relative_y < row_h * 0.5;
+                                        drop_destination = Some((parent_id, sibling_index + (if before { 0 } else { 1 })));
+                                        drop_line_y = Some(if before { row_rect.top() } else { row_rect.bottom() });
+                                    }
+                                } else {
+                                    let before = position.y < row_rect.center().y;
+                                    drop_destination = Some((parent_id, sibling_index + (if before { 0 } else { 1 })));
+                                    drop_line_y = Some(if before { row_rect.top() } else { row_rect.bottom() });
+                                }
+                            }
+                        }
 
+                        let primary_dragged_id = drag_state.as_ref().map(|state| state.source_id);
+                        let is_targetable = matches!(
+                            &cue.cue_type,
+                            CueType::Play { .. }
+                                | CueType::Pause { .. }
+                                | CueType::Stop { .. }
+                                | CueType::Fade { .. }
+                        );
+                        let pointer_over_target = pointer_pos
+                            .map(|position| target_cell_rect.contains(position))
+                            .unwrap_or(false);
+                        let released_over_target = ui.input(|input| {
+                            input.pointer.button_released(PointerButton::Primary)
+                        });
+                        if let Some(pid) = primary_dragged_id {
+                            let valid_target = pid != cue.id && is_targetable && targetable_ids.contains(&pid);
+                            if pointer_over_target && valid_target {
+                                ui.painter().rect_stroke(
+                                    target_cell_rect,
+                                    2.0,
+                                    Stroke::new(2.0, Theme::ACCENT2),
+                                    StrokeKind::Inside,
+                                );
+                                if released_over_target {
+                                    action = Some(CueTableAction::AssignTarget(pid, cue.id));
+                                    drag_state = None;
+                                    drop_destination = None;
+                                    drop_line_y = None;
+                                }
+                            }
+                        }
+                    }
+
+                    // Контекстное меню
                     row_resp.context_menu(|ui| {
                         if ui.button("▶  Play / Trigger").clicked() {
-                            action = Some(CueTableAction::Play(cue_id));
+                            action = Some(CueTableAction::Play(cue.id));
                             ui.close_menu();
                         }
                         if ui.button("⏸  Pause").clicked() {
-                            action = Some(CueTableAction::Pause(cue_id));
+                            action = Some(CueTableAction::Pause(cue.id));
                             ui.close_menu();
                         }
                         if ui.button("⏹  Stop").clicked() {
-                            action = Some(CueTableAction::Stop(cue_id));
+                            action = Some(CueTableAction::Stop(cue.id));
                             ui.close_menu();
                         }
                         ui.separator();
                         if ui.button("⬆  Move Up").clicked() {
-                            action = Some(CueTableAction::MoveUp(cue_id));
+                            action = Some(CueTableAction::MoveUp(cue.id));
                             ui.close_menu();
                         }
                         if ui.button("⬇  Move Down").clicked() {
-                            action = Some(CueTableAction::MoveDown(cue_id));
+                            action = Some(CueTableAction::MoveDown(cue.id));
+                            ui.close_menu();
+                        }
+                        if ui.button("Clear cue number").clicked() {
+                            action = Some(CueTableAction::ClearNumber(cue.id));
                             ui.close_menu();
                         }
                         if ui.button("✏  Rename").clicked() {
-                            let focus_flag_id =
-                                Id::new(("edit_focus_init", cue_id, EditField::Name));
-                            ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
                             action = Some(CueTableAction::StartEdit(
-                                cue_id,
+                                cue.id,
                                 EditField::Name,
-                                cue_name_clone.clone(),
+                                cue.name.clone(),
                             ));
                             ui.close_menu();
                         }
                         if ui.button("🗑  Delete").clicked() {
-                            action = Some(CueTableAction::Delete(cue_id));
+                            action = Some(CueTableAction::Delete(cue.id));
                             ui.close_menu();
                         }
                         ui.separator();
@@ -475,105 +849,188 @@ impl CueTable {
                                     ))
                                     .clicked()
                                 {
-                                    action = Some(CueTableAction::SetColor(cue_id, *color));
+                                    action = Some(CueTableAction::SetColor(cue.id, *color));
                                     ui.close_menu();
                                 }
                             }
                         });
                     });
 
-                    // Обрабатываем клик (включая Shift / Ctrl)
-                    if name_clicked || row_resp.clicked() {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
-
-                        if shift {
-                            if let Some(anchor_id) = *selected {
-                                let pos_a =
-                                    display_order.iter().position(|(_, _, id)| *id == anchor_id);
-                                let pos_b =
-                                    display_order.iter().position(|(_, _, id)| *id == cue_id);
-                                if let (Some(a), Some(b)) = (pos_a, pos_b) {
-                                    let start = a.min(b);
-                                    let end = a.max(b);
-                                    for i in start..=end {
-                                        selected_ids.insert(display_order[i].2);
-                                    }
-                                } else {
-                                    selected_ids.insert(cue_id);
-                                }
-                            } else {
-                                *selected = Some(cue_id);
-                                selected_ids.insert(cue_id);
-                            }
-                        } else if ctrl {
-                            if selected_ids.is_empty() {
-                                if let Some(prev) = *selected {
-                                    selected_ids.insert(prev);
-                                }
-                            }
-                            if selected_ids.contains(&cue_id) {
-                                selected_ids.remove(&cue_id);
-                            } else {
-                                selected_ids.insert(cue_id);
-                            }
-                            *selected = Some(cue_id);
-                        } else {
-                            selected_ids.clear();
-                            *selected = Some(cue_id);
-                        }
-                    }
-
                     ui.add_space(1.0);
-                }
+                        }
+                        while let Some((_, rect)) = group_frame_stack.pop() {
+                            completed_group_frames.push(rect);
+                        }
+                        for rect in completed_group_frames {
+                            // A clear outline encloses the group header and every
+                            // visible descendant. Collapsed groups retain a frame
+                            // around their header row so they remain recognizable.
+                            let outline = rect.expand2(vec2(3.0, 2.0));
+                            ui.painter().rect_stroke(
+                                outline,
+                                5.0,
+                                Stroke::new(2.0, Theme::ACCENT2),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    pos2(outline.left() + 1.0, outline.top() + 5.0),
+                                    pos2(outline.left() + 1.0, outline.bottom() - 5.0),
+                                ],
+                                Stroke::new(3.0, Theme::ACCENT),
+                            );
+                        }
+
+                        // A real end-of-list drop target lives inside the vertical
+                        // scroll content. If the final visible cue is a group child,
+                        // the drop remains in that group's sibling sequence.
+                        let tail_height = (viewport_rect.bottom() - ui.cursor().min.y).max(row_h);
+                        let (tail_rect, _) = ui.allocate_exact_size(
+                            vec2(table_width, tail_height),
+                            Sense::hover(),
+                        );
+                        if drag_state.as_ref().map(|state| state.active).unwrap_or(false)
+                            && ui.ctx().pointer_latest_pos()
+                                .map(|position| tail_rect.contains(position))
+                                .unwrap_or(false)
+                        {
+                            if let Some(last_id) = display_ids.last().copied() {
+                                let (parent_id, sibling_index) = sibling_locations
+                                    .get(&last_id)
+                                    .copied()
+                                    .unwrap_or((None, 0));
+                                drop_destination = Some((parent_id, sibling_index + 1));
+                            } else {
+                                drop_destination = Some((None, 0));
+                            }
+                            drop_line_y = Some(tail_rect.top() + 2.0);
+                        }
+
+                        if let Some(y) = drop_line_y {
+                            let left = viewport_rect.left();
+                            let right = left + table_width;
+                            let mut x = left;
+                            while x < right {
+                                let end_x = (x + 7.0).min(right);
+                                ui.painter().line_segment(
+                                    [pos2(x, y), pos2(end_x, y)],
+                                    Stroke::new(2.0, Theme::ACCENT2),
+                                );
+                                x += 12.0;
+                            }
+                        }
+                    });
             });
 
-        // Плавающая плашка за курсором во время перетаскивания
-        if let Some(drag_id) = dragged_id {
-            if let Some(pos) = pointer_pos {
-                if let Some(dragged_cue) = cues.iter().find(|c| c.id == drag_id) {
-                    let badge_text = if assign_target_cue_id.is_some() {
-                        format!(
-                            "🎯 Set Target: #{} {}",
-                            dragged_cue.number, dragged_cue.name
-                        )
+        if let Some(state) = drag_state.as_ref().filter(|state| state.active) {
+            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                let label = if state.dragged_ids.len() > 1 {
+                    format!("{} selected events", state.dragged_ids.len())
+                } else if let Some(dragged_cue) = cues.iter().find(|cue| cue.id == state.source_id) {
+                    if dragged_cue.number.trim().is_empty() {
+                        dragged_cue.name.clone()
                     } else {
-                        format!("↕ Move: #{} {}", dragged_cue.number, dragged_cue.name)
-                    };
-                    let ghost_rect =
-                        Rect::from_center_size(pos + vec2(0.0, -18.0), vec2(260.0, 24.0));
-                    ui.painter().rect_filled(
-                        ghost_rect,
-                        4.0,
-                        Color32::from_rgba_unmultiplied(40, 80, 140, 220),
-                    );
-                    ui.painter().text(
-                        ghost_rect.center(),
-                        Align2::CENTER_CENTER,
-                        badge_text,
-                        FontId::proportional(12.0),
-                        Color32::WHITE,
-                    );
+                        format!("#{} {}", dragged_cue.number, dragged_cue.name)
+                    }
+                } else {
+                    "Moving event".to_string()
+                };
+                let ghost_rect = Rect::from_center_size(pos, vec2(300.0, 24.0));
+                ui.painter().rect_filled(
+                    ghost_rect,
+                    4.0,
+                    Color32::from_rgba_unmultiplied(90, 170, 255, 180),
+                );
+                ui.painter().text(
+                    ghost_rect.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+
+        // Keep the drag candidate and full selection across frames. On release,
+        // emit exactly one move action and clear the temporary state.
+        if ui.input(|input| input.pointer.any_released()) {
+            if let Some(state) = drag_state.take().filter(|state| state.active) {
+                if action.is_none() {
+                    if let Some((parent_id, sibling_index)) = drop_destination {
+                        action = Some(CueTableAction::MoveMultipleToPosition(
+                            state.dragged_ids,
+                            parent_id,
+                            sibling_index,
+                        ));
+                    }
+                }
+            }
+            ui.data_mut(|data| data.insert_temp(drag_state_id, None::<CueDragState>));
+        } else {
+            ui.data_mut(|data| data.insert_temp(drag_state_id, drag_state.clone()));
+        }
+
+        // Clicking unused table space clears every selection. Row/header widgets
+        // are excluded, so normal clicks and column resizing keep their behaviour.
+        let primary_clicked = ui.input(|input| input.pointer.button_clicked(PointerButton::Primary));
+        if primary_clicked {
+            if let Some(position) = ui.ctx().pointer_latest_pos() {
+                let inside_table = viewport_rect.contains(position);
+                let on_header = header_rect.contains(position);
+                let on_row = row_rects.iter().any(|rect| rect.contains(position));
+                if inside_table && !on_header && !on_row && action.is_none() {
+                    action = Some(CueTableAction::Deselect);
                 }
             }
         }
 
-        // Завершение перетаскивания при отпускании кнопки мыши
-        if ui.input(|i| i.pointer.any_released()) {
-            let removed_drag = ui.data_mut(|d| d.remove_temp::<Uuid>(Id::new("dragged_cue_id")));
-            if let Some(dragged_id) = removed_drag {
-                if let Some(target_cue_id) = assign_target_cue_id {
-                    action = Some(CueTableAction::AssignTarget(dragged_id, target_cue_id));
-                } else if let Some(target_idx) = dropped_target_idx {
-                    action = Some(CueTableAction::MoveToGroupOrIndex(dragged_id, target_idx));
-                }
-            }
-        }
-
-        _ = scroll_output;
         action
     }
 
+    fn apply_selection(
+        cue_id: Uuid,
+        visible_ids: &[Uuid],
+        selected: &mut Option<Uuid>,
+        selected_ids: &mut HashSet<Uuid>,
+        anchor: &mut Option<Uuid>,
+        modifiers: Modifiers,
+    ) {
+        if modifiers.shift {
+            let anchor_id = (*anchor).or(*selected).unwrap_or(cue_id);
+            if anchor.is_none() {
+                *anchor = Some(anchor_id);
+            }
+            if let (Some(anchor_index), Some(target_index)) = (
+                visible_ids.iter().position(|id| *id == anchor_id),
+                visible_ids.iter().position(|id| *id == cue_id),
+            ) {
+                selected_ids.clear();
+                let start = anchor_index.min(target_index);
+                let end = anchor_index.max(target_index);
+                selected_ids.extend(visible_ids[start..=end].iter().copied());
+            } else {
+                selected_ids.insert(cue_id);
+            }
+            *selected = Some(cue_id);
+        } else if modifiers.ctrl {
+            if !selected_ids.remove(&cue_id) {
+                selected_ids.insert(cue_id);
+            }
+            if selected_ids.contains(&cue_id) {
+                *selected = Some(cue_id);
+            } else {
+                *selected = selected_ids.iter().next().copied();
+            }
+            *anchor = Some(cue_id);
+        } else {
+            selected_ids.clear();
+            selected_ids.insert(cue_id);
+            *selected = Some(cue_id);
+            *anchor = Some(cue_id);
+        }
+    }
+
+    /// Ячейка Pre-Wait / Post-Wait с редактированием по двойному клику.
     fn wait_cell(
         ui: &mut Ui,
         cue_id: Uuid,
@@ -583,38 +1040,30 @@ impl CueTable {
         row_h: f32,
         accent: Color32,
         editing: &mut Option<(Uuid, EditField, String)>,
+        editing_focus_pending: &mut bool,
         action: &mut Option<CueTableAction>,
-        any_click: bool,
-        pointer_pos: Option<Pos2>,
-    ) {
+        _indent: u8,
+    ) -> Rect {
         let is_editing = matches!(editing, Some((id, f, _)) if *id == cue_id && *f == field);
         if is_editing {
             if let Some((_, _, ref mut buf)) = editing {
-                let focus_flag_id = Id::new(("edit_focus_init", cue_id, field));
-                let need_focus = ui
-                    .data(|d| d.get_temp::<bool>(focus_flag_id))
-                    .unwrap_or(true);
-
-                let r = ui.add_sized(
+                let response = ui.add_sized(
                     [width, row_h - 4.0],
                     TextEdit::singleline(buf).font(TextStyle::Monospace),
                 );
-
-                if need_focus {
-                    r.request_focus();
-                    ui.data_mut(|d| d.insert_temp(focus_flag_id, false));
-                } else {
-                    let clicked_outside =
-                        any_click && pointer_pos.map_or(false, |pos| !r.rect.contains(pos));
-                    if clicked_outside || r.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter))
-                    {
-                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
-                        *action = Some(CueTableAction::EditConfirm(cue_id, field, buf.clone()));
-                    } else if ui.input(|i| i.key_pressed(Key::Escape)) {
-                        ui.data_mut(|d| d.remove_temp::<bool>(focus_flag_id));
-                        *action = Some(CueTableAction::EditCancel);
-                    }
+                if *editing_focus_pending {
+                    response.request_focus();
+                    *editing_focus_pending = false;
                 }
+                if response.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    *action = Some(CueTableAction::EditConfirm(cue_id, field, buf.clone()));
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    *action = Some(CueTableAction::EditCancel);
+                }
+                response.rect
+            } else {
+                Rect::NOTHING
             }
         } else {
             let txt = if value > 0.0 {
@@ -622,7 +1071,7 @@ impl CueTable {
             } else {
                 "00:00.00".to_string()
             };
-            let label = ui.add_sized(
+            ui.add_sized(
                 [width, row_h],
                 Label::new(
                     RichText::new(txt)
@@ -630,17 +1079,10 @@ impl CueTable {
                         .monospace()
                         .size(11.0),
                 )
-                .sense(Sense::click()),
-            );
-            if label.double_clicked() {
-                let focus_flag_id = Id::new(("edit_focus_init", cue_id, field));
-                ui.data_mut(|d| d.insert_temp(focus_flag_id, true));
-                *action = Some(CueTableAction::StartEdit(
-                    cue_id,
-                    field,
-                    format!("{:.2}", value),
-                ));
-            }
+                .selectable(false)
+                .sense(Sense::hover()),
+            )
+            .rect
         }
     }
 
@@ -668,12 +1110,13 @@ impl CueTable {
                         .unwrap_or("—")
                         .to_string()
                 } else {
-                    "🎯 Drop target here".to_string()
+                    "All / None".to_string()
                 }
             }
             CueType::Midi {
                 channel, message, ..
             } => format!("Ch {} • {}", channel, message.label()),
+            CueType::Osc { address, .. } => address.clone(),
             CueType::Group { mode, children, .. } => {
                 format!("{} ({} cues)", mode.label(), children.len())
             }
@@ -707,14 +1150,16 @@ impl CueTable {
 }
 
 pub enum CueTableAction {
+    Deselect,
     Play(Uuid),
     Stop(Uuid),
     Pause(Uuid),
     Delete(Uuid),
     MoveUp(Uuid),
     MoveDown(Uuid),
-    MoveToGroupOrIndex(Uuid, usize),
+    MoveMultipleToPosition(Vec<Uuid>, Option<Uuid>, usize),
     StartEdit(Uuid, EditField, String),
+    ClearNumber(Uuid),
     EditConfirm(Uuid, EditField, String),
     EditCancel,
     SetColor(Uuid, CueColor),
@@ -742,4 +1187,93 @@ pub fn format_duration(secs: f64) -> String {
     let s = secs as u32 % 60;
     let cs = ((secs.fract()) * 100.0) as u32;
     format!("{m:02}:{s:02}.{cs:02}")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{build_sibling_locations, visible_cue_ids};
+    use crate::cue::{Cue, CueType, GroupMode};
+    use std::collections::HashSet;
+
+    #[test]
+    fn visible_navigation_uses_group_child_order_not_cue_number_order() {
+        let child_a = Cue::new_typed(CueType::Stop { target_id: None });
+        let child_b = Cue::new_typed(CueType::Pause { target_id: None });
+        let group = Cue::new_typed(CueType::Group {
+            mode: GroupMode::Normal,
+            children: vec![child_b.id, child_a.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        });
+        let after = Cue::new_typed(CueType::Midi {
+            channel: 1,
+            message: crate::cue::MidiMessageKind::NoteOn { note: 60, velocity: 100 },
+            raw_hex: String::new(),
+        });
+        let expected = vec![group.id, child_b.id, child_a.id, after.id];
+        let cues = vec![group.clone(), after.clone(), child_a.clone(), child_b.clone()];
+        let mut expanded = HashSet::new();
+        expanded.insert(group.id);
+        assert_eq!(visible_cue_ids(&cues, &expanded), expected);
+    }
+
+    #[test]
+    fn collapsed_groups_hide_children_from_keyboard_navigation() {
+        let child = Cue::new_typed(CueType::Stop { target_id: None });
+        let group = Cue::new_typed(CueType::Group {
+            mode: GroupMode::Normal,
+            children: vec![child.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        });
+        let after = Cue::new_typed(CueType::Pause { target_id: None });
+        let cues = vec![group.clone(), after.clone(), child];
+        assert_eq!(visible_cue_ids(&cues, &HashSet::new()), vec![group.id, after.id]);
+    }
+
+
+    #[test]
+    fn sibling_locations_separate_root_rows_from_group_children() {
+        let first_root = Cue::new_typed(CueType::Stop { target_id: None });
+        let child_a = Cue::new_typed(CueType::Pause { target_id: None });
+        let child_b = Cue::new_typed(CueType::Play { target_id: None });
+        let group = Cue::new_typed(CueType::Group {
+            mode: GroupMode::Normal,
+            children: vec![child_a.id, child_b.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        });
+        let last_root = Cue::new_typed(CueType::Stop { target_id: None });
+        let cues = vec![first_root.clone(), group.clone(), child_a.clone(), child_b.clone(), last_root.clone()];
+
+        let locations = build_sibling_locations(&cues);
+        assert_eq!(locations.get(&first_root.id), Some(&(None, 0)));
+        assert_eq!(locations.get(&group.id), Some(&(None, 1)));
+        assert_eq!(locations.get(&child_a.id), Some(&(Some(group.id), 0)));
+        assert_eq!(locations.get(&child_b.id), Some(&(Some(group.id), 1)));
+        assert_eq!(locations.get(&last_root.id), Some(&(None, 2)));
+    }
+
+    #[test]
+    fn collapsed_parent_hides_expanded_nested_group_children() {
+        let nested_child = Cue::new_typed(CueType::Stop { target_id: None });
+        let nested_group = Cue::new_typed(CueType::Group {
+            mode: GroupMode::Normal,
+            children: vec![nested_child.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        });
+        let parent = Cue::new_typed(CueType::Group {
+            mode: GroupMode::Normal,
+            children: vec![nested_group.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        });
+        let cues = vec![parent.clone(), nested_group.clone(), nested_child.clone()];
+        let mut expanded = HashSet::new();
+        // The nested group may remain marked expanded while its parent is closed.
+        expanded.insert(nested_group.id);
+        assert_eq!(visible_cue_ids(&cues, &expanded), vec![parent.id]);
+    }
 }

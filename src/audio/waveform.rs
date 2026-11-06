@@ -75,3 +75,16 @@ pub fn get_duration(path: &Path) -> f64 {
         Err(_) => 0.0,
     }
 }
+
+/// Returns the number of interleaved audio channels reported by the decoder.
+pub fn get_channel_count(path: &Path) -> usize {
+    if path.as_os_str().is_empty() {
+        return 0;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    rodio::Decoder::new(std::io::BufReader::new(file))
+        .map(|decoder| decoder.channels().max(1) as usize)
+        .unwrap_or(0)
+}

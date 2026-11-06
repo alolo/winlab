@@ -1,9 +1,9 @@
 // src/export/session_report.rs — лог сессии воспроизведения
+use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::info;
-use anyhow::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayEvent {

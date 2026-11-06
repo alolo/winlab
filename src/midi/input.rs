@@ -3,6 +3,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16,54 +17,93 @@ pub enum MidiMessage {
 pub struct MidiInputManager {
     pub msg_rx: Receiver<MidiMessage>,
     pub port_names: Vec<String>,
+    pub current_port: Option<String>,
+    msg_tx: Sender<MidiMessage>,
+    repaint_context: Arc<OnceLock<egui::Context>>,
     _connection: Option<MidiInputConnection<()>>,
 }
 
 impl MidiInputManager {
     pub fn new() -> Self {
-        let (tx, rx) = bounded::<MidiMessage>(512);
-        let (port_names, conn) = Self::try_connect(tx);
-        Self {
+        let (tx, rx) = bounded::<MidiMessage>(2048);
+        let mut manager = Self {
             msg_rx: rx,
-            port_names,
-            _connection: conn,
-        }
+            port_names: Vec::new(),
+            current_port: None,
+            msg_tx: tx,
+            repaint_context: Arc::new(OnceLock::new()),
+            _connection: None,
+        };
+        manager.refresh_and_connect(None);
+        manager
     }
 
-    fn try_connect(tx: Sender<MidiMessage>) -> (Vec<String>, Option<MidiInputConnection<()>>) {
+    /// Attach the UI context so MIDI input can wake an otherwise idle egui app.
+    /// The native MIDI callback only enqueues the message and requests a repaint;
+    /// all application state changes still happen on the UI thread.
+    pub fn set_repaint_context(&mut self, context: egui::Context) {
+        let _ = self.repaint_context.set(context);
+    }
+
+    pub fn refresh_and_connect(&mut self, preferred_port: Option<&str>) {
+        // Dropping the previous connection cleanly disconnects the old input port.
+        self._connection = None;
+        self.current_port = None;
+
         let midi_in = match MidiInput::new("CueLabs Input") {
             Ok(m) => m,
             Err(e) => {
                 warn!("MIDI init failed: {e}");
-                return (vec![], None);
+                self.port_names.clear();
+                return;
             }
         };
 
         let ports = midi_in.ports();
-        let names: Vec<String> = ports
+        self.port_names = ports
             .iter()
             .filter_map(|p| midi_in.port_name(p).ok())
             .collect();
 
-        let port = match ports.first() {
-            Some(p) => p.clone(),
-            None => return (names, None),
+        let target = preferred_port
+            .and_then(|preferred| {
+                ports
+                    .iter()
+                    .find(|port| midi_in.port_name(port).ok().as_deref() == Some(preferred))
+            })
+            .or_else(|| ports.first());
+
+        let Some(port) = target else {
+            return;
         };
 
-        let conn = midi_in
-            .connect(
-                &port,
-                "cuelabs-in",
-                move |_stamp, raw, _| {
-                    if let Some(msg) = parse_midi(raw) {
-                        let _ = tx.try_send(msg);
+        let port_name = midi_in.port_name(port).ok();
+        let tx = self.msg_tx.clone();
+        let repaint_context = Arc::clone(&self.repaint_context);
+        match midi_in.connect(
+            port,
+            "cuelabs-in",
+            move |_stamp, raw, _| {
+                if let Some(msg) = parse_midi(raw) {
+                    if tx.try_send(msg).is_ok() {
+                        if let Some(context) = repaint_context.get() {
+                            context.request_repaint();
+                        }
                     }
-                },
-                (),
-            )
-            .ok();
-
-        (names, conn)
+                }
+            },
+            (),
+        ) {
+            Ok(connection) => {
+                self.current_port = port_name;
+                self._connection = Some(connection);
+                info!(
+                    "Connected MIDI Input: {}",
+                    self.current_port.as_deref().unwrap_or("unknown")
+                );
+            }
+            Err(e) => warn!("Could not connect MIDI input: {e}"),
+        }
     }
 
     pub fn drain(&self) -> Vec<MidiMessage> {
@@ -93,7 +133,10 @@ impl MidiOutputManager {
     }
 
     pub fn refresh_and_connect(&mut self, preferred_port: Option<&str>) {
+        self.connection = None;
+        self.current_port = None;
         let Ok(midi_out) = MidiOutput::new("CueLabs Output") else {
+            self.port_names.clear();
             return;
         };
         let ports = midi_out.ports();
@@ -129,7 +172,10 @@ impl MidiOutputManager {
             conn.send(bytes)
                 .map_err(|e| anyhow::anyhow!("MIDI send error: {e}"))?;
         } else {
-            warn!("No MIDI Output port connected; bytes {:02X?} not sent", bytes);
+            warn!(
+                "No MIDI Output port connected; bytes {:02X?} not sent",
+                bytes
+            );
         }
         Ok(())
     }

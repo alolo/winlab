@@ -8,19 +8,37 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CueType {
     Audio,
-    Pause { target_id: Option<Uuid> },
-    Play { target_id: Option<Uuid> },
-    Stop { target_id: Option<Uuid> },
+    Pause {
+        target_id: Option<Uuid>,
+    },
+    Play {
+        target_id: Option<Uuid>,
+    },
+    Stop {
+        target_id: Option<Uuid>,
+    },
     Fade {
         target_id: Option<Uuid>,
         fade_in: bool,
         duration_secs: f64,
         stop_on_finish: bool,
+        /// None follows the target audio cue's configured level for Fade In, or 0 for Fade Out.
+        #[serde(default)]
+        target_volume: Option<f32>,
+        #[serde(default)]
+        fade_curve: FadeCurve,
+        #[serde(default)]
+        custom_fade_points: Vec<[f32; 2]>,
     },
     Midi {
         channel: u8,
         message: MidiMessageKind,
         raw_hex: String,
+    },
+    Osc {
+        address: String,
+        #[serde(default)]
+        args: Vec<OscCueArg>,
     },
     Group {
         mode: GroupMode,
@@ -39,8 +57,15 @@ impl CueType {
             CueType::Pause { .. } => "Pause",
             CueType::Play { .. } => "Play",
             CueType::Stop { .. } => "Stop",
-            CueType::Fade { fade_in, .. } => if *fade_in { "Fade In" } else { "Fade Out" },
+            CueType::Fade { fade_in, .. } => {
+                if *fade_in {
+                    "Fade In"
+                } else {
+                    "Fade Out"
+                }
+            }
             CueType::Midi { .. } => "MIDI",
+            CueType::Osc { .. } => "OSC",
             CueType::Group { .. } => "Group",
         }
     }
@@ -51,9 +76,35 @@ impl CueType {
             CueType::Pause { .. } => "⏸",
             CueType::Play { .. } => "▶",
             CueType::Stop { .. } => "⏹",
-            CueType::Fade { fade_in, .. } => if *fade_in { "↗" } else { "↘" },
+            CueType::Fade { fade_in, .. } => {
+                if *fade_in {
+                    "↗"
+                } else {
+                    "↘"
+                }
+            }
             CueType::Midi { .. } => "🎹",
+            CueType::Osc { .. } => "📡",
             CueType::Group { .. } => "📁",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum OscCueArg {
+    Int(i32),
+    Float(f32),
+    String(String),
+    Bool(bool),
+}
+
+impl OscCueArg {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Int(_) => "Integer",
+            Self::Float(_) => "Float",
+            Self::String(_) => "String",
+            Self::Bool(_) => "Boolean",
         }
     }
 }
@@ -83,9 +134,15 @@ impl MidiMessageKind {
     pub fn to_bytes(&self, channel: u8) -> Vec<u8> {
         let ch = channel.saturating_sub(1) & 0x0F;
         match self {
-            MidiMessageKind::NoteOn { note, velocity } => vec![0x90 | ch, *note & 0x7F, *velocity & 0x7F],
-            MidiMessageKind::NoteOff { note, velocity } => vec![0x80 | ch, *note & 0x7F, *velocity & 0x7F],
-            MidiMessageKind::ControlChange { cc, value } => vec![0xB0 | ch, *cc & 0x7F, *value & 0x7F],
+            MidiMessageKind::NoteOn { note, velocity } => {
+                vec![0x90 | ch, *note & 0x7F, *velocity & 0x7F]
+            }
+            MidiMessageKind::NoteOff { note, velocity } => {
+                vec![0x80 | ch, *note & 0x7F, *velocity & 0x7F]
+            }
+            MidiMessageKind::ControlChange { cc, value } => {
+                vec![0xB0 | ch, *cc & 0x7F, *value & 0x7F]
+            }
             MidiMessageKind::ProgramChange { program } => vec![0xC0 | ch, *program & 0x7F],
             MidiMessageKind::PitchBend { value } => {
                 let v = (*value + 8192).clamp(0, 16383) as u16;
@@ -100,22 +157,26 @@ impl MidiMessageKind {
             .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
             .filter(|s| !s.is_empty())
             .filter_map(|s| {
-                let clean = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                let clean = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
                 u8::from_str_radix(clean, 16).ok()
             })
             .collect()
     }
 }
 
-// ==== НОВЫЕ РЕЖИМЫ ГРУППЫ ====
+// ==== Режимы воспроизведения групп ====
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum GroupMode {
     /// Запускает только первое событие. Дальше — по auto-continue/follow цепочке детей.
     #[default]
     Normal,
-    /// Последовательно воспроизводит ВСЕХ детей по завершении предыдущего,
-    /// игнорируя их собственные continue_mode/pre/post wait.
+    /// Plays each child one after another, respecting each child's pre-wait and post-wait.
     Playlist,
+    /// Starts every child at once (each child still observes its own pre-wait).
+    AllCues,
 }
 
 impl GroupMode {
@@ -123,9 +184,11 @@ impl GroupMode {
         match self {
             GroupMode::Normal => "Normal",
             GroupMode::Playlist => "Playlist",
+            GroupMode::AllCues => "All Cues",
         }
     }
-    pub const ALL: &'static [GroupMode] = &[GroupMode::Normal, GroupMode::Playlist];
+    pub const ALL: &'static [GroupMode] =
+        &[GroupMode::Normal, GroupMode::Playlist, GroupMode::AllCues];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -144,21 +207,37 @@ impl ContinueMode {
             ContinueMode::AutoFollow => "Auto-Follow",
         }
     }
-    pub const ALL: &'static [ContinueMode] = &[ContinueMode::Nothing, ContinueMode::AutoContinue, ContinueMode::AutoFollow];
+    pub const ALL: &'static [ContinueMode] = &[
+        ContinueMode::Nothing,
+        ContinueMode::AutoContinue,
+        ContinueMode::AutoFollow,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum CueState {
     #[default]
-    Stopped, Waiting, Playing, FadingIn, FadingOut, Paused, Loading,
+    Stopped,
+    Waiting,
+    Playing,
+    FadingIn,
+    FadingOut,
+    Paused,
+    Loading,
     Error(String),
 }
 
 impl CueState {
     pub fn is_active(&self) -> bool {
-        matches!(self,
-            CueState::Waiting | CueState::Playing | CueState::FadingIn
-            | CueState::FadingOut | CueState::Paused | CueState::Loading)
+        matches!(
+            self,
+            CueState::Waiting
+                | CueState::Playing
+                | CueState::FadingIn
+                | CueState::FadingOut
+                | CueState::Paused
+                | CueState::Loading
+        )
     }
 }
 
@@ -172,7 +251,45 @@ pub struct LoopRegion {
 
 impl Default for LoopRegion {
     fn default() -> Self {
-        Self { enabled: false, start_secs: 0.0, end_secs: 0.0, count: -1 }
+        Self {
+            enabled: false,
+            start_secs: 0.0,
+            end_secs: 0.0,
+            count: -1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelRoute {
+    pub active: bool,
+    /// Zero-based physical output index. The UI displays it as 1-based.
+    pub output_channel: usize,
+    pub gain_db: f32,
+}
+
+impl Default for ChannelRoute {
+    fn default() -> Self {
+        Self {
+            active: true,
+            output_channel: 0,
+            gain_db: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutputChannelSetting {
+    pub active: bool,
+    pub gain_db: f32,
+}
+
+impl Default for OutputChannelSetting {
+    fn default() -> Self {
+        Self {
+            active: true,
+            gain_db: 0.0,
+        }
     }
 }
 
@@ -185,14 +302,53 @@ pub struct IoRouting {
     pub right_gain_db: f32,
     pub left_enabled: bool,
     pub right_enabled: bool,
+    #[serde(default)]
+    pub channel_routes: Vec<ChannelRoute>,
 }
 
 impl Default for IoRouting {
     fn default() -> Self {
         Self {
-            output_device: None, input_device: None, output_channel: 0,
-            left_gain_db: 0.0, right_gain_db: 0.0,
-            left_enabled: true, right_enabled: true,
+            output_device: None,
+            input_device: None,
+            output_channel: 0,
+            left_gain_db: 0.0,
+            right_gain_db: 0.0,
+            left_enabled: true,
+            right_enabled: true,
+            channel_routes: Vec::new(),
+        }
+    }
+}
+
+impl IoRouting {
+    pub fn ensure_channel_routes(&mut self, input_channels: usize, output_channels: usize) {
+        let input_channels = input_channels.max(1);
+        let output_channels = output_channels.max(1);
+        if self.channel_routes.len() > input_channels {
+            self.channel_routes.truncate(input_channels);
+        }
+        while self.channel_routes.len() < input_channels {
+            let index = self.channel_routes.len();
+            let (active, gain_db) = match index {
+                0 => (self.left_enabled, self.left_gain_db),
+                1 => (self.right_enabled, self.right_gain_db),
+                _ => (true, 0.0),
+            };
+            self.channel_routes.push(ChannelRoute {
+                active,
+                output_channel: if index < output_channels {
+                    index
+                } else if output_channels == 2 {
+                    index % 2
+                } else {
+                    0
+                },
+                gain_db,
+            });
+        }
+        for route in &mut self.channel_routes {
+            route.output_channel = route.output_channel.min(output_channels - 1);
         }
     }
 }
@@ -200,7 +356,11 @@ impl Default for IoRouting {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum FadeCurve {
     #[default]
-    Linear, SCurve, Logarithmic, Exponential,
+    Linear,
+    SCurve,
+    Logarithmic,
+    Exponential,
+    Custom,
 }
 
 impl FadeCurve {
@@ -211,14 +371,42 @@ impl FadeCurve {
             FadeCurve::SCurve => t * t * (3.0 - 2.0 * t),
             FadeCurve::Logarithmic => (t * 9.0 + 1.0).log10(),
             FadeCurve::Exponential => t * t,
+            FadeCurve::Custom => t,
         }
+    }
+
+    pub fn apply_with_points(&self, t: f32, points: &[[f32; 2]]) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        if *self != FadeCurve::Custom || points.len() < 2 {
+            return self.apply(t);
+        }
+
+        let mut previous = points[0];
+        for next in points.iter().copied().skip(1) {
+            if t <= next[0] {
+                let span = (next[0] - previous[0]).max(0.0001);
+                let local_t = ((t - previous[0]) / span).clamp(0.0, 1.0);
+                return (previous[1] + (next[1] - previous[1]) * local_t).clamp(0.0, 1.0);
+            }
+            previous = next;
+        }
+        previous[1].clamp(0.0, 1.0)
     }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum CueColor {
     #[default]
-    None, Red, Orange, Yellow, Green, Cyan, Blue, Purple, Pink, White,
+    None,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Cyan,
+    Blue,
+    Purple,
+    Pink,
+    White,
 }
 
 impl CueColor {
@@ -253,16 +441,29 @@ impl CueColor {
     }
 
     pub const ALL: &'static [CueColor] = &[
-        CueColor::None, CueColor::Red, CueColor::Orange, CueColor::Yellow,
-        CueColor::Green, CueColor::Cyan, CueColor::Blue, CueColor::Purple,
-        CueColor::Pink, CueColor::White,
+        CueColor::None,
+        CueColor::Red,
+        CueColor::Orange,
+        CueColor::Yellow,
+        CueColor::Green,
+        CueColor::Cyan,
+        CueColor::Blue,
+        CueColor::Purple,
+        CueColor::Pink,
+        CueColor::White,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            CueColor::None => "None", CueColor::Red => "Red", CueColor::Orange => "Orange",
-            CueColor::Yellow => "Yellow", CueColor::Green => "Green", CueColor::Cyan => "Cyan",
-            CueColor::Blue => "Blue", CueColor::Purple => "Purple", CueColor::Pink => "Pink",
+            CueColor::None => "None",
+            CueColor::Red => "Red",
+            CueColor::Orange => "Orange",
+            CueColor::Yellow => "Yellow",
+            CueColor::Green => "Green",
+            CueColor::Cyan => "Cyan",
+            CueColor::Blue => "Blue",
+            CueColor::Purple => "Purple",
+            CueColor::Pink => "Pink",
             CueColor::White => "White",
         }
     }
@@ -270,8 +471,19 @@ impl CueColor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MidiTrigger {
-    NoteOn { channel: u8, note: u8 },
-    CC { channel: u8, cc: u8, value: Option<u8> },
+    NoteOn {
+        channel: u8,
+        note: u8,
+    },
+    CC {
+        channel: u8,
+        cc: u8,
+        value: Option<u8>,
+    },
+}
+
+fn default_custom_fade_points() -> Vec<[f32; 2]> {
+    vec![[0.0, 0.0], [1.0, 1.0]]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,57 +498,113 @@ pub struct Cue {
     pub pre_wait_secs: f64,
     pub post_wait_secs: f64,
     pub continue_mode: ContinueMode,
-    #[serde(skip)] pub state: CueState,
-    #[serde(skip)] pub position_secs: f64,
+    #[serde(skip)]
+    pub state: CueState,
+    #[serde(skip)]
+    pub position_secs: f64,
     pub file_path: PathBuf,
+    #[serde(default)]
+    pub audio_channels: usize,
     pub volume: f32,
     pub fade_in_secs: f64,
     pub fade_out_secs: f64,
     pub fade_curve: FadeCurve,
+    #[serde(default = "default_custom_fade_points")]
+    pub custom_fade_points: Vec<[f32; 2]>,
     pub start_secs: f64,
-    #[serde(default)] pub end_secs: Option<f64>,
+    #[serde(default)]
+    pub end_secs: Option<f64>,
     pub loop_region: LoopRegion,
     pub io: IoRouting,
     pub midi_trigger: Option<MidiTrigger>,
-    #[serde(default)] pub hotkey: Option<String>,
-    #[serde(skip)] pub waveform: Vec<f32>,
-    #[serde(skip)] pub duration_secs: f64,
+    #[serde(default)]
+    pub hotkey: Option<String>,
+    #[serde(skip)]
+    pub waveform: Vec<f32>,
+    #[serde(skip)]
+    pub duration_secs: f64,
 }
 
 impl Cue {
     pub fn new_audio(file_path: PathBuf) -> Self {
-        let name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled").to_string();
+        let name = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_string();
         Self {
-            id: Uuid::new_v4(), number: String::new(), name,
-            color: CueColor::None, notes: String::new(), armed: true,
+            id: Uuid::new_v4(),
+            number: String::new(),
+            name,
+            color: CueColor::None,
+            notes: String::new(),
+            armed: true,
             cue_type: CueType::Audio,
-            pre_wait_secs: 0.0, post_wait_secs: 0.0, continue_mode: ContinueMode::Nothing,
-            state: CueState::Stopped, position_secs: 0.0,
-            file_path, volume: 1.0, fade_in_secs: 0.0, fade_out_secs: 0.0,
-            fade_curve: FadeCurve::Linear, start_secs: 0.0, end_secs: None,
-            loop_region: LoopRegion::default(), io: IoRouting::default(),
-            midi_trigger: None, hotkey: None, waveform: vec![], duration_secs: 0.0,
+            pre_wait_secs: 0.0,
+            post_wait_secs: 0.0,
+            continue_mode: ContinueMode::Nothing,
+            state: CueState::Stopped,
+            position_secs: 0.0,
+            file_path,
+            audio_channels: 2,
+            volume: 1.0,
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+            fade_curve: FadeCurve::Linear,
+            custom_fade_points: default_custom_fade_points(),
+            start_secs: 0.0,
+            end_secs: None,
+            loop_region: LoopRegion::default(),
+            io: IoRouting::default(),
+            midi_trigger: None,
+            hotkey: None,
+            waveform: vec![],
+            duration_secs: 0.0,
         }
     }
 
     pub fn new_typed(cue_type: CueType) -> Self {
         let name = cue_type.label().to_string();
         Self {
-            id: Uuid::new_v4(), number: String::new(), name,
-            color: CueColor::None, notes: String::new(), armed: true, cue_type,
-            pre_wait_secs: 0.0, post_wait_secs: 0.0, continue_mode: ContinueMode::Nothing,
-            state: CueState::Stopped, position_secs: 0.0,
-            file_path: PathBuf::new(), volume: 1.0, fade_in_secs: 0.0, fade_out_secs: 0.0,
-            fade_curve: FadeCurve::Linear, start_secs: 0.0, end_secs: None,
-            loop_region: LoopRegion::default(), io: IoRouting::default(),
-            midi_trigger: None, hotkey: None, waveform: vec![], duration_secs: 0.0,
+            id: Uuid::new_v4(),
+            number: String::new(),
+            name,
+            color: CueColor::None,
+            notes: String::new(),
+            armed: true,
+            cue_type,
+            pre_wait_secs: 0.0,
+            post_wait_secs: 0.0,
+            continue_mode: ContinueMode::Nothing,
+            state: CueState::Stopped,
+            position_secs: 0.0,
+            file_path: PathBuf::new(),
+            audio_channels: 0,
+            volume: 1.0,
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+            fade_curve: FadeCurve::Linear,
+            custom_fade_points: default_custom_fade_points(),
+            start_secs: 0.0,
+            end_secs: None,
+            loop_region: LoopRegion::default(),
+            io: IoRouting::default(),
+            midi_trigger: None,
+            hotkey: None,
+            waveform: vec![],
+            duration_secs: 0.0,
         }
     }
 
-    pub fn is_active(&self) -> bool { self.state.is_active() }
+    pub fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
 
     pub fn effective_end_secs(&self) -> f64 {
-        self.end_secs.unwrap_or(self.duration_secs).min(self.duration_secs).max(self.start_secs)
+        self.end_secs
+            .unwrap_or(self.duration_secs)
+            .min(self.duration_secs)
+            .max(self.start_secs)
     }
 
     pub fn effective_duration(&self) -> f64 {
@@ -350,7 +618,11 @@ impl Cue {
     pub fn progress(&self) -> f32 {
         let eff_end = self.effective_end_secs();
         let span = (eff_end - self.start_secs).max(0.001);
-        if eff_end <= 0.0 { 0.0 } else { ((self.position_secs - self.start_secs) / span).clamp(0.0, 1.0) as f32 }
+        if eff_end <= 0.0 {
+            0.0
+        } else {
+            ((self.position_secs - self.start_secs) / span).clamp(0.0, 1.0) as f32
+        }
     }
 
     pub fn remaining_secs(&self) -> f64 {

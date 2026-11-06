@@ -4,6 +4,11 @@ use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rosc::{OscMessage, OscPacket, OscType};
 use std::net::UdpSocket;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -18,12 +23,15 @@ pub struct OscServer {
     pub send_tx: Sender<OscEvent>,
     pub listen_port: u16,
     pub send_addr: String,
+    stop: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl OscServer {
     pub fn new(listen_port: u16, send_addr: String) -> Result<Self> {
         let (event_tx, event_rx) = bounded::<OscEvent>(256);
         let (send_tx, send_rx) = bounded::<OscEvent>(256);
+        let stop = Arc::new(AtomicBool::new(false));
 
         let listen_addr = format!("0.0.0.0:{listen_port}");
         let socket = UdpSocket::bind(&listen_addr)?;
@@ -31,13 +39,15 @@ impl OscServer {
         info!("OSC listening on {listen_addr}");
 
         let send_addr_clone = send_addr.clone();
+        let mut threads = Vec::new();
 
         {
             let socket_recv = socket.try_clone()?;
             let tx = event_tx.clone();
-            std::thread::spawn(move || {
+            let stop_recv = stop.clone();
+            threads.push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
-                loop {
+                while !stop_recv.load(Ordering::Relaxed) {
                     match socket_recv.recv_from(&mut buf) {
                         Ok((size, _addr)) => {
                             if let Ok(packet) = rosc::decoder::decode_udp(&buf[..size]) {
@@ -52,24 +62,31 @@ impl OscServer {
                         }
                     }
                 }
-            });
+            }));
         }
 
         {
             let send_socket = UdpSocket::bind("0.0.0.0:0")?;
-            std::thread::spawn(move || {
-                while let Ok(event) = send_rx.recv() {
-                    let msg = OscPacket::Message(OscMessage {
-                        addr: event.addr,
-                        args: event.args,
-                    });
-                    if let Ok(bytes) = rosc::encoder::encode(&msg) {
-                        if let Err(e) = send_socket.send_to(&bytes, &send_addr_clone) {
-                            warn!("OSC send error: {e}");
+            let stop_send = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                while !stop_send.load(Ordering::Relaxed) {
+                    match send_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(event) => {
+                            let msg = OscPacket::Message(OscMessage {
+                                addr: event.addr,
+                                args: event.args,
+                            });
+                            if let Ok(bytes) = rosc::encoder::encode(&msg) {
+                                if let Err(e) = send_socket.send_to(&bytes, &send_addr_clone) {
+                                    warn!("OSC send error: {e}");
+                                }
+                            }
                         }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            });
+            }));
         }
 
         Ok(Self {
@@ -77,6 +94,8 @@ impl OscServer {
             send_tx,
             listen_port,
             send_addr,
+            stop,
+            threads,
         })
     }
 
@@ -109,6 +128,15 @@ fn flatten_packet(packet: OscPacket, tx: &Sender<OscEvent>) {
             for p in bundle.content {
                 flatten_packet(p, tx);
             }
+        }
+    }
+}
+
+impl Drop for OscServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
         }
     }
 }

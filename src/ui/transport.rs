@@ -108,7 +108,9 @@ impl TransportBar {
                     if ui
                         .add(
                             Button::new(
-                                RichText::new("ALL PAUSE").color(Theme::PAUSE_BTN).size(11.0),
+                                RichText::new("ALL PAUSE")
+                                    .color(Theme::PAUSE_BTN)
+                                    .size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 40, 10))
                             .corner_radius(4_u8),
@@ -139,7 +141,7 @@ impl TransportBar {
             ui.add(Separator::default().vertical());
             ui.add_space(8.0);
 
-            // Индикатор активных кью
+            // Indicator for active cues
             ui.vertical(|ui| {
                 ui.add_space(4.0);
                 let color = if active_count > 0 {
