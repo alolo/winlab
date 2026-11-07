@@ -351,6 +351,26 @@ impl IoRouting {
             route.output_channel = route.output_channel.min(output_channels - 1);
         }
     }
+
+    /// Create missing routes using device-specific default stream indices.
+    /// Existing user-configured routes are deliberately left untouched.
+    pub fn ensure_channel_routes_with_defaults(
+        &mut self,
+        input_channels: usize,
+        output_channels: usize,
+        default_output_channels: &[usize],
+    ) {
+        let existing_routes = self.channel_routes.len();
+        let output_channels = output_channels.max(1);
+        self.ensure_channel_routes(input_channels, output_channels);
+
+        for source_index in existing_routes..self.channel_routes.len() {
+            if let Some(output_index) = default_output_channels.get(source_index) {
+                self.channel_routes[source_index].output_channel =
+                    (*output_index).min(output_channels - 1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -651,5 +671,29 @@ mod fade_status_tests {
 
         assert!((cue.progress() - 0.375).abs() < 0.001);
         assert!((cue.remaining_secs() - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn new_routes_use_device_specific_default_output_indices() {
+        let mut routing = IoRouting::default();
+        routing.ensure_channel_routes_with_defaults(2, 6, &[4, 5]);
+
+        assert_eq!(routing.channel_routes[0].output_channel, 4);
+        assert_eq!(routing.channel_routes[1].output_channel, 5);
+    }
+
+    #[test]
+    fn adding_routes_does_not_overwrite_existing_user_routing() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes.push(ChannelRoute {
+            active: true,
+            output_channel: 1,
+            gain_db: -3.0,
+        });
+        routing.ensure_channel_routes_with_defaults(2, 6, &[4, 5]);
+
+        assert_eq!(routing.channel_routes[0].output_channel, 1);
+        assert_eq!(routing.channel_routes[0].gain_db, -3.0);
+        assert_eq!(routing.channel_routes[1].output_channel, 5);
     }
 }

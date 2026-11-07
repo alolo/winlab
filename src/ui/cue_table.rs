@@ -298,6 +298,8 @@ impl CueTable {
                         for &(cue_idx, indent) in &display_order {
                     let cue = &mut cues[cue_idx];
                     let is_selected = selected_ids.contains(&cue.id) || *selected == Some(cue.id);
+                    let missing_file = matches!(&cue.cue_type, CueType::Audio)
+                        && (cue.file_path.as_os_str().is_empty() || !cue.file_path.is_file());
                     let row_start = ui.cursor().min;
                     let row_rect = Rect::from_min_size(row_start, vec2(table_width, row_h));
                     row_rects.push(row_rect);
@@ -394,6 +396,17 @@ impl CueTable {
                             row_rect,
                             2.0_f32,
                             Stroke::new(1.5_f32, Theme::ACCENT),
+                            StrokeKind::Inside,
+                        );
+                    }
+
+                    if missing_file {
+                        // Thin red outline makes unavailable media visible without
+                        // changing the cue's normal background or selection state.
+                        ui.painter().rect_stroke(
+                            row_rect.shrink(0.5),
+                            0.0_f32,
+                            Stroke::new(1.0_f32, Color32::from_rgb(220, 65, 65)),
                             StrokeKind::Inside,
                         );
                     }
@@ -852,6 +865,22 @@ impl CueTable {
                             }
                         });
                     });
+
+                    if missing_file {
+                        let tooltip_response = ui.interact(
+                            row_rect,
+                            Id::new(("missing_file_tooltip", cue.id)),
+                            Sense::hover(),
+                        );
+                        let missing_path = if cue.file_path.as_os_str().is_empty() {
+                            "No file path assigned".to_string()
+                        } else {
+                            cue.file_path.display().to_string()
+                        };
+                        tooltip_response.on_hover_text(format!(
+                            "Missing media file: {missing_path}"
+                        ));
+                    }
 
                     ui.add_space(1.0);
                         }

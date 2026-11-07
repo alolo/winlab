@@ -1,4 +1,4 @@
-// src/project/asset_manager.rs — менеджер копирования аудио в папку assets проекта
+// src/project/asset_manager.rs — менеджер копирования аудио в папку audio проекта
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -18,22 +18,22 @@ impl AssetManager {
     }
 
     pub fn import_file(&self, src: &Path) -> Result<PathBuf> {
-        // An unsaved project has no assets directory yet. Keep the original file
+        // An unsaved project has no audio directory yet. Keep the original file
         // reference for now; save_project() will migrate it after the project is named.
         let Some(project_path) = self.project_path.as_ref() else {
             return Ok(src.to_path_buf());
         };
 
-        let assets_dir = project_path
+        let audio_dir = project_path
             .parent()
             .unwrap_or(Path::new("."))
-            .join("assets");
-        std::fs::create_dir_all(&assets_dir)?;
+            .join("audio");
+        std::fs::create_dir_all(&audio_dir)?;
 
         let file_name = src
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
-        let mut destination = assets_dir.join(file_name);
+        let mut destination = audio_dir.join(file_name);
 
         if destination.as_path() == src || Self::same_file(src, &destination) {
             return Ok(destination);
@@ -52,7 +52,7 @@ impl AssetManager {
                     Some(extension) => format!("{stem}_{suffix}.{extension}"),
                     None => format!("{stem}_{suffix}"),
                 };
-                destination = assets_dir.join(name);
+                destination = audio_dir.join(name);
                 if !destination.exists() {
                     break;
                 }

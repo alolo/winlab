@@ -7,9 +7,16 @@ use crate::cue::{
 use crate::midi::input::MidiOutputManager;
 use crate::ui::theme::Theme;
 use egui::*;
+use rfd::FileDialog;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub struct Inspector;
+
+#[derive(Debug, Clone)]
+pub enum InspectorAction {
+    SetAudioFile(PathBuf),
+}
 
 impl Inspector {
     /// Вкладка 1: Основные свойства, тайминги Pre/Post-Wait, выбор цели (для Play/Pause/Stop/Fade) и состав группы
@@ -18,7 +25,8 @@ impl Inspector {
         cue: &mut Cue,
         cue_targets: &[(Uuid, String, Option<std::path::PathBuf>)],
         all_cues: &[(Uuid, String)],
-    ) {
+    ) -> Option<InspectorAction> {
+        let mut action = None;
         ui.columns(3, |cols| {
                     // Колонка 1: Identity & Color
                     Self::section(&mut cols[0], "Identity", |ui| {
@@ -101,8 +109,50 @@ impl Inspector {
                         let cue_id = cue.id;
                         match &mut cue.cue_type {
                             CueType::Audio => {
-                                let fname = cue.file_path.to_string_lossy().to_string();
-                                ui.label(RichText::new(fname).color(Theme::TEXT_DIM).size(11.0));
+                                let file_exists = cue.file_path.is_file();
+                                let fname = if cue.file_path.as_os_str().is_empty() {
+                                    "No audio file assigned".to_string()
+                                } else {
+                                    cue.file_path.to_string_lossy().to_string()
+                                };
+                                ui.label(
+                                    RichText::new(fname)
+                                        .color(if file_exists {
+                                            Theme::TEXT_DIM
+                                        } else {
+                                            egui::Color32::from_rgb(235, 85, 85)
+                                        })
+                                        .size(11.0),
+                                )
+                                .on_hover_text(if file_exists {
+                                    "Audio file is available"
+                                } else {
+                                    "Audio file is missing. Locate it or replace it."
+                                });
+                                ui.horizontal(|ui| {
+                                    let button_label = if file_exists {
+                                        "Replace File…"
+                                    } else {
+                                        "Locate File…"
+                                    };
+                                    if ui.button(button_label).clicked() {
+                                        if let Some(path) = FileDialog::new()
+                                            .add_filter(
+                                                "Audio",
+                                                &["wav", "mp3", "flac", "ogg", "aiff", "aif", "m4a"],
+                                            )
+                                            .pick_file()
+                                        {
+                                            action = Some(InspectorAction::SetAudioFile(path));
+                                        }
+                                    }
+                                    if !file_exists {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(235, 85, 85),
+                                            "Missing media",
+                                        );
+                                    }
+                                });
                                 ui.label(
                                     RichText::new(format!(
                                         "Duration: {}",
@@ -357,6 +407,8 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         }
                     });
                 });
+
+        action
     }
 
     fn target_selector(
@@ -500,14 +552,17 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     .id_salt("io_hardware_outputs_scroll")
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        for (index, setting) in output_settings.iter_mut().enumerate() {
+                        let output_order = audio.output_channel_display_order(None);
+                        for index in output_order {
+                            let Some(setting) = output_settings.get_mut(index) else {
+                                continue;
+                            };
+                            let output_label = audio.output_channel_label(None, index);
                             ui.horizontal(|ui| {
                                 changed |= ui.checkbox(&mut setting.active, "Active").changed();
                                 ui.add_sized(
-                                    [78.0, 22.0],
-                                    Label::new(
-                                        RichText::new(format!("Output {}", index + 1)).strong(),
-                                    ),
+                                    [150.0, 22.0],
+                                    Label::new(RichText::new(output_label).strong()),
                                 );
                                 let slider_changed = ui
                                     .add(
@@ -629,8 +684,13 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         );
                         return;
                     }
-                    cue.io
-                        .ensure_channel_routes(input_channels, output_channels);
+                    let default_route_channels =
+                        audio.default_route_output_channels(cue.io.output_device.as_deref());
+                    cue.io.ensure_channel_routes_with_defaults(
+                        input_channels,
+                        output_channels,
+                        &default_route_channels,
+                    );
                     let format = match input_channels {
                         1 => "Mono",
                         2 => "Stereo",
@@ -642,6 +702,9 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         RichText::new(format!("{} · {} source channels", format, input_channels))
                             .color(Theme::ACCENT),
                     );
+                    let route_device_name = cue.io.output_device.clone();
+                    let output_order =
+                        audio.output_channel_display_order(route_device_name.as_deref());
                     ui.add_space(6.0);
 
                     egui::ScrollArea::vertical()
@@ -666,15 +729,22 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                         cue_id,
                                         source_index,
                                     ))
-                                    .width(105.0)
-                                    .selected_text(format!("Output {}", route.output_channel + 1))
+                                    .width(170.0)
+                                    .selected_text(audio.output_channel_label(
+                                        route_device_name.as_deref(),
+                                        route.output_channel,
+                                    ))
                                     .show_ui(ui, |ui| {
-                                        for output_index in 0..output_channels {
+                                        for output_index in output_order.iter().copied() {
+                                            let output_label = audio.output_channel_label(
+                                                route_device_name.as_deref(),
+                                                output_index,
+                                            );
                                             changed |= ui
                                                 .selectable_value(
                                                     &mut route.output_channel,
                                                     output_index,
-                                                    format!("Output {}", output_index + 1),
+                                                    output_label,
                                                 )
                                                 .changed();
                                         }

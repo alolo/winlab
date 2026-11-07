@@ -12,7 +12,7 @@ use crate::osc::server::OscServer;
 use crate::project::{asset_manager::AssetManager, save_load::Project};
 use crate::ui::{
     cue_table::{visible_cue_ids, CueTable, CueTableAction, EditField},
-    inspector::Inspector,
+    inspector::{Inspector, InspectorAction},
     theme::Theme,
     transport::{TransportAction, TransportBar},
     waveform_editor::WaveformEditor,
@@ -20,11 +20,64 @@ use crate::ui::{
 
 use eframe::egui::{self, Context, Id, Key, RichText};
 use rfd::FileDialog;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+fn ensure_project_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("clabs"))
+        .unwrap_or(false)
+    {
+        path
+    } else {
+        path.with_extension("clabs")
+    }
+}
+
+fn project_name_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Untitled Project")
+        .to_string()
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn sanitize_project_name(name: &str) -> Option<String> {
+    let sanitized: String = name
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    *character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+        .collect();
+    let sanitized = sanitized
+        .trim()
+        .trim_end_matches(|character: char| character == ' ' || character == '.')
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Panel {
@@ -44,6 +97,7 @@ enum SettingsTab {
     Midi,
     MidiControl,
     Playback,
+    Backup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +187,6 @@ fn normal_group_manual_stop_in(
 }
 
 pub struct CueLabsApp {
-    renaming_project: bool,
-    project_name_buf: String,
     audio: AudioEngine,
     midi: MidiInputManager,
     midi_out: MidiOutputManager,
@@ -143,6 +195,7 @@ pub struct CueLabsApp {
     cue_list: CueList,
     project: Project,
     project_path: Option<PathBuf>,
+    project_needs_save_as: bool,
     assets: AssetManager,
     report: SessionReport,
     settings: AppSettings,
@@ -157,11 +210,12 @@ pub struct CueLabsApp {
     selection_anchor: Option<Uuid>,
     editing: Option<(Uuid, EditField, String)>,
     editing_focus_pending: bool,
+    project_name_edit: Option<String>,
+    project_name_edit_focus_pending: bool,
     expanded_groups: HashSet<Uuid>,
     active_panel: Panel,
     master_vol: f32,
     status_msg: String,
-    project_name_focus_pending: bool,
     cue_column_widths: [f32; 9],
     bottom_panel_height: f32,
     bottom_panel_dirty: bool,
@@ -172,6 +226,10 @@ pub struct CueLabsApp {
     pending_triggers: Vec<PendingTrigger>,
     active_playlists: Vec<ActivePlaylist>,
     active_all_cues: Vec<ActiveAllCues>,
+    startup_frame_logged: bool,
+    last_periodic_backup_at: Instant,
+    last_backup_fingerprint: Option<u64>,
+    last_media_scan_at: Instant,
 }
 
 impl CueLabsApp {
@@ -201,6 +259,8 @@ impl CueLabsApp {
                 audio.set_input_device(device);
             }
         }
+        audio.set_output_channel_names(settings.output_channel_names.clone());
+        audio.set_default_output_pairs(settings.default_output_pairs.clone());
         settings.output_channels.resize(
             audio.output_channels.max(1),
             crate::cue::OutputChannelSetting::default(),
@@ -225,6 +285,7 @@ impl CueLabsApp {
             .ok();
         let cue_column_widths = settings.cue_column_widths;
         let bottom_panel_height = settings.bottom_panel_height.clamp(80.0, 1200.0);
+        info!("CueLabs initialization complete; creating the main window");
 
         Self {
             audio,
@@ -234,6 +295,7 @@ impl CueLabsApp {
             cue_list: CueList::new("Main"),
             project: Project::default(),
             project_path: None,
+            project_needs_save_as: false,
             assets: AssetManager::new(),
             report: SessionReport::new("Untitled Project"),
             settings,
@@ -247,6 +309,8 @@ impl CueLabsApp {
             selection_anchor: None,
             editing: None,
             editing_focus_pending: false,
+            project_name_edit: None,
+            project_name_edit_focus_pending: false,
             expanded_groups: HashSet::new(),
             active_panel: Panel::Inspector,
             master_vol: 1.0,
@@ -254,7 +318,10 @@ impl CueLabsApp {
             pending_triggers: Vec::new(),
             active_playlists: Vec::new(),
             active_all_cues: Vec::new(),
-            project_name_focus_pending: false,
+            startup_frame_logged: false,
+            last_periodic_backup_at: Instant::now(),
+            last_backup_fingerprint: None,
+            last_media_scan_at: Instant::now(),
             cue_column_widths,
             bottom_panel_height,
             bottom_panel_dirty: false,
@@ -262,8 +329,6 @@ impl CueLabsApp {
             notes_sidebar_open: true,
             fade_started_at: HashMap::new(),
             fade_managed_targets: HashSet::new(),
-            renaming_project: false,
-            project_name_buf: String::new(),
         }
     }
 
@@ -528,7 +593,14 @@ impl CueLabsApp {
             .audio
             .output_channels_for_device(snapshot.io.output_device.as_deref());
         let mut routing = snapshot.io.clone();
-        routing.ensure_channel_routes(source_channels, output_channels);
+        let default_route_channels = self
+            .audio
+            .default_route_output_channels(snapshot.io.output_device.as_deref());
+        routing.ensure_channel_routes_with_defaults(
+            source_channels,
+            output_channels,
+            &default_route_channels,
+        );
         if let Some(cue) = self.cue_list.find_mut(id) {
             cue.state = CueState::Playing;
             cue.audio_channels = source_channels;
@@ -599,7 +671,14 @@ impl CueLabsApp {
                         .audio
                         .output_channels_for_device(cue_snapshot.io.output_device.as_deref());
                     let mut io_routing = cue_snapshot.io.clone();
-                    io_routing.ensure_channel_routes(source_channels, track_output_channels);
+                    let default_route_channels = self
+                        .audio
+                        .default_route_output_channels(cue_snapshot.io.output_device.as_deref());
+                    io_routing.ensure_channel_routes_with_defaults(
+                        source_channels,
+                        track_output_channels,
+                        &default_route_channels,
+                    );
                     if let Some(cue) = self.cue_list.find_mut(id) {
                         cue.state = CueState::Playing;
                         cue.audio_channels = source_channels;
@@ -1513,7 +1592,7 @@ impl CueLabsApp {
     }
 
     fn import_file(&mut self, path: PathBuf) {
-        let final_path = if self.project_path.is_some() {
+        let final_path = if self.project_path.is_some() && !self.project_needs_save_as {
             self.assets
                 .import_file(&path)
                 .unwrap_or_else(|_| path.clone())
@@ -1524,8 +1603,12 @@ impl CueLabsApp {
         let mut cue = Cue::new_audio(final_path.clone());
         cue.audio_channels = get_channel_count(&final_path);
         if cue.audio_channels > 0 {
-            cue.io
-                .ensure_channel_routes(cue.audio_channels, self.audio.output_channels);
+            let default_route_channels = self.audio.default_route_output_channels(None);
+            cue.io.ensure_channel_routes_with_defaults(
+                cue.audio_channels,
+                self.audio.output_channels,
+                &default_route_channels,
+            );
         }
         let dur = get_duration(&final_path);
         if dur > 0.0 {
@@ -1744,19 +1827,37 @@ impl CueLabsApp {
     // ── Сохранение и загрузка проекта ────────────────────────────────────────
 
     fn save_project(&mut self) {
-        if self.project_path.is_none() {
+        info!(
+            "Save requested: path={:?}, project_name={:?}, save_as_required={}",
+            self.project_path, self.project.settings.name, self.project_needs_save_as
+        );
+        // Only a real title change requires Save As. Reconcile the flag with
+        // the opened filename so a stale flag can never turn ordinary Ctrl+S
+        // into Save As. Editing cues/settings must always save in place.
+        let renamed_from_opened_file = self.project_path.as_deref().is_some_and(|opened_path| {
+            project_name_from_path(opened_path) != self.project.settings.name
+        });
+        self.project_needs_save_as = renamed_from_opened_file;
+        if renamed_from_opened_file {
+            self.status_msg =
+                "Project name changed — choose a new project file with Save As".to_string();
+            self.save_as_project();
+            return;
+        }
+
+        let is_first_save = self.project_path.is_none();
+        if is_first_save {
+            let default_name = format!("{}.clabs", self.project.settings.name);
             let path = FileDialog::new()
                 .add_filter("CueLabs Project", &["clabs"])
+                .set_file_name(&default_name)
                 .save_file();
             match path {
-                Some(p) => {
-                    let p = if p.extension().is_none() {
-                        p.with_extension("clabs")
-                    } else {
-                        p
-                    };
-                    self.assets.set_project_path(p.clone());
-                    self.project_path = Some(p);
+                Some(path) => {
+                    let path = ensure_project_extension(path);
+                    self.project.settings.name = project_name_from_path(&path);
+                    self.assets.set_project_path(path.clone());
+                    self.project_path = Some(path);
                 }
                 None => return,
             }
@@ -1764,7 +1865,7 @@ impl CueLabsApp {
 
         let path = self.project_path.clone().unwrap();
 
-        // Move files that were added before the first Save into the project assets folder.
+        // Move files that were added before the first Save into the project audio folder.
         let pending_assets: Vec<(Uuid, PathBuf)> = self
             .cue_list
             .cues
@@ -1790,15 +1891,500 @@ impl CueLabsApp {
             }
         }
 
+        self.project.settings.name = project_name_from_path(&path);
+        self.report.project_name = self.project.settings.name.clone();
         self.project.cue_list = self.cue_list.clone();
 
         match self.project.save(&path) {
-            Ok(_) => self.status_msg = format!("💾 Saved: {}", path.display()),
+            Ok(_) => {
+                self.status_msg = format!("💾 Saved: {}", path.display());
+                if is_first_save {
+                    self.last_periodic_backup_at = Instant::now();
+                }
+                self.create_project_backup("save");
+            }
             Err(e) => {
                 self.status_msg = format!("Save error: {e}");
                 error!("{e}");
             }
         }
+    }
+
+    /// Save the current project under a new filename. Media references are
+    /// preserved; use Save as Bundle to copy media into a portable folder.
+    fn save_as_project(&mut self) {
+        let default_name = format!("{}.clabs", self.project.settings.name);
+
+        let Some(path) = FileDialog::new()
+            .add_filter("CueLabs Project", &["clabs"])
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let path = ensure_project_extension(path);
+
+        if self.project_needs_save_as
+            && self
+                .project_path
+                .as_deref()
+                .is_some_and(|opened_path| paths_refer_to_same_location(opened_path, &path))
+        {
+            self.status_msg =
+                "The original project file is protected. Choose a different name or location."
+                    .to_string();
+            return;
+        }
+
+        let mut project = self.project.clone();
+        project.settings.name = project_name_from_path(&path);
+        project.cue_list = self.cue_list.clone();
+
+        match project.save(&path) {
+            Ok(()) => {
+                self.project = project;
+                self.project_path = Some(path.clone());
+                self.assets.set_project_path(path.clone());
+                self.report.project_name = self.project.settings.name.clone();
+                self.project_needs_save_as = false;
+                self.last_periodic_backup_at = Instant::now();
+                self.status_msg = format!("💾 Saved as: {}", path.display());
+                self.create_project_backup("save-as");
+            }
+            Err(error) => {
+                self.status_msg = format!("Save As error: {error}");
+                error!("Could not save project copy: {error}");
+            }
+        }
+    }
+
+    /// Create a portable bundle folder:
+    /// <parent>/<project>/<project>.clabs + audio/ with relative media paths.
+    fn save_as_bundle(&mut self) {
+        let default_name = self.project.settings.name.clone();
+        let default_file_name = format!("{default_name}.clabs");
+
+        let Some(selected_path) = FileDialog::new()
+            .add_filter("CueLabs Project Bundle", &["clabs"])
+            .set_file_name(&default_file_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        // The selected filename determines both the bundle folder and project
+        // filename. The selected path itself is a naming/location hint; the
+        // actual project file is created one level deeper.
+        let selected_path = ensure_project_extension(selected_path);
+        let bundle_name = project_name_from_path(&selected_path);
+        let bundle_parent = selected_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let bundle_dir = bundle_parent.join(&bundle_name);
+        let bundle_project_path = bundle_dir.join(format!("{bundle_name}.clabs"));
+        let audio_dir = bundle_dir.join("audio");
+
+        if bundle_dir.exists() && !bundle_dir.is_dir() {
+            self.status_msg = format!(
+                "Bundle error: destination exists and is not a folder: {}",
+                bundle_dir.display()
+            );
+            return;
+        }
+
+        if let Err(error) = std::fs::create_dir_all(&audio_dir) {
+            self.status_msg = format!("Bundle error: {error}");
+            error!("Could not create bundle directory: {error}");
+            return;
+        }
+
+        let mut bundle_assets = AssetManager::new();
+        bundle_assets.set_project_path(bundle_project_path.clone());
+
+        let mut bundle_cues = self.cue_list.clone();
+        let mut copied_files: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let mut copied_count = 0usize;
+        let mut missing_count = 0usize;
+
+        for cue in &mut bundle_cues.cues {
+            if !matches!(&cue.cue_type, CueType::Audio) {
+                continue;
+            }
+
+            let source_path = cue.file_path.clone();
+            if source_path.as_os_str().is_empty() {
+                cue.file_path = audio_dir.join("missing").join("unknown-media");
+                missing_count += 1;
+                continue;
+            }
+
+            if source_path.is_file() {
+                let source_key = source_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| source_path.clone());
+
+                let destination = if let Some(existing) = copied_files.get(&source_key) {
+                    existing.clone()
+                } else {
+                    match bundle_assets.import_file(&source_path) {
+                        Ok(destination) => {
+                            copied_files.insert(source_key, destination.clone());
+                            copied_count += 1;
+                            destination
+                        }
+                        Err(error) => {
+                            self.status_msg = format!("Bundle audio copy error: {error}");
+                            error!("Could not copy bundle audio file: {error}");
+                            return;
+                        }
+                    }
+                };
+                cue.file_path = destination;
+            } else {
+                // Keep an expected relative location for missing media. This
+                // allows the project to open elsewhere and show the missing-file
+                // warning without retaining an absolute path from this computer.
+                let file_name = source_path
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("unknown-media"));
+                cue.file_path = audio_dir.join("missing").join(file_name);
+                missing_count += 1;
+            }
+        }
+
+        let mut project = self.project.clone();
+        project.settings.name = bundle_name.clone();
+        project.cue_list = bundle_cues.clone();
+
+        match project.save(&bundle_project_path) {
+            Ok(()) => {
+                self.cue_list = bundle_cues;
+                self.project = project;
+                self.project_path = Some(bundle_project_path.clone());
+                self.assets.set_project_path(bundle_project_path);
+                self.report.project_name = self.project.settings.name.clone();
+                self.project_needs_save_as = false;
+                self.last_periodic_backup_at = Instant::now();
+                self.status_msg = format!(
+                    "📦 Bundle saved: {} | audio files: {} | missing: {}",
+                    bundle_dir.display(),
+                    copied_count,
+                    missing_count
+                );
+                self.create_project_backup("bundle-save");
+            }
+            Err(error) => {
+                self.status_msg = format!("Bundle save error: {error}");
+                error!("Could not save project bundle: {error}");
+            }
+        }
+    }
+
+    fn rename_project(&mut self, requested_name: String) {
+        let Some(new_name) = sanitize_project_name(&requested_name) else {
+            self.status_msg =
+                "Project name cannot be empty or contain only invalid characters".to_string();
+            return;
+        };
+
+        let old_name = self.project.settings.name.clone();
+        if new_name == old_name || new_name.eq_ignore_ascii_case(&old_name) {
+            self.project_name_edit = None;
+            return;
+        }
+
+        // Keep the opened file and its containing Bundle untouched. The new
+        // name becomes the in-memory project name; the next Save operation
+        // will open Save As and write a separate project file.
+        self.project.settings.name = new_name.clone();
+        self.project.cue_list = self.cue_list.clone();
+        self.report.project_name = new_name.clone();
+        self.project_needs_save_as = self.project_path.is_some();
+        self.status_msg = if self.project_needs_save_as {
+            format!("Project renamed to {new_name}. Save to create a new project file.")
+        } else {
+            format!("Project renamed: {new_name}")
+        };
+    }
+
+    fn project_backup_fingerprint(&self) -> Option<u64> {
+        let mut snapshot = self.project.clone();
+        snapshot.cue_list = self.cue_list.clone();
+        let serialized = serde_json::to_vec(&snapshot).ok()?;
+        let mut hasher = DefaultHasher::new();
+        serialized.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn create_project_backup(&mut self, reason: &str) {
+        let Some(project_path) = self.project_path.clone() else {
+            return;
+        };
+
+        // Do not create nested backup/backup folders when a snapshot itself
+        // has been opened for recovery.
+        let is_backup_project = project_path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
+        if is_backup_project {
+            return;
+        }
+
+        let project_dir = project_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup_dir = project_dir.join("backup");
+
+        if let Err(error) = std::fs::create_dir_all(&backup_dir) {
+            self.status_msg = format!("Backup error: {error}");
+            warn!("Could not create project backup directory: {error}");
+            if reason == "periodic" {
+                self.last_periodic_backup_at = Instant::now();
+            }
+            return;
+        }
+
+        self.project.cue_list = self.cue_list.clone();
+        let safe_name = sanitize_project_name(&self.project.settings.name)
+            .unwrap_or_else(|| "Project".to_string());
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
+        let backup_path = backup_dir.join(format!("{safe_name}__{timestamp}.clabs"));
+
+        match self.project.save_backup(&backup_path, &project_path) {
+            Ok(()) => {
+                self.last_backup_fingerprint = self.project_backup_fingerprint();
+                if reason == "periodic" {
+                    self.last_periodic_backup_at = Instant::now();
+                }
+                info!("Created {reason} backup: {:?}", backup_path);
+
+                // The retention limit applies to the whole backup folder,
+                // not just the current project-name prefix. This also handles
+                // snapshots created before/after a project rename.
+                let mut backups: Vec<PathBuf> = match std::fs::read_dir(&backup_dir) {
+                    Ok(entries) => entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.is_file()
+                                && path
+                                    .extension()
+                                    .and_then(|extension| extension.to_str())
+                                    .is_some_and(|extension| {
+                                        extension.eq_ignore_ascii_case("clabs")
+                                    })
+                        })
+                        .collect(),
+                    Err(error) => {
+                        warn!("Could not list project backups: {error}");
+                        Vec::new()
+                    }
+                };
+                backups.sort_by_key(|path| {
+                    std::fs::metadata(path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or(0)
+                });
+
+                while backups.len() > 10 {
+                    let oldest = backups.remove(0);
+                    if let Err(error) = std::fs::remove_file(&oldest) {
+                        warn!("Could not remove old project backup {:?}: {error}", oldest);
+                    }
+                }
+            }
+            Err(error) => {
+                self.status_msg = format!("Backup error: {error}");
+                warn!("Could not create project backup: {error}");
+                if reason == "periodic" {
+                    self.last_periodic_backup_at = Instant::now();
+                }
+            }
+        }
+    }
+
+    fn poll_periodic_backup(&mut self) {
+        let interval_minutes = self.settings.backup_interval_minutes;
+        if interval_minutes == 0
+            || self.project_path.is_none()
+            || self.project_needs_save_as
+            || self.last_periodic_backup_at.elapsed()
+                < Duration::from_secs(interval_minutes as u64 * 60)
+        {
+            return;
+        }
+
+        // A manual Save creates its own snapshot, but must not restart the
+        // periodic clock. This clock is independent so timed backups still
+        // happen on schedule even when the user saves frequently.
+        self.last_periodic_backup_at = Instant::now();
+        let current_fingerprint = self.project_backup_fingerprint();
+        if current_fingerprint.is_some() && current_fingerprint == self.last_backup_fingerprint {
+            info!("Skipping periodic backup: project has not changed since the last snapshot");
+            return;
+        }
+
+        self.create_project_backup("periodic");
+    }
+
+    fn poll_audio_file_metadata(&mut self) {
+        if self.last_media_scan_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_media_scan_at = Instant::now();
+
+        for cue in &mut self.cue_list.cues {
+            if !matches!(&cue.cue_type, CueType::Audio) {
+                continue;
+            }
+
+            if !cue.file_path.is_file() {
+                // Clear stale runtime metadata when media disappears. The
+                // next scan will rebuild it as soon as the file is restored.
+                cue.duration_secs = 0.0;
+                cue.waveform.clear();
+                continue;
+            }
+
+            if cue.duration_secs > 0.0 && !cue.waveform.is_empty() {
+                continue;
+            }
+
+            let duration = get_duration(&cue.file_path);
+            if duration <= 0.0 {
+                continue;
+            }
+            let waveform = generate_waveform(&cue.file_path, 512);
+            if waveform.is_empty() {
+                continue;
+            }
+            let channels = get_channel_count(&cue.file_path);
+
+            cue.duration_secs = duration;
+            cue.waveform = waveform;
+            if cue.loop_region.end_secs <= 0.0 {
+                cue.loop_region.end_secs = duration;
+            } else {
+                cue.loop_region.end_secs = cue.loop_region.end_secs.min(duration);
+            }
+            cue.start_secs = cue.start_secs.min(duration);
+            if let Some(end_secs) = cue.end_secs.as_mut() {
+                *end_secs = (*end_secs).min(duration);
+            }
+
+            if channels > 0 {
+                cue.audio_channels = channels;
+                let output_count = self
+                    .audio
+                    .output_channels_for_device(cue.io.output_device.as_deref());
+                let default_route_channels = self
+                    .audio
+                    .default_route_output_channels(cue.io.output_device.as_deref());
+                cue.io.ensure_channel_routes_with_defaults(
+                    channels,
+                    output_count,
+                    &default_route_channels,
+                );
+            }
+
+            info!(
+                "Recovered audio metadata for cue {} from {:?}",
+                cue.id, cue.file_path
+            );
+        }
+    }
+
+    fn set_audio_cue_file(&mut self, cue_id: Uuid, source_path: PathBuf) {
+        if !source_path.is_file() {
+            self.status_msg = format!("Audio file does not exist: {}", source_path.display());
+            return;
+        }
+
+        let duration = get_duration(&source_path);
+        let waveform = generate_waveform(&source_path, 512);
+        let channels = get_channel_count(&source_path);
+        if duration <= 0.0 || waveform.is_empty() {
+            self.status_msg = format!("Could not decode audio file: {}", source_path.display());
+            return;
+        }
+
+        let is_backup_project = self
+            .project_path
+            .as_deref()
+            .and_then(|path| path.parent())
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
+        let destination =
+            if self.project_path.is_some() && !is_backup_project && !self.project_needs_save_as {
+                match self.assets.import_file(&source_path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.status_msg = format!("Could not import audio file: {error}");
+                        error!("Could not import replacement audio file: {error}");
+                        return;
+                    }
+                }
+            } else {
+                source_path
+            };
+
+        if let Some(cue) = self.cue_list.find_mut(cue_id) {
+            if !matches!(&cue.cue_type, CueType::Audio) {
+                return;
+            }
+
+            if cue.is_active() {
+                self.audio.send(AudioCommand::Stop(cue_id));
+            }
+            let previous_duration = cue.duration_secs;
+            cue.state = CueState::Stopped;
+            cue.position_secs = 0.0;
+            cue.file_path = destination.clone();
+            cue.duration_secs = duration;
+            cue.waveform = waveform;
+            if channels > 0 {
+                cue.audio_channels = channels;
+                let output_count = self
+                    .audio
+                    .output_channels_for_device(cue.io.output_device.as_deref());
+                let default_route_channels = self
+                    .audio
+                    .default_route_output_channels(cue.io.output_device.as_deref());
+                cue.io.ensure_channel_routes_with_defaults(
+                    channels,
+                    output_count,
+                    &default_route_channels,
+                );
+            }
+
+            if cue.loop_region.end_secs <= 0.0
+                || previous_duration <= 0.0
+                || (cue.loop_region.end_secs - previous_duration).abs() < 0.05
+            {
+                cue.loop_region.end_secs = duration;
+            } else {
+                cue.loop_region.end_secs = cue.loop_region.end_secs.min(duration);
+            }
+            cue.start_secs = cue.start_secs.min(duration);
+            if let Some(end_secs) = cue.end_secs.as_mut() {
+                *end_secs = (*end_secs).min(duration);
+            }
+        }
+
+        self.status_msg = format!(
+            "Audio file updated: {} · {}",
+            destination.display(),
+            crate::ui::cue_table::format_duration(duration)
+        );
     }
 
     fn open_project(&mut self) {
@@ -1819,9 +2405,16 @@ impl CueLabsApp {
                                 cue.audio_channels = detected_channels;
                             }
                             if cue.audio_channels > 0 {
-                                cue.io.ensure_channel_routes(
+                                let output_count = self
+                                    .audio
+                                    .output_channels_for_device(cue.io.output_device.as_deref());
+                                let default_route_channels = self
+                                    .audio
+                                    .default_route_output_channels(cue.io.output_device.as_deref());
+                                cue.io.ensure_channel_routes_with_defaults(
                                     cue.audio_channels,
-                                    self.audio.output_channels,
+                                    output_count,
+                                    &default_route_channels,
                                 );
                             }
                             if cue.duration_secs == 0.0 {
@@ -1837,10 +2430,28 @@ impl CueLabsApp {
                     }
 
                     self.cue_list = cl;
-                    self.assets.set_project_path(path.clone());
-                    self.project_path = Some(path.clone());
-                    self.report = SessionReport::new(&proj.settings.name);
                     self.project = proj;
+                    let is_backup_project = path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
+                    if !is_backup_project {
+                        self.assets.set_project_path(path.clone());
+                        self.project_path = Some(path.clone());
+                        self.project.settings.name = project_name_from_path(&path);
+                    } else {
+                        // Opening a backup is a recovery operation. Keep the
+                        // snapshot untouched and let the user Save As a normal
+                        // project when ready.
+                        self.assets = AssetManager::new();
+                        self.project_path = None;
+                    }
+                    self.project_needs_save_as = false;
+                    self.last_periodic_backup_at = Instant::now();
+                    self.last_backup_fingerprint = self.project_backup_fingerprint();
+                    self.last_media_scan_at = Instant::now();
+                    self.report = SessionReport::new(&self.project.settings.name);
                     self.selected = None;
                     self.selected_ids.clear();
                     self.selection_anchor = None;
@@ -1859,11 +2470,15 @@ impl CueLabsApp {
         self.cue_list = CueList::new("Main");
         self.project = Project::default();
         self.project_path = None;
+        self.project_needs_save_as = false;
         self.assets = AssetManager::new();
         self.report = SessionReport::new("Untitled Project");
         self.selected = None;
         self.selected_ids.clear();
         self.selection_anchor = None;
+        self.last_periodic_backup_at = Instant::now();
+        self.last_backup_fingerprint = None;
+        self.last_media_scan_at = Instant::now();
         self.status_msg = "New project".to_string();
     }
 
@@ -2160,7 +2775,32 @@ impl CueLabsApp {
             return;
         }
 
-        // Do not steal keystrokes from text fields and other editors.
+        // Project save shortcuts are global, including while a text editor has
+        // focus. This matches normal desktop-app behaviour: Ctrl+S saves the
+        // project, Ctrl+Shift+S always opens Save As, and Ctrl+Alt+S bundles.
+        if key_events.iter().any(|(key, modifiers)| {
+            *key == Key::S && modifiers.ctrl && modifiers.shift && !modifiers.alt
+        }) {
+            self.save_as_project();
+            return;
+        }
+        if key_events.iter().any(|(key, modifiers)| {
+            *key == Key::S && modifiers.ctrl && modifiers.alt && !modifiers.shift
+        }) {
+            self.save_as_bundle();
+            return;
+        }
+        let save_binding = self.settings.hotkeys.bindings.get(&AppAction::SaveProject);
+        if save_binding.is_some_and(|binding| {
+            key_events.iter().any(|(key, modifiers)| {
+                Self::format_hotkey(*key, *modifiers).eq_ignore_ascii_case(binding)
+            })
+        }) {
+            self.save_project();
+            return;
+        }
+
+        // Other shortcuts should not steal keystrokes from text fields/editors.
         if ctx.memory(|memory| memory.focused().is_some()) {
             return;
         }
@@ -2188,6 +2828,9 @@ impl CueLabsApp {
         }
 
         for action in AppAction::ALL {
+            if *action == AppAction::SaveProject {
+                continue;
+            }
             let Some(binding) = self.settings.hotkeys.bindings.get(action) else {
                 continue;
             };
@@ -2285,6 +2928,8 @@ impl CueLabsApp {
                         replacement.set_output_device(saved_device);
                     }
                 }
+                replacement.set_output_channel_names(self.settings.output_channel_names.clone());
+                replacement.set_default_output_pairs(self.settings.default_output_pairs.clone());
                 let backend_devices = replacement.output_devices.clone();
                 self.audio = replacement;
                 self.settings.audio_backend = backend;
@@ -2303,8 +2948,14 @@ impl CueLabsApp {
                         let output_count = self
                             .audio
                             .output_channels_for_device(cue.io.output_device.as_deref());
-                        cue.io
-                            .ensure_channel_routes(cue.audio_channels.max(1), output_count);
+                        let default_route_channels = self
+                            .audio
+                            .default_route_output_channels(cue.io.output_device.as_deref());
+                        cue.io.ensure_channel_routes_with_defaults(
+                            cue.audio_channels.max(1),
+                            output_count,
+                            &default_route_channels,
+                        );
                     }
                 }
                 self.save_app_settings();
@@ -2387,6 +3038,7 @@ impl CueLabsApp {
                                 (SettingsTab::MidiControl, "MIDI Control"),
                                 (SettingsTab::Midi, "MIDI Interfaces"),
                                 (SettingsTab::Playback, "Playback"),
+                                (SettingsTab::Backup, "Backups"),
                             ] {
                                 ui.selectable_value(&mut self.settings_tab, tab, label);
                             }
@@ -2442,7 +3094,14 @@ impl CueLabsApp {
                                             for cue in &mut self.cue_list.cues {
                                                 if matches!(&cue.cue_type, CueType::Audio) && cue.audio_channels > 0 {
                                                     let output_count = self.audio.output_channels_for_device(cue.io.output_device.as_deref());
-                                                    cue.io.ensure_channel_routes(cue.audio_channels, output_count);
+                                                    let default_route_channels = self
+                                                        .audio
+                                                        .default_route_output_channels(cue.io.output_device.as_deref());
+                                                    cue.io.ensure_channel_routes_with_defaults(
+                                                        cue.audio_channels,
+                                                        output_count,
+                                                        &default_route_channels,
+                                                    );
                                                 }
                                             }
                                             self.settings.audio_output_device = Some(device);
@@ -2471,22 +3130,144 @@ impl CueLabsApp {
                         }
                         let mut output_settings = self.audio.output_channel_settings();
                         let mut output_settings_changed = false;
+                        let output_count = self
+                            .audio
+                            .output_channels_for_device(Some(&output))
+                            .max(1);
+                        let mut output_names =
+                            self.audio.output_channel_names_for_device(Some(&output));
+                        output_names.resize(output_count, String::new());
+                        let mut output_names_changed = false;
+                        let mut output_names_commit = false;
+                        let channel_options: Vec<(usize, String)> = (0..output_count)
+                            .map(|index| {
+                                (
+                                    index,
+                                    self.audio.output_channel_label(Some(&output), index),
+                                )
+                            })
+                            .collect();
+
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Physical output channel controls").strong());
-                        for (index, setting) in output_settings.iter_mut().enumerate() {
+                        ui.label(
+                            egui::RichText::new("Output channel names and levels").strong(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Press Test to identify the physical connector, then enter its name. Calibration is saved separately for each device.",
+                            )
+                            .color(Theme::TEXT_DIM)
+                            .size(11.0),
+                        );
+                        let output_order = self.audio.output_channel_display_order(Some(&output));
+                        for index in output_order {
+                            let Some(setting) = output_settings.get_mut(index) else {
+                                continue;
+                            };
                             ui.horizontal(|ui| {
-                                output_settings_changed |= ui.checkbox(&mut setting.active, "Active").changed();
-                                ui.label(format!("Output {}", index + 1));
-                                output_settings_changed |= ui.add(
-                                    egui::Slider::new(&mut setting.gain_db, -60.0..=18.0)
-                                        .show_value(true)
-                                        .custom_formatter(|value, _| format!("{:+.1} dB", value)),
-                                ).changed();
+                                output_settings_changed |=
+                                    ui.checkbox(&mut setting.active, "Active").changed();
+                                ui.label(format!("Driver ch. {}", index + 1));
+                                let name_response = ui.add_sized(
+                                    [190.0, 22.0],
+                                    egui::TextEdit::singleline(&mut output_names[index])
+                                        .hint_text(format!("Physical output {}", index + 1)),
+                                );
+                                output_names_changed |= name_response.changed();
+                                output_names_commit |= name_response.lost_focus()
+                                    || (name_response.has_focus()
+                                        && ui.input(|input| input.key_pressed(Key::Enter)));
+                                if ui.small_button("Test").clicked() {
+                                    self.audio.test_output_channel(index);
+                                }
+                                output_settings_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut setting.gain_db, -60.0..=18.0)
+                                            .show_value(true)
+                                            .custom_formatter(|value, _| {
+                                                format!("{:+.1} dB", value)
+                                            }),
+                                    )
+                                    .changed();
                             });
                         }
                         if output_settings_changed {
                             self.audio.set_output_channel_settings(output_settings.clone());
                             self.settings.output_channels = output_settings;
+                            self.save_app_settings();
+                        }
+                        if output_names_changed {
+                            self.audio
+                                .set_output_channel_names_for_device(&output, output_names.clone());
+                            let settings_key =
+                                self.audio.output_device_settings_key(&output);
+                            self.settings
+                                .output_channel_names
+                                .insert(settings_key, output_names);
+                        }
+                        if output_names_commit {
+                            self.save_app_settings();
+                        }
+
+                        let mut default_pair =
+                            self.audio.default_output_pair_for_device(Some(&output));
+                        default_pair[0] = default_pair[0].min(output_count - 1);
+                        default_pair[1] = default_pair[1].min(output_count - 1);
+                        let mut default_pair_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Default stereo pair");
+                            ui.label("L");
+                            egui::ComboBox::from_id_salt(("default_output_left", output.clone()))
+                                .width(150.0)
+                                .selected_text(
+                                    channel_options
+                                        .get(default_pair[0])
+                                        .map(|(_, label)| label.as_str())
+                                        .unwrap_or("Output 1"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, label) in &channel_options {
+                                        default_pair_changed |= ui
+                                            .selectable_value(
+                                                &mut default_pair[0],
+                                                *index,
+                                                label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                            ui.label("R");
+                            egui::ComboBox::from_id_salt(("default_output_right", output.clone()))
+                                .width(150.0)
+                                .selected_text(
+                                    channel_options
+                                        .get(default_pair[1])
+                                        .map(|(_, label)| label.as_str())
+                                        .unwrap_or("Output 1"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, label) in &channel_options {
+                                        default_pair_changed |= ui
+                                            .selectable_value(
+                                                &mut default_pair[1],
+                                                *index,
+                                                label,
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
+                        if default_pair_changed {
+                            if output_count > 1 && default_pair[0] == default_pair[1] {
+                                default_pair[1] = (default_pair[0] + 1) % output_count;
+                            }
+                            self.audio
+                                .set_default_output_pair_for_device(&output, default_pair);
+                            let settings_key =
+                                self.audio.output_device_settings_key(&output);
+                            self.settings
+                                .default_output_pairs
+                                .insert(settings_key, default_pair);
                             self.save_app_settings();
                         }
 
@@ -2508,7 +3289,7 @@ impl CueLabsApp {
                                 });
                         });
                         ui.label(RichText::new(
-                            "The selected output device and its physical channel count are global for the application.",
+                            "The selected output device and its driver channel count are global for the application.",
                         ).color(Theme::TEXT_DIM).size(11.0));
                     }
                     SettingsTab::Osc => {
@@ -2717,6 +3498,55 @@ impl CueLabsApp {
                             self.save_app_settings();
                         }
                     }
+                    SettingsTab::Backup => {
+                        ui.heading("Project backups");
+                        ui.label(
+                            RichText::new(
+                                "CueLabs creates a lightweight event snapshot after every successful project save and periodically when the project has changed.",
+                            )
+                            .color(Theme::TEXT_DIM)
+                            .size(11.0),
+                        );
+                        ui.add_space(8.0);
+
+                        let interval_changed = ui
+                            .horizontal(|ui| {
+                                ui.label("Automatic backup interval");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.settings.backup_interval_minutes,
+                                    )
+                                    .range(0..=240)
+                                    .speed(1)
+                                    .suffix(" min"),
+                                )
+                                .changed()
+                            })
+                            .inner;
+
+                        ui.label(
+                            RichText::new("0 disables timed backups. The periodic timer is independent of manual saves; unchanged projects are not backed up repeatedly.")
+                                .color(Theme::TEXT_DIM)
+                                .size(11.0),
+                        );
+                        ui.label(
+                            RichText::new("The backup folder stores event/project data only, not audio media. CueLabs keeps the 10 newest snapshots and removes the oldest automatically.")
+                                .color(Theme::TEXT_DIM)
+                                .size(11.0),
+                        );
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(self.project_path.is_some(), egui::Button::new("Create backup now"))
+                            .clicked()
+                        {
+                            self.create_project_backup("manual");
+                        }
+
+                        if interval_changed {
+                            self.last_periodic_backup_at = Instant::now();
+                            self.save_app_settings();
+                        }
+                    }
                 }
                     });
             });
@@ -2824,6 +3654,14 @@ impl CueLabsApp {
                 }
                 if ui.button("Save           Ctrl+S").clicked() {
                     self.save_project();
+                    ui.close_menu();
+                }
+                if ui.button("Save As…    Ctrl+Shift+S").clicked() {
+                    self.save_as_project();
+                    ui.close_menu();
+                }
+                if ui.button("Save as Bundle…    Ctrl+Alt+S").clicked() {
+                    self.save_as_bundle();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -3027,8 +3865,13 @@ impl CueLabsApp {
                             .collect();
 
                         if let Some(id) = self.selected {
+                            let mut inspector_action = None;
                             if let Some(cue) = self.cue_list.find_mut(id) {
-                                Inspector::show_inspector(ui, cue, &cue_targets, &all_cues);
+                                inspector_action =
+                                    Inspector::show_inspector(ui, cue, &cue_targets, &all_cues);
+                            }
+                            if let Some(InspectorAction::SetAudioFile(path)) = inspector_action {
+                                self.set_audio_cue_file(id, path);
                             }
                         } else {
                             ui.label(
@@ -3147,6 +3990,11 @@ impl CueLabsApp {
 
 impl eframe::App for CueLabsApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if !self.startup_frame_logged {
+            info!("CueLabs GUI reached its first frame");
+            self.startup_frame_logged = true;
+        }
+
         // A previous build could have persisted the runaway panel's expanded
         // height. Reset only clearly screen-sized values once, then preserve
         // normal user resizing from this version onward.
@@ -3161,11 +4009,25 @@ impl eframe::App for CueLabsApp {
         self.poll_audio();
         self.poll_midi();
         self.poll_osc();
+        self.poll_audio_file_metadata();
+        self.poll_periodic_backup();
         self.handle_keyboard(ctx);
         self.handle_drop(ctx);
 
         if self.cue_list.active_count() > 0 || !self.pending_triggers.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            ctx.request_repaint_after(Duration::from_millis(30));
+        } else if (self.settings.backup_interval_minutes > 0
+            && self.project_path.is_some()
+            && !self.project_needs_save_as)
+            || self
+                .cue_list
+                .cues
+                .iter()
+                .any(|cue| matches!(&cue.cue_type, CueType::Audio) && !cue.file_path.is_file())
+        {
+            // Timed backups and missing-media recovery are checked once per
+            // second even while the show is otherwise idle.
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
 
         // ── Верхнее меню ──────────────────────────────────────────────────
@@ -3375,47 +4237,54 @@ impl eframe::App for CueLabsApp {
                 } else {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        let title = if self.project.settings.name.is_empty() {
-                            "Untitled Project"
-                        } else {
-                            &self.project.settings.name
-                        };
+                        let title = self.project.settings.name.clone();
+                        let mut rename_commit: Option<String> = None;
+                        let mut rename_cancel = false;
 
-                        if self.renaming_project {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.project_name_buf)
-                                    .desired_width(220.0),
+                        if let Some(edit_name) = self.project_name_edit.as_mut() {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(edit_name)
+                                    .desired_width(190.0)
+                                    .font(egui::FontId::proportional(14.0)),
                             );
-                            if self.project_name_focus_pending {
-                                resp.request_focus();
-                                self.project_name_focus_pending = false;
+                            if self.project_name_edit_focus_pending {
+                                response.request_focus();
+                                self.project_name_edit_focus_pending = false;
                             }
-                            if resp.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                                self.project.settings.name =
-                                    self.project_name_buf.trim().to_string();
-                                self.renaming_project = false;
+
+                            let enter_pressed = ui.input(|input| input.key_pressed(Key::Enter));
+                            let escape_pressed = ui.input(|input| input.key_pressed(Key::Escape));
+                            if response.has_focus() && escape_pressed {
+                                rename_cancel = true;
+                            } else if (response.has_focus() && enter_pressed)
+                                || response.lost_focus()
+                            {
+                                rename_commit = Some(edit_name.clone());
                             }
                         } else {
-                            let title_resp = ui.add(
+                            let title_response = ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(title).color(Theme::TEXT).size(14.0),
+                                    egui::RichText::new(title.clone())
+                                        .color(Theme::TEXT)
+                                        .size(14.0),
                                 )
-                                .selectable(false)
                                 .sense(egui::Sense::click()),
                             );
-                            let title_double_clicked = ctx.input(|input| {
-                                input
-                                    .pointer
-                                    .button_double_clicked(egui::PointerButton::Primary)
-                            }) && ctx
-                                .pointer_latest_pos()
-                                .map(|position| title_resp.rect.contains(position))
-                                .unwrap_or(false);
-                            if title_resp.double_clicked() || title_double_clicked {
-                                self.project_name_buf = self.project.settings.name.clone();
-                                self.renaming_project = true;
-                                self.project_name_focus_pending = true;
+                            let title_response =
+                                title_response.on_hover_text("Double-click to rename project");
+                            if title_response.double_clicked() {
+                                self.project_name_edit = Some(title);
+                                self.project_name_edit_focus_pending = true;
                             }
+                        }
+
+                        if rename_cancel {
+                            self.project_name_edit = None;
+                            self.project_name_edit_focus_pending = false;
+                        } else if let Some(new_name) = rename_commit {
+                            self.project_name_edit = None;
+                            self.project_name_edit_focus_pending = false;
+                            self.rename_project(new_name);
                         }
 
                         ui.add_space(16.0);
@@ -3511,8 +4380,6 @@ impl eframe::App for CueLabsApp {
                                 self.selection_anchor = None;
                                 self.editing = None;
                                 self.editing_focus_pending = false;
-                                self.renaming_project = false;
-                                self.project_name_focus_pending = false;
                             }
                             CueTableAction::Play(id) => {
                                 self.select_only(id);

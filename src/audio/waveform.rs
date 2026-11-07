@@ -13,7 +13,7 @@ pub fn generate_waveform(path: &Path, buckets: usize) -> Vec<f32> {
         Ok(f) => f,
         Err(e) => {
             error!("Waveform: cannot open {:?}: {e}", path);
-            return vec![0.0; buckets * 2];
+            return vec![];
         }
     };
 
@@ -21,14 +21,14 @@ pub fn generate_waveform(path: &Path, buckets: usize) -> Vec<f32> {
         Ok(d) => d,
         Err(e) => {
             error!("Waveform: decode error {:?}: {e}", path);
-            return vec![0.0; buckets * 2];
+            return vec![];
         }
     };
 
     let samples: Vec<f32> = decoder.map(|s| s as f32 / i16::MAX as f32).collect();
 
     if samples.is_empty() {
-        return vec![0.0; buckets * 2];
+        return vec![];
     }
 
     let bucket_size = (samples.len() / buckets).max(1);

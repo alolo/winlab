@@ -176,6 +176,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub midi_controls: Vec<MidiControlBinding>,
     pub output_channels: Vec<OutputChannelSetting>,
+    /// User-calibrated physical names for each device's stream channels.
+    #[serde(default)]
+    pub output_channel_names: HashMap<String, Vec<String>>,
+    /// Default stereo left/right stream indices for each output device.
+    #[serde(default)]
+    pub default_output_pairs: HashMap<String, [usize; 2]>,
     pub stop_all_fade_secs: f64,
     /// User-resized Cue List column widths, in logical points.
     #[serde(default = "default_cue_column_widths")]
@@ -183,6 +189,10 @@ pub struct AppSettings {
     /// User-resized lower inspector panel height, in logical points.
     #[serde(default = "default_bottom_panel_height")]
     pub bottom_panel_height: f32,
+    /// Periodic project backup interval in minutes. Zero disables timed
+    /// backups; a backup is still created after every successful save.
+    #[serde(default = "default_backup_interval_minutes")]
+    pub backup_interval_minutes: u32,
 }
 
 impl Default for AppSettings {
@@ -198,9 +208,12 @@ impl Default for AppSettings {
             midi_output_port: None,
             midi_controls: Vec::new(),
             output_channels: Vec::new(),
+            output_channel_names: HashMap::new(),
+            default_output_pairs: HashMap::new(),
             stop_all_fade_secs: 0.0,
             cue_column_widths: default_cue_column_widths(),
             bottom_panel_height: default_bottom_panel_height(),
+            backup_interval_minutes: default_backup_interval_minutes(),
         }
     }
 }
@@ -211,6 +224,10 @@ fn default_cue_column_widths() -> [f32; 9] {
 
 fn default_bottom_panel_height() -> f32 {
     225.0
+}
+
+fn default_backup_interval_minutes() -> u32 {
+    10
 }
 
 impl AppSettings {

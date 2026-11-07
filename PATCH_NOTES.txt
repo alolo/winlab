@@ -1,0 +1,25 @@
+CueLabs bugfix: Save vs Save As and timed project backups
+
+1. Save / Save As
+   - Ctrl+S now uses the current project path and overwrites the opened project.
+   - Save As (Ctrl+Shift+S) always opens a separate file picker.
+   - Ctrl+S only opens Save As when the in-app project title differs from the opened
+     project filename; a stale rename flag is reconciled against the actual filename.
+   - Save shortcuts are handled globally, including while a text field has focus.
+   - Added diagnostic logging for the current path/name and Save As decision.
+
+2. Periodic backups
+   - The periodic clock is independent of manual Save backups, so frequent manual saves
+     do not continually postpone the timed backup check.
+   - A timed snapshot is created when the project has changed since the last snapshot.
+     Unchanged projects do not generate duplicate timed snapshots.
+   - The periodic clock is initialized when a project is opened or first saved, and when
+     the backup interval is changed.
+   - Added a Create backup now button in Settings > Backups for immediate verification.
+   - The 10-file retention limit now applies to all .clabs snapshots in that project's
+     backup folder, including snapshots created before/after project renaming.
+   - Timed backups remain disabled when the configured interval is 0.
+
+3. Verification
+   - Archive structure and ZIP integrity verified.
+   - Rust/Cargo are not installed in this environment; run `cargo check` on Windows.

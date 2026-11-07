@@ -57,6 +57,10 @@ pub enum AudioCommand {
     },
     SetOutputDevice(String),
     SetInputDevice(String),
+    /// Play a short low-level test tone through one zero-based stream channel.
+    TestOutput {
+        channel: usize,
+    },
     SetRouting {
         id: Uuid,
         routes: Vec<ChannelRoute>,
@@ -126,8 +130,20 @@ fn preferred_output_config(device: &Device) -> Option<cpal::SupportedStreamConfi
         .supported_output_configs()
         .ok()?
         .max_by_key(|config| {
+            let min_rate = config.min_sample_rate();
+            let max_rate = config.max_sample_rate();
+            let rate_priority = if min_rate <= 48_000 && max_rate >= 48_000 {
+                3_u8
+            } else if min_rate <= 44_100 && max_rate >= 44_100 {
+                2_u8
+            } else if min_rate <= 96_000 && max_rate >= 96_000 {
+                1_u8
+            } else {
+                0_u8
+            };
             (
                 config.channels(),
+                rate_priority,
                 (config.sample_format() == cpal::SampleFormat::F32) as u8,
             )
         })?;
@@ -155,6 +171,8 @@ pub struct AudioEngine {
     output_device_channels: HashMap<String, usize>,
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
     output_channel_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
+    output_channel_names: HashMap<String, Vec<String>>,
+    default_output_pairs: HashMap<String, [usize; 2]>,
 }
 
 impl AudioEngine {
@@ -233,6 +251,8 @@ impl AudioEngine {
             output_device_channels,
             output_device_channel_layouts,
             output_channel_settings,
+            output_channel_names: HashMap::new(),
+            default_output_pairs: HashMap::new(),
         })
     }
 
@@ -336,6 +356,96 @@ impl AudioEngine {
                 .max(1),
             None => self.output_channels.max(1),
         }
+    }
+
+    fn output_device_config_key(&self, device_name: &str) -> String {
+        format!("{}::{}", self.backend.label(), device_name)
+    }
+
+    /// Public key helper so AppSettings can persist calibration separately for
+    /// the same hardware exposed through different backends.
+    pub fn output_device_settings_key(&self, device_name: &str) -> String {
+        self.output_device_config_key(device_name)
+    }
+
+    /// Display stream channels in their native driver order. Physical labels
+    /// are calibrated per device by the user; no model-specific channel offsets
+    /// are assumed.
+    pub fn output_channel_display_order(&self, device_name: Option<&str>) -> Vec<usize> {
+        let channels = self.output_channels_for_device(device_name);
+        (0..channels).collect()
+    }
+
+    /// Human-readable label for a zero-based stream channel index. A saved
+    /// user-calibrated name takes precedence over the generic driver index.
+    pub fn output_channel_label(&self, device_name: Option<&str>, channel_index: usize) -> String {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let key = self.output_device_config_key(name);
+        self.output_channel_names
+            .get(&key)
+            .and_then(|labels| labels.get(channel_index))
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if self.backend == AudioBackend::Asio {
+                    format!("ASIO Output {}", channel_index + 1)
+                } else {
+                    format!("Output {}", channel_index + 1)
+                }
+            })
+    }
+
+    pub fn output_channel_names_for_device(&self, device_name: Option<&str>) -> Vec<String> {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let key = self.output_device_config_key(name);
+        self.output_channel_names
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_output_channel_names(&mut self, names: HashMap<String, Vec<String>>) {
+        self.output_channel_names = names;
+    }
+
+    pub fn set_output_channel_names_for_device(&mut self, device_name: &str, names: Vec<String>) {
+        let key = self.output_device_config_key(device_name);
+        self.output_channel_names.insert(key, names);
+    }
+
+    pub fn default_output_pair_for_device(&self, device_name: Option<&str>) -> [usize; 2] {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let key = self.output_device_config_key(name);
+        self.default_output_pairs
+            .get(&key)
+            .copied()
+            .unwrap_or([0, 1])
+    }
+
+    pub fn set_default_output_pairs(&mut self, pairs: HashMap<String, [usize; 2]>) {
+        self.default_output_pairs = pairs;
+    }
+
+    pub fn set_default_output_pair_for_device(&mut self, device_name: &str, pair: [usize; 2]) {
+        let key = self.output_device_config_key(device_name);
+        self.default_output_pairs.insert(key, pair);
+    }
+
+    /// Default stream indices for the first two source channels. A configured
+    /// pair is used for new cues; existing per-cue routes remain untouched.
+    pub fn default_route_output_channels(&self, device_name: Option<&str>) -> Vec<usize> {
+        let pair = self.default_output_pair_for_device(device_name);
+        let channels = self.output_channels_for_device(device_name);
+        if pair[0] < channels && pair[1] < channels {
+            vec![pair[0], pair[1]]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn test_output_channel(&self, channel: usize) {
+        self.send(AudioCommand::TestOutput { channel });
     }
 
     fn list_input_devices(host: &Host) -> Vec<String> {
@@ -645,11 +755,24 @@ fn build_device_output(
         "Opening output '{}' with {} channels @ {} Hz ({:?})",
         device_name, channels, sample_rate, sample_format
     );
-    let mut stream = rodio::DeviceSinkBuilder::default()
+    let mut stream = match rodio::DeviceSinkBuilder::default()
         .with_device(device.clone())
         .with_supported_config(&config)
         .open_stream()
-        .ok()?;
+    {
+        Ok(stream) => stream,
+        Err(open_error) => {
+            error!(
+                "Could not open audio output '{}' ({} channels @ {} Hz): {}",
+                device_name, channels, sample_rate, open_error
+            );
+            return None;
+        }
+    };
+    info!(
+        "Audio output stream opened successfully: '{}' ({} channels @ {} Hz)",
+        device_name, channels, sample_rate
+    );
     stream.log_on_drop(false);
     let mixer = stream.mixer().clone();
     let settings = if device_name == default_device_name {
@@ -750,6 +873,7 @@ fn audio_worker(
     streams.insert(initial_device_name.clone(), initial_output);
     let mut default_device_name = initial_device_name;
     let mut players: Vec<ActivePlayer> = Vec::new();
+    let mut test_players: Vec<(rodio::Player, Instant)> = Vec::new();
     let tick = Duration::from_millis(5);
 
     loop {
@@ -760,6 +884,10 @@ fn audio_worker(
                         player.sink.stop();
                     }
                     players.clear();
+                    for (player, _) in &test_players {
+                        player.stop();
+                    }
+                    test_players.clear();
                     return;
                 }
                 AudioCommand::SetOutputDevice(dev_name) => {
@@ -809,6 +937,7 @@ fn audio_worker(
                     &host,
                     &default_device_name,
                     &output_settings,
+                    &mut test_players,
                 ),
             }
         }
@@ -930,6 +1059,16 @@ fn audio_worker(
             });
         }
 
+        let now = Instant::now();
+        test_players.retain(|(player, stop_at)| {
+            if now >= *stop_at {
+                player.stop();
+                false
+            } else {
+                true
+            }
+        });
+
         std::thread::sleep(tick);
     }
 }
@@ -941,6 +1080,7 @@ fn handle_command(
     host: &Host,
     default_device_name: &str,
     default_settings: &Arc<RwLock<Vec<OutputChannelSetting>>>,
+    test_players: &mut Vec<(rodio::Player, Instant)>,
 ) {
     match cmd {
         AudioCommand::Play {
@@ -1166,6 +1306,52 @@ fn handle_command(
             }
         }
 
+        AudioCommand::TestOutput { channel } => {
+            for (previous_test, _) in test_players.drain(..) {
+                previous_test.stop();
+            }
+
+            let Some((mixer, output_channels, _)) = ensure_device_output(
+                streams,
+                default_device_name,
+                host,
+                default_device_name,
+                default_settings,
+            ) else {
+                warn!("Could not open output device for channel test");
+                return;
+            };
+
+            if channel >= output_channels {
+                warn!(
+                    "Test output channel {} is outside the active {}-channel stream",
+                    channel + 1,
+                    output_channels
+                );
+                return;
+            }
+
+            // Test tones bypass the user's mute/gain controls so every physical
+            // route can be identified even if a channel is currently disabled.
+            let test_settings = Arc::new(RwLock::new(vec![
+                OutputChannelSetting::default();
+                output_channels
+            ]));
+            let routes = Arc::new(RwLock::new(vec![ChannelRoute {
+                active: true,
+                output_channel: channel,
+                gain_db: 0.0,
+            }]));
+            let source =
+                rodio::source::SineWave::new(440.0).take_duration(Duration::from_millis(650));
+            let routed = ChannelRouter::new(source, routes, test_settings, output_channels);
+            let player = rodio::Player::connect_new(&mixer);
+            player.set_volume(0.12);
+            player.append(routed);
+            player.play();
+            test_players.push((player, Instant::now() + Duration::from_millis(750)));
+            info!("Testing audio stream output channel {}", channel + 1);
+        }
         AudioCommand::SetOutputDevice(_)
         | AudioCommand::SetInputDevice(_)
         | AudioCommand::Shutdown => {}

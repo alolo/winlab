@@ -32,10 +32,12 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    tracing::info!("Starting CueLabs native window");
+    let result = eframe::run_native(
         "CueLabs",
         options,
         Box::new(|cc| Ok(Box::new(app::CueLabsApp::new(cc)))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+    );
+    tracing::info!("CueLabs native event loop returned");
+    result.map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
