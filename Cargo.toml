@@ -2,7 +2,7 @@
 name = "cuelabs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 authors = ["CueLabs Team"]
 description = "Professional audio cue player for live performance"
 
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["asio"]
-asio = ["cpal/asio"]
+asio = ["cpal/asio", "dep:azo"]
 
 [dependencies]
 # --- GUI ---
@@ -60,3 +60,6 @@ opt-level = 1          # Небольшая оптимизация в дев р�
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[target.'cfg(target_os = "windows")'.dependencies]
+azo = { version = "0.5.2", default-features = false, optional = true }

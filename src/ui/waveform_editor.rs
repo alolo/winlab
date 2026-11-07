@@ -22,15 +22,16 @@ impl Default for WaveformViewState {
 }
 
 impl WaveformEditor {
-    pub fn show(ui: &mut Ui, cue: &mut Cue) -> Option<f64> {
+    pub fn show(ui: &mut Ui, cue: &mut Cue) -> (Option<f64>, bool) {
         let dur = cue.duration_secs.max(0.01);
         let eff_end = cue.effective_end_secs();
+        let mut automation_changed = false;
 
         // Панель управления Region & Loop над вейвформой
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("Region & Loop:")
-                    .color(Theme::ACCENT)
+                    .color(Theme::accent())
                     .strong(),
             );
             ui.separator();
@@ -114,6 +115,53 @@ impl WaveformEditor {
             }
         });
 
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .checkbox(&mut cue.volume_automation_enabled, "Volume automation")
+                .changed()
+            {
+                automation_changed = true;
+            }
+            if cue.volume_automation_enabled {
+                ui.label(
+                    RichText::new(
+                        "0–100% · click envelope to add · drag points · right-click to remove",
+                    )
+                    .color(Theme::text_dim())
+                    .size(10.0),
+                );
+                if ui.small_button("Reset curve").clicked() {
+                    cue.volume_automation = vec![[0.0, 1.0], [dur, 1.0]];
+                    automation_changed = true;
+                }
+            }
+        });
+
+        if cue.volume_automation_enabled {
+            let before = cue.volume_automation.clone();
+            cue.volume_automation
+                .retain(|point| point[0].is_finite() && point[1].is_finite());
+            cue.volume_automation.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            for point in &mut cue.volume_automation {
+                point[0] = point[0].clamp(0.0, dur);
+                point[1] = point[1].clamp(0.0, 1.0);
+            }
+            if cue.volume_automation.is_empty() {
+                cue.volume_automation = vec![[0.0, 1.0], [dur, 1.0]];
+            } else {
+                if cue.volume_automation[0][0] > 0.0 {
+                    let gain = cue.volume_automation[0][1];
+                    cue.volume_automation.insert(0, [0.0, gain]);
+                }
+                let last_index = cue.volume_automation.len() - 1;
+                if cue.volume_automation[last_index][0] < dur {
+                    let gain = cue.volume_automation[last_index][1];
+                    cue.volume_automation.push([dur, gain]);
+                }
+            }
+            automation_changed |= before != cue.volume_automation;
+        }
+
         ui.add_space(4.0);
 
         let view_id = Id::new(("waveform_view_state", cue.id));
@@ -178,11 +226,11 @@ impl WaveformEditor {
 
         let painter = ui.painter_at(rect);
 
-        painter.rect_filled(rect, 4.0_f32, Color32::from_rgb(14, 14, 20));
+        painter.rect_filled(rect, 4.0_f32, Theme::bg_dark());
         painter.rect_stroke(
             rect,
             4.0_f32,
-            Stroke::new(1.0_f32, Theme::BORDER),
+            Stroke::new(1.0_f32, Theme::border()),
             egui::StrokeKind::Outside,
         );
 
@@ -192,9 +240,9 @@ impl WaveformEditor {
                 Align2::CENTER_CENTER,
                 "No waveform data (select an Audio cue with a loaded file)",
                 FontId::proportional(12.0),
-                Theme::TEXT_DIM,
+                Theme::text_dim(),
             );
-            return None;
+            return (None, automation_changed);
         }
 
         let secs_to_x = |secs: f64| -> f32 {
@@ -204,6 +252,14 @@ impl WaveformEditor {
         let x_to_secs = |x: f32| -> f64 {
             let fraction = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
             ((view_start + fraction * view_span) as f64 * dur).clamp(0.0, dur)
+        };
+        let gain_to_y = |gain: f64| -> f32 {
+            let usable_height = (rect.height() - 36.0).max(1.0);
+            rect.bottom() - 18.0 - gain.clamp(0.0, 1.0) as f32 * usable_height
+        };
+        let y_to_gain = |y: f32| -> f64 {
+            let usable_height = (rect.height() - 36.0).max(1.0);
+            ((rect.bottom() - 18.0 - y) / usable_height).clamp(0.0, 1.0) as f64
         };
 
         let eff_end = cue.effective_end_secs();
@@ -217,6 +273,41 @@ impl WaveformEditor {
         let bucket_w = rect.width() / visible_buckets as f32;
         let mid_y = rect.center().y;
         let half_h = rect.height() * 0.44;
+
+        // A subtle but unmistakable fill distinguishes the active loop region
+        // from the rest of the clip without obscuring waveform detail.
+        if cue.loop_region.enabled {
+            let loop_color = Theme::loop_region();
+            let loop_left = secs_to_x(cue.loop_region.start_secs).clamp(rect.left(), rect.right());
+            let loop_right = secs_to_x(cue.loop_region.end_secs).clamp(rect.left(), rect.right());
+            if loop_right > loop_left {
+                let loop_rect = Rect::from_min_max(
+                    pos2(loop_left, rect.top()),
+                    pos2(loop_right, rect.bottom()),
+                );
+                painter.rect_filled(
+                    loop_rect,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(
+                        loop_color.r(),
+                        loop_color.g(),
+                        loop_color.b(),
+                        42,
+                    ),
+                );
+                painter.line_segment(
+                    [pos2(loop_left, rect.top()), pos2(loop_left, rect.bottom())],
+                    Stroke::new(1.5_f32, loop_color),
+                );
+                painter.line_segment(
+                    [
+                        pos2(loop_right, rect.top()),
+                        pos2(loop_right, rect.bottom()),
+                    ],
+                    Stroke::new(1.5_f32, loop_color),
+                );
+            }
+        }
 
         for i in first_bucket..last_bucket {
             let min_val = cue.waveform[i * 2];
@@ -233,9 +324,10 @@ impl WaveformEditor {
             let color = if outside_region {
                 Color32::from_rgba_unmultiplied(70, 70, 85, 90)
             } else if in_loop {
-                Color32::from_rgba_premultiplied(80, 160, 255, 190)
+                let loop_color = Theme::loop_region();
+                Color32::from_rgba_unmultiplied(loop_color.r(), loop_color.g(), loop_color.b(), 225)
             } else {
-                Theme::WAVE_FILL
+                Theme::wave_fill()
             };
 
             painter.line_segment(
@@ -247,13 +339,44 @@ impl WaveformEditor {
             );
         }
 
+        // Volume automation is drawn over the waveform as an independent envelope.
+        if cue.volume_automation_enabled && cue.volume_automation.len() >= 2 {
+            let envelope_color = Theme::volume_automation();
+            for pair in cue.volume_automation.windows(2) {
+                let x1 = secs_to_x(pair[0][0]);
+                let x2 = secs_to_x(pair[1][0]);
+                if x2 < rect.left() || x1 > rect.right() {
+                    continue;
+                }
+                painter.line_segment(
+                    [
+                        pos2(x1, gain_to_y(pair[0][1])),
+                        pos2(x2, gain_to_y(pair[1][1])),
+                    ],
+                    Stroke::new(2.5_f32, envelope_color),
+                );
+            }
+            for (index, point) in cue.volume_automation.iter().enumerate() {
+                let x = secs_to_x(point[0]);
+                if x < rect.left() - 8.0 || x > rect.right() + 8.0 {
+                    continue;
+                }
+                let center = pos2(x, gain_to_y(point[1]));
+                painter.circle_filled(center, 5.5, envelope_color);
+                painter.circle_stroke(center, 5.5, Stroke::new(1.2_f32, Color32::WHITE));
+                if index == 0 || index + 1 == cue.volume_automation.len() {
+                    painter.circle_filled(center, 2.0, Color32::WHITE);
+                }
+            }
+        }
+
         // Линии Fade In и Fade Out
         if cue.fade_in_secs > 0.0 {
             let x0 = secs_to_x(cue.start_secs);
             let x1 = secs_to_x((cue.start_secs + cue.fade_in_secs).min(eff_end));
             painter.line_segment(
                 [pos2(x0, rect.bottom() - 14.0), pos2(x1, rect.top() + 8.0)],
-                Stroke::new(2.0_f32, Theme::ACCENT2),
+                Stroke::new(2.0_f32, Theme::accent2()),
             );
         }
         if cue.fade_out_secs > 0.0 {
@@ -261,14 +384,14 @@ impl WaveformEditor {
             let x1 = secs_to_x(eff_end);
             painter.line_segment(
                 [pos2(x0, rect.top() + 8.0), pos2(x1, rect.bottom() - 14.0)],
-                Stroke::new(2.0_f32, Theme::ACCENT),
+                Stroke::new(2.0_f32, Theme::accent()),
             );
         }
 
         // Центральная ось
         painter.line_segment(
             [pos2(rect.left(), mid_y), pos2(rect.right(), mid_y)],
-            Stroke::new(0.5_f32, Theme::BORDER),
+            Stroke::new(0.5_f32, Theme::border()),
         );
 
         // Курсор воспроизведения
@@ -285,7 +408,7 @@ impl WaveformEditor {
             &painter,
             secs_to_x(cue.start_secs),
             rect,
-            Theme::MARKER_START,
+            Theme::marker_start(),
             "▼ START",
         );
 
@@ -294,7 +417,7 @@ impl WaveformEditor {
                 &painter,
                 secs_to_x(eff_end),
                 rect,
-                Theme::MARKER_END,
+                Theme::marker_end(),
                 "▼ END",
             );
         }
@@ -304,14 +427,14 @@ impl WaveformEditor {
                 &painter,
                 secs_to_x(cue.loop_region.start_secs),
                 rect,
-                Theme::MARKER_LOOP,
+                Theme::marker_loop(),
                 "▼ L-IN",
             );
             Self::draw_marker(
                 &painter,
                 secs_to_x(cue.loop_region.end_secs),
                 rect,
-                Theme::MARKER_LOOP,
+                Theme::marker_loop(),
                 "▼ L-OUT",
             );
         }
@@ -346,7 +469,7 @@ impl WaveformEditor {
             if x >= rect.left() - 1.0 && x <= rect.right() + 1.0 {
                 painter.line_segment(
                     [pos2(x, rect.bottom() - 13.0), pos2(x, rect.bottom())],
-                    Stroke::new(1.0_f32, Theme::BORDER),
+                    Stroke::new(1.0_f32, Theme::border()),
                 );
                 painter.text(
                     pos2(x, rect.bottom() - 13.0),
@@ -368,21 +491,134 @@ impl WaveformEditor {
             Color32::WHITE,
         );
 
-        // A plain click sets the playhead and pauses the cue at that position.
-        // The app forwards the returned position to the audio engine; if the cue
-        // is currently stopped, the next trigger starts from this saved position.
-        let mut seek_position = None;
-        if resp.clicked() {
-            if let Some(pointer_pos) = resp.interact_pointer_pos() {
-                let position = x_to_secs(pointer_pos.x).clamp(cue.start_secs, eff_end);
-                cue.position_secs = position;
-                cue.state = CueState::Paused;
-                seek_position = Some(position);
+        // Volume automation editing: drag a node, click the envelope to add a
+        // breakpoint, and right-click an interior node to remove it.
+        let drag_id = Id::new(("waveform_volume_automation_drag", cue.id));
+        let mut dragging_point = ui.ctx().data(|data| data.get_temp::<usize>(drag_id));
+        if cue.volume_automation_enabled && resp.drag_started() {
+            if let Some(pointer) = resp.interact_pointer_pos() {
+                let nearest = cue
+                    .volume_automation
+                    .iter()
+                    .enumerate()
+                    .map(|(index, point)| {
+                        let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                        (index, point_pos.distance(pointer))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                dragging_point = nearest
+                    .filter(|(_, distance)| *distance <= 13.0)
+                    .map(|(index, _)| index);
+                if let Some(index) = dragging_point {
+                    ui.ctx().data_mut(|data| data.insert_temp(drag_id, index));
+                }
             }
         }
 
-        // Dragging near a marker edits the marker instead of seeking.
-        if resp.dragged() {
+        if cue.volume_automation_enabled && resp.dragged() {
+            if let (Some(index), Some(pointer)) = (dragging_point, resp.interact_pointer_pos()) {
+                if index < cue.volume_automation.len() {
+                    let last_index = cue.volume_automation.len().saturating_sub(1);
+                    let mut new_time = x_to_secs(pointer.x);
+                    if index == 0 {
+                        new_time = 0.0;
+                    } else if index == last_index {
+                        new_time = dur;
+                    } else {
+                        let min_time = cue.volume_automation[index - 1][0] + 0.001;
+                        let max_time = cue.volume_automation[index + 1][0] - 0.001;
+                        new_time = new_time.clamp(min_time.min(max_time), max_time.max(min_time));
+                    }
+                    let new_gain = y_to_gain(pointer.y);
+                    let point = &mut cue.volume_automation[index];
+                    if (point[0] - new_time).abs() > 0.0001 || (point[1] - new_gain).abs() > 0.0001
+                    {
+                        *point = [new_time, new_gain];
+                        automation_changed = true;
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        if cue.volume_automation_enabled && resp.secondary_clicked() {
+            if let Some(pointer) = resp.interact_pointer_pos() {
+                let nearest = cue
+                    .volume_automation
+                    .iter()
+                    .enumerate()
+                    .map(|(index, point)| {
+                        let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                        (index, point_pos.distance(pointer))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((index, distance)) = nearest {
+                    let last_index = cue.volume_automation.len().saturating_sub(1);
+                    if distance <= 13.0 && index > 0 && index < last_index {
+                        cue.volume_automation.remove(index);
+                        automation_changed = true;
+                    }
+                }
+            }
+        }
+
+        if resp.drag_stopped() {
+            ui.ctx().data_mut(|data| data.remove_temp::<usize>(drag_id));
+            dragging_point = None;
+        }
+
+        // A click near the envelope adds a point; a click elsewhere seeks.
+        // This keeps the common playhead interaction while making automation
+        // editing feel like a DAW clip envelope.
+        let mut seek_position = None;
+        if resp.clicked() && dragging_point.is_none() {
+            if let Some(pointer) = resp.interact_pointer_pos() {
+                let clicked_time = x_to_secs(pointer.x);
+                let mut added_point = false;
+                if cue.volume_automation_enabled && cue.volume_automation.len() >= 2 {
+                    let nearest_point = cue
+                        .volume_automation
+                        .iter()
+                        .enumerate()
+                        .map(|(index, point)| {
+                            let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                            (index, point_pos.distance(pointer))
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1));
+                    let near_existing = nearest_point
+                        .map(|(_, distance)| distance <= 13.0)
+                        .unwrap_or(false);
+                    if !near_existing {
+                        let current_gain =
+                            automation_gain_at_ui(clicked_time, &cue.volume_automation);
+                        let curve_y = gain_to_y(current_gain);
+                        if (pointer.y - curve_y).abs() <= 12.0 {
+                            cue.volume_automation
+                                .push([clicked_time, y_to_gain(pointer.y)]);
+                            cue.volume_automation.sort_by(|a, b| a[0].total_cmp(&b[0]));
+                            automation_changed = true;
+                            added_point = true;
+                        }
+                    }
+                }
+                if !added_point {
+                    let near_point = cue.volume_automation_enabled
+                        && cue.volume_automation.iter().any(|point| {
+                            pos2(secs_to_x(point[0]), gain_to_y(point[1])).distance(pointer) <= 13.0
+                        });
+                    if !near_point {
+                        let position = clicked_time.clamp(cue.start_secs, eff_end);
+                        cue.position_secs = position;
+                        cue.state = CueState::Paused;
+                        seek_position = Some(position);
+                    }
+                }
+            }
+        }
+
+        // Dragging near a region marker edits it instead of seeking or drawing
+        // automation. A volume node takes precedence when one was grabbed.
+        if resp.dragged() && dragging_point.is_none() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let secs = x_to_secs(pos.x).clamp(0.0, dur);
                 let start_dx = (secs_to_x(cue.start_secs) - pos.x).abs();
@@ -428,7 +664,7 @@ impl WaveformEditor {
                 pos2(scroll_rect.left() + 4.0, scroll_rect.center().y - 3.0),
                 pos2(scroll_rect.right() - 4.0, scroll_rect.center().y + 3.0),
             );
-            painter.rect_filled(track, 6.0, Color32::from_rgb(42, 44, 54));
+            painter.rect_filled(track, 6.0, Theme::bg_panel());
             let span = (1.0 / view.zoom.max(1.0)).clamp(0.000_001, 1.0);
             let max_offset = (1.0 - span).max(0.0);
             let thumb_width = (track.width() * span).clamp(24.0, track.width());
@@ -443,7 +679,7 @@ impl WaveformEditor {
                 pos2(thumb_left, scroll_rect.center().y - 7.0),
                 vec2(thumb_width, 14.0),
             );
-            painter.rect_filled(thumb_rect, 7.0, Theme::ACCENT);
+            painter.rect_filled(thumb_rect, 7.0, Theme::accent());
             painter.circle_filled(thumb_rect.center(), 4.0, Color32::WHITE);
 
             if (scroll_response.dragged() || scroll_response.clicked()) && max_offset > 0.0 {
@@ -457,7 +693,7 @@ impl WaveformEditor {
         }
         ui.ctx().data_mut(|data| data.insert_temp(view_id, view));
 
-        seek_position
+        (seek_position, automation_changed)
     }
 
     fn draw_marker(painter: &Painter, x: f32, rect: Rect, color: Color32, label: &str) {
@@ -473,6 +709,29 @@ impl WaveformEditor {
             color,
         );
     }
+}
+
+fn automation_gain_at_ui(position_secs: f64, points: &[[f64; 2]]) -> f64 {
+    if points.is_empty() {
+        return 1.0;
+    }
+    if position_secs <= points[0][0] {
+        return points[0][1].clamp(0.0, 1.0);
+    }
+    for pair in points.windows(2) {
+        if position_secs <= pair[1][0] {
+            let span = pair[1][0] - pair[0][0];
+            if span <= f64::EPSILON {
+                return pair[1][1].clamp(0.0, 1.0);
+            }
+            let t = ((position_secs - pair[0][0]) / span).clamp(0.0, 1.0);
+            return (pair[0][1] + (pair[1][1] - pair[0][1]) * t).clamp(0.0, 1.0);
+        }
+    }
+    points
+        .last()
+        .map(|point| point[1].clamp(0.0, 1.0))
+        .unwrap_or(1.0)
 }
 
 fn format_timecode(seconds: f64) -> String {

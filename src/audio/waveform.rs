@@ -25,31 +25,66 @@ pub fn generate_waveform(path: &Path, buckets: usize) -> Vec<f32> {
         }
     };
 
-    let samples: Vec<f32> = decoder.map(|s| s as f32 / i16::MAX as f32).collect();
+    // Rodio 0.23 decoders yield normalized f32 samples. Do not divide by i16::MAX:
+    // that would shrink every peak by ~32768 and make the waveform look flat.
+    let samples: Vec<f32> = decoder.map(normalize_decoder_sample).collect();
+    let result = samples_to_waveform(&samples, buckets);
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+    debug!(
+        "Waveform generated: {} buckets for {:?}; samples={}, peak={:.6}",
+        result.len() / 2,
+        path,
+        samples.len(),
+        peak
+    );
+    result
+}
 
-    if samples.is_empty() {
-        return vec![];
+#[inline]
+fn normalize_decoder_sample(sample: f32) -> f32 {
+    sample.clamp(-1.0, 1.0)
+}
+
+/// Convert normalized decoder samples into [min, max] buckets. Peak normalization
+/// is display-only: it makes quiet recordings visible without changing playback gain.
+fn samples_to_waveform(samples: &[f32], buckets: usize) -> Vec<f32> {
+    if samples.is_empty() || buckets == 0 {
+        return Vec::new();
     }
 
-    let bucket_size = (samples.len() / buckets).max(1);
+    let peak = samples
+        .iter()
+        .copied()
+        .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+    if peak <= f32::EPSILON {
+        return vec![0.0; buckets * 2];
+    }
+
+    let display_gain = 0.95 / peak;
+    let bucket_size = samples.len().div_ceil(buckets).max(1);
     let mut result = Vec::with_capacity(buckets * 2);
 
-    for i in 0..buckets {
-        let start = i * bucket_size;
-        let end = ((i + 1) * bucket_size).min(samples.len());
+    for bucket in 0..buckets {
+        let start = bucket * bucket_size;
+        let end = ((bucket + 1) * bucket_size).min(samples.len());
         if start >= samples.len() {
-            result.push(0.0);
-            result.push(0.0);
+            result.extend([0.0, 0.0]);
             continue;
         }
-        let slice = &samples[start..end];
-        let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        result.push(min.clamp(-1.0, 0.0));
-        result.push(max.clamp(0.0, 1.0));
+
+        let (minimum, maximum) = samples[start..end].iter().copied().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(minimum, maximum), sample| {
+                let sample = (sample * display_gain).clamp(-1.0, 1.0);
+                (minimum.min(sample), maximum.max(sample))
+            },
+        );
+        result.push(minimum);
+        result.push(maximum);
     }
 
-    debug!("Waveform generated: {} buckets for {:?}", buckets, path);
     result
 }
 
@@ -87,4 +122,40 @@ pub fn get_channel_count(path: &Path) -> usize {
     rodio::Decoder::new(std::io::BufReader::new(file))
         .map(|decoder| decoder.channels().get().max(1) as usize)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_decoder_sample, samples_to_waveform};
+
+    #[test]
+    fn rodio_float_samples_keep_their_normalized_amplitude() {
+        assert!((normalize_decoder_sample(0.5) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(normalize_decoder_sample(1.5), 1.0);
+        assert_eq!(normalize_decoder_sample(-1.5), -1.0);
+    }
+
+    #[test]
+    fn waveform_contains_positive_and_negative_peaks() {
+        let samples = [-0.8, -0.4, 0.2, 0.9, 0.1, -0.6, 0.3, 0.7];
+        let waveform = samples_to_waveform(&samples, 2);
+        assert_eq!(waveform.len(), 4);
+        assert!(waveform[0] < -0.7);
+        assert!(waveform[1] > 0.8);
+        assert!(waveform[2] < -0.5);
+        assert!(waveform[3] > 0.6);
+    }
+
+    #[test]
+    fn quiet_audio_is_boosted_for_display_only() {
+        let samples = [-0.01, -0.005, 0.004, 0.01];
+        let waveform = samples_to_waveform(&samples, 1);
+        assert!(waveform[0] <= -0.3);
+        assert!(waveform[1] >= 0.3);
+    }
+
+    #[test]
+    fn silent_audio_remains_a_flatline() {
+        assert_eq!(samples_to_waveform(&[0.0; 8], 4), vec![0.0; 8]);
+    }
 }

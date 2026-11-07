@@ -118,7 +118,7 @@ impl Inspector {
                                 ui.label(
                                     RichText::new(fname)
                                         .color(if file_exists {
-                                            Theme::TEXT_DIM
+                                            Theme::text_dim()
                                         } else {
                                             egui::Color32::from_rgb(235, 85, 85)
                                         })
@@ -158,7 +158,7 @@ impl Inspector {
                                         "Duration: {}",
                                         crate::ui::cue_table::format_duration(cue.duration_secs)
                                     ))
-                                    .color(Theme::ACCENT)
+                                    .color(Theme::accent())
                                     .monospace(),
                                 );
                             }
@@ -220,7 +220,7 @@ impl Inspector {
                                         "Follow target volume (0 dB if muted)"
                                     } else {
                                         default_label
-                                    }).color(Theme::TEXT_DIM).size(10.5));
+                                    }).color(Theme::text_dim()).size(10.5));
                                         set_target_level = ui.small_button("Set level").clicked();
                                     }
                                 });
@@ -278,12 +278,12 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             ui.label(RichText::new(
                 "Normal: triggers only the first child, then follows \
                  auto-continue/auto-follow chain of children."
-            ).color(Theme::TEXT_DIM).size(11.0));
+            ).color(Theme::text_dim()).size(11.0));
         }
         GroupMode::Playlist => {
             ui.label(RichText::new(
                 "Playlist: plays children sequentially. Each child waits for its pre-wait, playback completion, and post-wait."
-            ).color(Theme::TEXT_DIM).size(11.0));
+            ).color(Theme::text_dim()).size(11.0));
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -300,7 +300,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         GroupMode::AllCues => {
             ui.label(RichText::new(
                 "All Cues: starts every child simultaneously. Each child observes its own pre-wait; the group completes after all children and their post-waits."
-            ).color(Theme::TEXT_DIM).size(11.0));
+            ).color(Theme::text_dim()).size(11.0));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Group Fade In:");
@@ -319,7 +319,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     ui.label(RichText::new(format!(
         "Children: {} (drag cues onto the group row in the table to add, or use context menu)",
         children.len()
-    )).color(Theme::ACCENT).size(11.0));
+    )).color(Theme::accent()).size(11.0));
 
     // Список детей только для справки (без чекбоксов)
     egui::ScrollArea::vertical()
@@ -330,7 +330,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             if *cid == cue_id { continue; }
             if children.contains(cid) {
                 ui.label(RichText::new(format!("  • {}", clabel))
-                    .color(Theme::TEXT_DIM).size(11.0));
+                    .color(Theme::text_dim()).size(11.0));
             }
         }
     });
@@ -339,8 +339,25 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             CueType::Midi { .. } => {
                                 ui.label(
                                     RichText::new("Switch to the '🎹 MIDI' tab to configure MIDI parameters and raw hex code.")
-                                        .color(Theme::ACCENT)
+                                        .color(Theme::accent())
                                         .size(11.5),
+                                );
+                            }
+
+                            CueType::Comment { text } => {
+                                ui.label(
+                                    RichText::new("Comment cues are passive markers. GO skips them without triggering an event.")
+                                        .color(Theme::text_dim())
+                                        .size(11.0),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("Comment text").color(Theme::accent()).strong());
+                                let comment_width = ui.available_width();
+                                ui.add(
+                                    TextEdit::multiline(text)
+                                        .desired_width(comment_width)
+                                        .desired_rows(6)
+                                        .hint_text("Write a stage direction, reminder or show note…"),
                                 );
                             }
 
@@ -353,7 +370,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     );
                                 });
                                 ui.add_space(6.0);
-                                ui.label(RichText::new("Arguments").color(Theme::ACCENT).strong());
+                                ui.label(RichText::new("Arguments").color(Theme::accent()).strong());
                                 let mut remove_index = None;
                                 for (index, arg) in args.iter_mut().enumerate() {
                                     ui.push_id(("osc_arg", cue_id, index), |ui| {
@@ -400,7 +417,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 });
                                 ui.label(
                                     RichText::new("The event sends this OSC message through the configured global send address.")
-                                        .color(Theme::TEXT_DIM)
+                                        .color(Theme::text_dim())
                                         .size(10.5),
                                 );
                             }
@@ -424,7 +441,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
 
         ui.label(
             RichText::new("Target Cue / Group:")
-                .color(Theme::TEXT_DIM)
+                .color(Theme::text_dim())
                 .size(11.0),
         );
         egui::ComboBox::from_id_salt("target_cue_or_group")
@@ -596,7 +613,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     if !matches!(&cue.cue_type, CueType::Audio) {
                         ui.label(
                             RichText::new("Select an audio cue to configure its source channels")
-                                .color(Theme::TEXT_DIM),
+                                .color(Theme::text_dim()),
                         );
                         return;
                     }
@@ -650,7 +667,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             "Available outputs for this track: {}",
                             output_channels
                         ))
-                        .color(Theme::TEXT_DIM)
+                        .color(Theme::text_dim())
                         .size(11.0),
                     );
                     let track_layouts =
@@ -665,7 +682,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ))
-                            .color(Theme::TEXT_DIM)
+                            .color(Theme::text_dim())
                             .size(10.0),
                         );
                     }
@@ -673,14 +690,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         RichText::new(
                             "Device selection applies the next time this cue is started.",
                         )
-                        .color(Theme::TEXT_DIM)
+                        .color(Theme::text_dim())
                         .size(10.0),
                     );
                     let input_channels = cue.audio_channels;
                     if input_channels == 0 {
                         ui.label(
                             RichText::new("Could not detect this track's audio channel format")
-                                .color(Theme::TEXT_DIM),
+                                .color(Theme::text_dim()),
                         );
                         return;
                     }
@@ -700,7 +717,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     };
                     ui.label(
                         RichText::new(format!("{} · {} source channels", format, input_channels))
-                            .color(Theme::ACCENT),
+                            .color(Theme::accent()),
                     );
                     let route_device_name = cue.io.output_device.clone();
                     let output_order =
@@ -791,7 +808,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 } else {
                     ui.label(
                         RichText::new("Select an audio cue to configure its source channels")
-                            .color(Theme::TEXT_DIM),
+                            .color(Theme::text_dim()),
                     );
                 }
             });
@@ -951,7 +968,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     RichText::new(
                         "Enter raw MIDI bytes in Hex (e.g. 90 3C 7F or F0 7F 7F 06 02 F7):",
                     )
-                    .color(Theme::TEXT_DIM)
+                    .color(Theme::text_dim())
                     .size(11.0),
                 );
                 if ui
@@ -981,7 +998,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         RichText::new(format!("Compiled bytes: {:02X?}", bytes_to_send))
                             .monospace()
                             .size(11.0)
-                            .color(Theme::ACCENT),
+                            .color(Theme::accent()),
                     );
                     if ui.button("🎹 Send MIDI Now").clicked() {
                         let _ = midi_out.send_bytes(&bytes_to_send);
@@ -994,11 +1011,11 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     fn fade_curve_preview(ui: &mut Ui, curve: FadeCurve, fade_in: bool) {
         let (rect, _) = ui.allocate_exact_size(vec2(300.0, 72.0), Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 3.0, Theme::BG_DARK);
+        painter.rect_filled(rect, 3.0, Theme::bg_dark());
         painter.rect_stroke(
             rect,
             3.0,
-            Stroke::new(1.0_f32, Theme::BORDER),
+            Stroke::new(1.0_f32, Theme::border()),
             StrokeKind::Inside,
         );
         let points: Vec<Pos2> = (0..=48)
@@ -1012,24 +1029,24 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 )
             })
             .collect();
-        painter.add(Shape::line(points, Stroke::new(2.0_f32, Theme::ACCENT)));
+        painter.add(Shape::line(points, Stroke::new(2.0_f32, Theme::accent())));
     }
 
     fn custom_fade_editor(ui: &mut Ui, points: &mut Vec<[f32; 2]>, fade_in: bool) {
         ui.add_space(4.0);
         ui.label(
             RichText::new("Draw the fade curve by dragging inside the graph")
-                .color(Theme::TEXT_DIM)
+                .color(Theme::text_dim())
                 .size(11.0),
         );
 
         let (rect, response) = ui.allocate_exact_size(vec2(300.0, 118.0), Sense::drag());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 3.0, Theme::BG_DARK);
+        painter.rect_filled(rect, 3.0, Theme::bg_dark());
         painter.rect_stroke(
             rect,
             3.0,
-            Stroke::new(1.0_f32, Theme::BORDER),
+            Stroke::new(1.0_f32, Theme::border()),
             StrokeKind::Inside,
         );
 
@@ -1039,11 +1056,11 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             let y = rect.bottom() - rect.height() * t;
             painter.line_segment(
                 [pos2(x, rect.top()), pos2(x, rect.bottom())],
-                Stroke::new(1.0_f32, Theme::BORDER),
+                Stroke::new(1.0_f32, Theme::border()),
             );
             painter.line_segment(
                 [pos2(rect.left(), y), pos2(rect.right(), y)],
-                Stroke::new(1.0_f32, Theme::BORDER),
+                Stroke::new(1.0_f32, Theme::border()),
             );
         }
 
@@ -1087,14 +1104,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         if curve_points.len() >= 2 {
             painter.add(Shape::line(
                 curve_points,
-                Stroke::new(2.0_f32, Theme::ACCENT),
+                Stroke::new(2.0_f32, Theme::accent()),
             ));
         }
 
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("{} control points", points.len()))
-                    .color(Theme::TEXT_DIM)
+                    .color(Theme::text_dim())
                     .size(10.0),
             );
             if ui.small_button("Reset linear").clicked() {
@@ -1106,7 +1123,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     fn section(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
         ui.label(
             RichText::new(title)
-                .color(Theme::ACCENT)
+                .color(Theme::accent())
                 .size(11.5)
                 .strong(),
         );
@@ -1153,7 +1170,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [76.0, 20.0],
-                Label::new(RichText::new(label).color(Theme::TEXT_DIM).size(11.0)),
+                Label::new(RichText::new(label).color(Theme::text_dim()).size(11.0)),
             );
             content(ui);
         });

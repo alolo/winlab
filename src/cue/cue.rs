@@ -3,6 +3,7 @@
 use egui::Color32;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +41,11 @@ pub enum CueType {
         #[serde(default)]
         args: Vec<OscCueArg>,
     },
+    /// Passive annotation row. It is selectable with the mouse but never executes.
+    Comment {
+        #[serde(default)]
+        text: String,
+    },
     Group {
         mode: GroupMode,
         children: Vec<Uuid>,
@@ -66,6 +72,7 @@ impl CueType {
             }
             CueType::Midi { .. } => "MIDI",
             CueType::Osc { .. } => "OSC",
+            CueType::Comment { .. } => "Comment",
             CueType::Group { .. } => "Group",
         }
     }
@@ -85,6 +92,7 @@ impl CueType {
             }
             CueType::Midi { .. } => "🎹",
             CueType::Osc { .. } => "📡",
+            CueType::Comment { .. } => "💬",
             CueType::Group { .. } => "📁",
         }
     }
@@ -225,6 +233,15 @@ pub enum CueState {
     Paused,
     Loading,
     Error(String),
+}
+
+/// Runtime-only phase for a cue's pre-wait or post-wait countdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaitPhase {
+    #[default]
+    None,
+    Pre,
+    Post,
 }
 
 impl CueState {
@@ -522,10 +539,22 @@ pub struct Cue {
     pub state: CueState,
     #[serde(skip)]
     pub position_secs: f64,
+    /// Runtime-only wait clock. A future start time supports Fade duration + post-wait.
+    #[serde(skip)]
+    pub wait_phase: WaitPhase,
+    #[serde(skip)]
+    pub wait_started_at: Option<Instant>,
+    #[serde(skip)]
+    pub wait_duration_secs: f64,
     pub file_path: PathBuf,
     #[serde(default)]
     pub audio_channels: usize,
     pub volume: f32,
+    /// Per-cue volume envelope points as [absolute source time in seconds, linear gain 0..1].
+    #[serde(default)]
+    pub volume_automation_enabled: bool,
+    #[serde(default)]
+    pub volume_automation: Vec<[f64; 2]>,
     pub fade_in_secs: f64,
     pub fade_out_secs: f64,
     pub fade_curve: FadeCurve,
@@ -565,9 +594,14 @@ impl Cue {
             continue_mode: ContinueMode::Nothing,
             state: CueState::Stopped,
             position_secs: 0.0,
+            wait_phase: WaitPhase::None,
+            wait_started_at: None,
+            wait_duration_secs: 0.0,
             file_path,
             audio_channels: 2,
             volume: 1.0,
+            volume_automation_enabled: false,
+            volume_automation: Vec::new(),
             fade_in_secs: 0.0,
             fade_out_secs: 0.0,
             fade_curve: FadeCurve::Linear,
@@ -598,9 +632,14 @@ impl Cue {
             continue_mode: ContinueMode::Nothing,
             state: CueState::Stopped,
             position_secs: 0.0,
+            wait_phase: WaitPhase::None,
+            wait_started_at: None,
+            wait_duration_secs: 0.0,
             file_path: PathBuf::new(),
             audio_channels: 0,
             volume: 1.0,
+            volume_automation_enabled: false,
+            volume_automation: Vec::new(),
             fade_in_secs: 0.0,
             fade_out_secs: 0.0,
             fade_curve: FadeCurve::Linear,
@@ -614,6 +653,12 @@ impl Cue {
             waveform: vec![],
             duration_secs: 0.0,
         }
+    }
+
+    pub fn clear_wait_runtime(&mut self) {
+        self.wait_phase = WaitPhase::None;
+        self.wait_started_at = None;
+        self.wait_duration_secs = 0.0;
     }
 
     pub fn is_active(&self) -> bool {
@@ -631,6 +676,7 @@ impl Cue {
         match &self.cue_type {
             CueType::Audio => (self.effective_end_secs() - self.start_secs).max(0.0),
             CueType::Fade { duration_secs, .. } => *duration_secs,
+            CueType::Comment { .. } => 0.0,
             _ => self.duration_secs,
         }
     }
@@ -653,6 +699,36 @@ impl Cue {
 #[cfg(test)]
 mod fade_status_tests {
     use super::*;
+
+    #[test]
+    fn clear_wait_runtime_resets_wait_clock() {
+        let mut cue = Cue::new_typed(CueType::Midi {
+            channel: 1,
+            message: MidiMessageKind::ProgramChange { program: 1 },
+            raw_hex: String::new(),
+        });
+        cue.wait_phase = WaitPhase::Post;
+        cue.wait_started_at = Some(Instant::now());
+        cue.wait_duration_secs = 3.0;
+
+        cue.clear_wait_runtime();
+
+        assert_eq!(cue.wait_phase, WaitPhase::None);
+        assert!(cue.wait_started_at.is_none());
+        assert_eq!(cue.wait_duration_secs, 0.0);
+    }
+
+    #[test]
+    fn comment_cue_is_a_zero_duration_passive_marker() {
+        let cue = Cue::new_typed(CueType::Comment {
+            text: "Stand by for blackout".to_string(),
+        });
+
+        assert_eq!(cue.cue_type.label(), "Comment");
+        assert_eq!(cue.cue_type.icon(), "💬");
+        assert_eq!(cue.effective_duration(), 0.0);
+        assert_eq!(cue.continue_mode, ContinueMode::Nothing);
+    }
 
     #[test]
     fn fade_status_uses_runtime_elapsed_time() {

@@ -79,6 +79,7 @@ impl CueList {
         for c in &mut self.cues {
             c.state = CueState::Stopped;
             c.position_secs = 0.0;
+            c.clear_wait_runtime();
         }
     }
 

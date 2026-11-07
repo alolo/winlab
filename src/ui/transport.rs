@@ -31,7 +31,7 @@ impl TransportBar {
                         .size(15.0)
                         .strong(),
                 )
-                .fill(Theme::GO_BTN)
+                .fill(Theme::go_btn())
                 .corner_radius(6_u8),
             );
             if go_resp.clicked() {
@@ -46,7 +46,7 @@ impl TransportBar {
                 .add_sized(
                     [60.0, 44.0],
                     Button::new(RichText::new("⏹").size(18.0))
-                        .fill(Theme::STOP_BTN)
+                        .fill(Theme::stop_btn())
                         .corner_radius(6_u8),
                 )
                 .on_hover_text("Stop selected (S)")
@@ -60,7 +60,7 @@ impl TransportBar {
                 .add_sized(
                     [60.0, 44.0],
                     Button::new(RichText::new("⏸").size(18.0))
-                        .fill(Theme::PAUSE_BTN)
+                        .fill(Theme::pause_btn())
                         .corner_radius(6_u8),
                 )
                 .on_hover_text("Pause selected (P)")
@@ -94,7 +94,9 @@ impl TransportBar {
                     if ui
                         .add(
                             Button::new(
-                                RichText::new("ALL STOP").color(Theme::STOP_BTN).size(11.0),
+                                RichText::new("ALL STOP")
+                                    .color(Theme::stop_btn())
+                                    .size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 20, 20))
                             .corner_radius(4_u8),
@@ -109,7 +111,7 @@ impl TransportBar {
                         .add(
                             Button::new(
                                 RichText::new("ALL PAUSE")
-                                    .color(Theme::PAUSE_BTN)
+                                    .color(Theme::pause_btn())
                                     .size(11.0),
                             )
                             .fill(Color32::from_rgb(50, 40, 10))
@@ -124,7 +126,9 @@ impl TransportBar {
                     if ui
                         .add(
                             Button::new(
-                                RichText::new("ALL RESUME").color(Theme::ACCENT2).size(11.0),
+                                RichText::new("ALL RESUME")
+                                    .color(Theme::accent2())
+                                    .size(11.0),
                             )
                             .fill(Color32::from_rgb(15, 50, 30))
                             .corner_radius(4_u8),
@@ -145,9 +149,9 @@ impl TransportBar {
             ui.vertical(|ui| {
                 ui.add_space(4.0);
                 let color = if active_count > 0 {
-                    Theme::TEXT_ACTIVE
+                    Theme::text_active()
                 } else {
-                    Theme::TEXT_DIM
+                    Theme::text_dim()
                 };
                 ui.label(
                     RichText::new(format!("● {active_count} active"))
@@ -162,7 +166,7 @@ impl TransportBar {
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.add_space(2.0);
-                ui.label(RichText::new("MASTER").color(Theme::TEXT_DIM).size(10.0));
+                ui.label(RichText::new("MASTER").color(Theme::text_dim()).size(10.0));
                 ui.add(
                     Slider::new(master_vol, 0.0..=1.0)
                         .show_value(true)

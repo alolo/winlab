@@ -1,9 +1,10 @@
 // src/ui/cue_table.rs
 #![allow(float_literal_f32_fallback)]
-use crate::cue::{ContinueMode, Cue, CueColor, CueState, CueType};
+use crate::cue::{ContinueMode, Cue, CueColor, CueState, CueType, WaitPhase};
 use crate::ui::theme::Theme;
 use egui::*;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +12,7 @@ pub enum EditField {
     Number,
     Name,
     PreWait,
+    Duration,
     PostWait,
 }
 
@@ -21,6 +23,20 @@ pub fn visible_cue_ids(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<Uui
     build_display_order(cues, expanded_groups)
         .into_iter()
         .map(|(index, _)| cues[index].id)
+        .collect()
+}
+
+/// Visible cue IDs that keyboard navigation may select. Comment rows remain in
+/// the table for mouse selection, but are intentionally skipped by navigation.
+pub fn visible_navigation_cue_ids(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<Uuid> {
+    let comment_ids: HashSet<Uuid> = cues
+        .iter()
+        .filter(|cue| matches!(&cue.cue_type, CueType::Comment { .. }))
+        .map(|cue| cue.id)
+        .collect();
+    visible_cue_ids(cues, expanded_groups)
+        .into_iter()
+        .filter(|id| !comment_ids.contains(id))
         .collect()
 }
 
@@ -197,8 +213,57 @@ impl CueTable {
         let row_h = 28.0_f32;
         // The 26 px gutter is shared by header and rows: 18 px for the group
         // disclosure slot, 5 px for the color strip, and 3 px breathing room.
-        let table_width = 26.0 + column_widths.iter().sum::<f32>();
+        // The old Status column (saved width index 7) is merged into Duration;
+        // keeping the 9-value settings array preserves compatibility with older
+        // user settings files.
         let display_order = build_display_order(cues, expanded_groups);
+        let viewport_rect = ui.available_rect_before_wrap();
+        let vertical_scrollbar_width =
+            if display_order.len() as f32 * row_h + 28.0 > viewport_rect.height() {
+                14.0
+            } else {
+                0.0
+            };
+        let mut display_widths = [
+            column_widths[0],
+            column_widths[1],
+            column_widths[2],
+            column_widths[3],
+            column_widths[4],
+            column_widths[5] + column_widths[7],
+            column_widths[6],
+            column_widths[8],
+        ];
+        let available_columns_width =
+            (viewport_rect.width() - 26.0 - vertical_scrollbar_width).max(160.0);
+        let base_width = display_widths.iter().sum::<f32>();
+        if base_width < available_columns_width {
+            let extra = available_columns_width - base_width;
+            // Give spare room to the descriptive columns so rows use the full
+            // remaining Cue List width instead of leaving a blank strip.
+            display_widths[2] += extra * 0.62;
+            display_widths[3] += extra * 0.38;
+        } else if base_width > available_columns_width {
+            let mut deficit = base_width - available_columns_width;
+            let minimums = [36.0, 44.0, 100.0, 90.0, 52.0, 86.0, 52.0, 90.0];
+            for index in [2usize, 3, 5, 7, 1, 0, 4, 6] {
+                let reducible = (display_widths[index] - minimums[index]).max(0.0);
+                let reduction = reducible.min(deficit);
+                display_widths[index] -= reduction;
+                deficit -= reduction;
+                if deficit <= 0.1 {
+                    break;
+                }
+            }
+            if deficit > 0.1 {
+                let current = display_widths.iter().sum::<f32>().max(1.0);
+                let scale = (available_columns_width / current).min(1.0);
+                for width in &mut display_widths {
+                    *width *= scale;
+                }
+            }
+        }
+        let table_width = 26.0 + display_widths.iter().sum::<f32>();
         let sibling_locations = build_sibling_locations(cues);
         let group_child_counts: HashMap<Uuid, usize> = cues
             .iter()
@@ -215,8 +280,7 @@ impl CueTable {
             .map(|(index, _)| cues[*index].id)
             .collect();
 
-        let viewport_rect = ui.available_rect_before_wrap();
-        let header_rect = Rect::from_min_size(viewport_rect.min, vec2(viewport_rect.width(), 28.0));
+        let header_rect = Rect::from_min_size(viewport_rect.min, vec2(table_width, 28.0));
         let mut row_rects: Vec<Rect> = Vec::with_capacity(display_order.len());
         let mut drop_destination: Option<(Option<Uuid>, usize)> = None;
         let mut drop_line_y: Option<f32> = None;
@@ -225,77 +289,99 @@ impl CueTable {
             .data(|data| data.get_temp::<Option<CueDragState>>(drag_state_id))
             .flatten();
 
-        // One horizontal scroll area contains both header and rows. This keeps
-        // every header aligned with its column even after horizontal scrolling.
-        egui::ScrollArea::horizontal()
-            .id_salt("cue_table_horizontal_scroll")
+        // The columns are fitted to the available Cue List width, so a horizontal
+        // scroll area is no longer needed. The vertical list alone scrolls.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(26.0);
+            let labels = [
+                "Cue",
+                "Type",
+                "Name",
+                "File / Target",
+                "Pre-Wait",
+                "Duration",
+                "Post-Wait",
+                "Continue",
+            ];
+            let saved_indices = [0usize, 1, 2, 3, 4, 5, 6, 8];
+            for (index, label) in labels.iter().enumerate() {
+                const RESIZE_HANDLE_WIDTH: f32 = 14.0;
+                ui.add_sized(
+                    [
+                        (display_widths[index] - RESIZE_HANDLE_WIDTH).max(20.0),
+                        22.0,
+                    ],
+                    Label::new(RichText::new(*label).color(Theme::text_dim()).size(11.0)),
+                );
+                let (handle_rect, resize_response) =
+                    ui.allocate_exact_size(vec2(RESIZE_HANDLE_WIDTH, 22.0), Sense::drag());
+                let start_id = Id::new(("cue_column_resize_start", index));
+                if resize_response.drag_started() {
+                    let start_x = ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .map(|position| position.x)
+                        .unwrap_or(handle_rect.center().x);
+                    let saved_width = if index == 5 {
+                        column_widths[5] + column_widths[7]
+                    } else {
+                        column_widths[saved_indices[index]]
+                    };
+                    ui.data_mut(|data| {
+                        data.insert_temp(start_id, (saved_width, start_x));
+                    });
+                }
+                if resize_response.dragged() {
+                    if let (Some((start_width, start_x)), Some(pointer)) = (
+                        ui.data(|data| data.get_temp::<(f32, f32)>(start_id)),
+                        ui.ctx().pointer_latest_pos(),
+                    ) {
+                        let new_width = (start_width + pointer.x - start_x).clamp(44.0, 600.0);
+                        if index == 5 {
+                            // Consolidate the legacy Duration + Status
+                            // widths into the single visible Duration column.
+                            column_widths[5] = new_width;
+                            column_widths[7] = 0.0;
+                        } else {
+                            column_widths[saved_indices[index]] = new_width;
+                        }
+                    }
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                } else if resize_response.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                }
+                if resize_response.drag_stopped() {
+                    ui.data_mut(|data| {
+                        let _ = data.remove_temp::<(f32, f32)>(start_id);
+                    });
+                }
+                ui.painter().line_segment(
+                    [
+                        pos2(handle_rect.center().x, handle_rect.top() + 3.0),
+                        pos2(handle_rect.center().x, handle_rect.bottom() - 3.0),
+                    ],
+                    Stroke::new(
+                        1.5,
+                        if resize_response.hovered() || resize_response.dragged() {
+                            Theme::accent()
+                        } else {
+                            Theme::border()
+                        },
+                    ),
+                );
+            }
+        });
+        ui.add(Separator::default().horizontal());
+
+        egui::ScrollArea::vertical()
+            .id_salt("cue_table_vertical_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_min_width(table_width);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(26.0);
-                    let labels = [
-                        "Cue", "Type", "Name", "File / Target", "Pre-Wait",
-                        "Duration", "Post-Wait", "Status", "Continue",
-                    ];
-                    for (index, label) in labels.iter().enumerate() {
-                        const RESIZE_HANDLE_WIDTH: f32 = 14.0;
-                        ui.add_sized(
-                            [(column_widths[index] - RESIZE_HANDLE_WIDTH).max(24.0), 22.0],
-                            Label::new(RichText::new(*label).color(Theme::TEXT_DIM).size(11.0)),
-                        );
-                        let (handle_rect, resize_response) = ui.allocate_exact_size(
-                            vec2(RESIZE_HANDLE_WIDTH, 22.0),
-                            Sense::drag(),
-                        );
-                        let start_id = Id::new(("cue_column_resize_start", index));
-                        if resize_response.drag_started() {
-                            let start_x = ui.ctx().pointer_latest_pos()
-                                .map(|position| position.x)
-                                .unwrap_or(handle_rect.center().x);
-                            ui.data_mut(|data| {
-                                data.insert_temp(start_id, (column_widths[index], start_x));
-                            });
-                        }
-                        if resize_response.dragged() {
-                            if let (Some((start_width, start_x)), Some(pointer)) = (
-                                ui.data(|data| data.get_temp::<(f32, f32)>(start_id)),
-                                ui.ctx().pointer_latest_pos(),
-                            ) {
-                                column_widths[index] = (start_width + pointer.x - start_x)
-                                    .clamp(44.0, 600.0);
-                            }
-                            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                        } else if resize_response.hovered() {
-                            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                        }
-                        if resize_response.drag_stopped() {
-                            ui.data_mut(|data| {
-                                let _ = data.remove_temp::<(f32, f32)>(start_id);
-                            });
-                        }
-                        ui.painter().line_segment(
-                            [pos2(handle_rect.center().x, handle_rect.top() + 3.0),
-                             pos2(handle_rect.center().x, handle_rect.bottom() - 3.0)],
-                            Stroke::new(1.5, if resize_response.hovered() || resize_response.dragged() {
-                                Theme::ACCENT
-                            } else {
-                                Theme::BORDER
-                            }),
-                        );
-                    }
-                });
-                ui.add(Separator::default().horizontal());
-
-                egui::ScrollArea::vertical()
-                    .id_salt("cue_table_vertical_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(table_width);
-                        let mut completed_group_frames: Vec<Rect> = Vec::new();
-                        let mut group_frame_stack: Vec<(u8, Rect)> = Vec::new();
-                        for &(cue_idx, indent) in &display_order {
+                let mut completed_group_frames: Vec<Rect> = Vec::new();
+                let mut group_frame_stack: Vec<(u8, Rect)> = Vec::new();
+                for &(cue_idx, indent) in &display_order {
                     let cue = &mut cues[cue_idx];
                     let is_selected = selected_ids.contains(&cue.id) || *selected == Some(cue.id);
                     let missing_file = matches!(&cue.cue_type, CueType::Audio)
@@ -305,7 +391,11 @@ impl CueTable {
                     row_rects.push(row_rect);
 
                     // Close frames for groups whose visible subtree has ended.
-                    while group_frame_stack.last().map(|(depth, _)| *depth >= indent).unwrap_or(false) {
+                    while group_frame_stack
+                        .last()
+                        .map(|(depth, _)| *depth >= indent)
+                        .unwrap_or(false)
+                    {
                         if let Some((_, rect)) = group_frame_stack.pop() {
                             completed_group_frames.push(rect);
                         }
@@ -321,24 +411,46 @@ impl CueTable {
                         group_frame_stack.push((indent, row_rect));
                     }
 
-                    // Фон
-                    let base_bg = Self::row_bg(cue, is_selected, cue_idx);
+                    // Base row background, followed by user cue tint and a subtle state overlay.
+                    let base_bg = Self::row_bg(cue, cue_idx);
                     ui.painter().rect_filled(row_rect, 0.0_f32, base_bg);
 
-                    // Тонировка цветом (теперь с alpha=26)
                     if let Some(cue_tint) = cue.color.row_bg_egui() {
                         ui.painter().rect_filled(row_rect, 0.0_f32, cue_tint);
+                    }
+
+                    let is_playing = matches!(
+                        &cue.state,
+                        CueState::Playing | CueState::FadingIn | CueState::FadingOut
+                    );
+                    if is_playing {
+                        // Playing cue: neutral white overlay at 10% opacity.
+                        ui.painter()
+                            .rect_filled(row_rect, 0.0_f32, Theme::playing_overlay());
+                        ui.painter().rect_stroke(
+                            row_rect.shrink(0.5),
+                            0.0_f32,
+                            Stroke::new(1.0_f32, Theme::playing_outline()),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    if is_selected {
+                        // Selected cue: accent overlay at 10% opacity (90% transparent).
+                        ui.painter()
+                            .rect_filled(row_rect, 0.0_f32, Theme::selected_overlay());
                     }
 
                     // Start a row drag from any cell, including labels, target,
                     // pre/post-wait, status, and the group disclosure area. This
                     // does not depend on which child widget owns the pointer.
                     let pointer_pos = ui.ctx().pointer_latest_pos();
-                    let primary_pressed = ui.input(|input| {
-                        input.pointer.button_pressed(PointerButton::Primary)
-                    });
-                    if drag_state.is_none() && primary_pressed
-                        && pointer_pos.map(|position| row_rect.contains(position)).unwrap_or(false)
+                    let primary_pressed =
+                        ui.input(|input| input.pointer.button_pressed(PointerButton::Primary));
+                    if drag_state.is_none()
+                        && primary_pressed
+                        && pointer_pos
+                            .map(|position| row_rect.contains(position))
+                            .unwrap_or(false)
                     {
                         drag_state = pointer_pos.map(|start_pos| CueDragState {
                             source_id: cue.id,
@@ -356,7 +468,8 @@ impl CueTable {
                                     state.dragged_ids = if selected_ids.contains(&state.source_id)
                                         && selected_ids.len() > 1
                                     {
-                                        display_ids.iter()
+                                        display_ids
+                                            .iter()
                                             .filter(|id| selected_ids.contains(*id))
                                             .copied()
                                             .collect()
@@ -373,7 +486,8 @@ impl CueTable {
                         }
                     }
 
-                    let active_drag_ids: Vec<Uuid> = drag_state.as_ref()
+                    let active_drag_ids: Vec<Uuid> = drag_state
+                        .as_ref()
                         .filter(|state| state.active)
                         .map(|state| state.dragged_ids.clone())
                         .unwrap_or_default();
@@ -386,7 +500,7 @@ impl CueTable {
                         ui.painter().rect_stroke(
                             row_rect,
                             2.0_f32,
-                            Stroke::new(1.5_f32, Theme::ACCENT),
+                            Stroke::new(1.5_f32, Theme::accent()),
                             StrokeKind::Inside,
                         );
                     }
@@ -395,7 +509,7 @@ impl CueTable {
                         ui.painter().rect_stroke(
                             row_rect,
                             2.0_f32,
-                            Stroke::new(1.5_f32, Theme::ACCENT),
+                            Stroke::new(1.5_f32, Theme::accent()),
                             StrokeKind::Inside,
                         );
                     }
@@ -422,6 +536,7 @@ impl CueTable {
                     let mut cue_number_rect = Rect::NOTHING;
                     let mut name_cell_rect = Rect::NOTHING;
                     let mut pre_wait_rect = Rect::NOTHING;
+                    let mut duration_cell_rect = Rect::NOTHING;
                     let mut post_wait_rect = Rect::NOTHING;
                     let mut continue_cell_rect = Rect::NOTHING;
                     let _resp = ui.horizontal(|ui| {
@@ -431,7 +546,11 @@ impl CueTable {
                         let is_group = matches!(&cue.cue_type, CueType::Group { .. });
                         let (arrow_rect, arrow_response) = ui.allocate_exact_size(
                             vec2(18.0, row_h),
-                            if is_group { Sense::click() } else { Sense::hover() },
+                            if is_group {
+                                Sense::click()
+                            } else {
+                                Sense::hover()
+                            },
                         );
                         if is_group {
                             let open = expanded_groups.contains(&cue.id);
@@ -451,7 +570,7 @@ impl CueTable {
                             };
                             ui.painter().add(Shape::convex_polygon(
                                 points,
-                                Theme::TEXT_DIM,
+                                Theme::text_dim(),
                                 Stroke::NONE,
                             ));
                             if arrow_response.clicked() {
@@ -476,7 +595,7 @@ impl CueTable {
                         if is_editing_number {
                             if let Some((_, _, ref mut buf)) = editing {
                                 let response = ui.add_sized(
-                                    [column_widths[0], row_h - 4.0],
+                                    [display_widths[0], row_h - 4.0],
                                     TextEdit::singleline(buf).font(TextStyle::Monospace),
                                 );
                                 cue_number_rect = response.rect;
@@ -484,9 +603,12 @@ impl CueTable {
                                     response.request_focus();
                                     *editing_focus_pending = false;
                                 }
-                                if response.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                                if response.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter))
+                                {
                                     action = Some(CueTableAction::EditConfirm(
-                                        cue.id, EditField::Number, buf.clone(),
+                                        cue.id,
+                                        EditField::Number,
+                                        buf.clone(),
                                     ));
                                 }
                                 if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -495,10 +617,10 @@ impl CueTable {
                             }
                         } else {
                             let number_label = ui.add_sized(
-                                [column_widths[0], row_h],
+                                [display_widths[0], row_h],
                                 Label::new(
                                     RichText::new(&cue.number)
-                                        .color(Theme::ACCENT)
+                                        .color(Theme::accent())
                                         .monospace()
                                         .size(12.0),
                                 )
@@ -510,13 +632,16 @@ impl CueTable {
 
                         // Type
                         ui.add_sized(
-                            [column_widths[1], row_h],
+                            [display_widths[1], row_h],
                             Label::new(
                                 RichText::new(cue.cue_type.icon())
-                                    .color(Theme::TEXT)
+                                    .color(Theme::text())
                                     .size(15.0),
-                            ).selectable(false).sense(Sense::hover()),
-                        );
+                            )
+                            .selectable(false)
+                            .sense(Sense::hover()),
+                        )
+                        .on_hover_text(cue.cue_type.label());
 
                         // Name — двойной клик по имени запускает редактирование
                         let is_editing_name =
@@ -525,7 +650,10 @@ impl CueTable {
                             if let Some((_, _, ref mut buf)) = editing {
                                 ui.add_space(indent as f32 * 16.0);
                                 let r = ui.add_sized(
-                                    [(column_widths[2] - indent as f32 * 16.0).max(24.0), row_h - 4.0],
+                                    [
+                                        (display_widths[2] - indent as f32 * 16.0).max(24.0),
+                                        row_h - 4.0,
+                                    ],
                                     TextEdit::singleline(buf).font(TextStyle::Body),
                                 );
                                 name_cell_rect = r.rect;
@@ -547,7 +675,7 @@ impl CueTable {
                         } else {
                             ui.add_space(indent as f32 * 16.0);
                             let name_label = ui.add_sized(
-                                [(column_widths[2] - indent as f32 * 16.0).max(24.0), row_h],
+                                [(display_widths[2] - indent as f32 * 16.0).max(24.0), row_h],
                                 Label::new(
                                     RichText::new(&cue.name)
                                         .color(Self::name_color(cue))
@@ -563,15 +691,20 @@ impl CueTable {
 
                         // File / Target
                         let target_desc = Self::describe_target(cue, &cue_names);
-                        let target_cell = ui.add_sized(
-                            [column_widths[3], row_h],
-                            Label::new(
-                                RichText::new(target_desc).color(Theme::TEXT_DIM).size(11.0),
+                        let target_tooltip = target_desc.clone();
+                        let target_cell = ui
+                            .add_sized(
+                                [display_widths[3], row_h],
+                                Label::new(
+                                    RichText::new(target_desc)
+                                        .color(Theme::text_dim())
+                                        .size(11.0),
+                                )
+                                .truncate()
+                                .selectable(false)
+                                .sense(Sense::hover()),
                             )
-                            .truncate()
-                            .selectable(false)
-                            .sense(Sense::hover()),
-                        );
+                            .on_hover_text(target_tooltip);
                         target_cell_rect = target_cell.rect;
 
                         // Pre-Wait (двойной клик = редактирование)
@@ -580,53 +713,71 @@ impl CueTable {
                             cue.id,
                             EditField::PreWait,
                             cue.pre_wait_secs,
-                            column_widths[4],
+                            display_widths[4],
                             row_h,
-                            Theme::ACCENT,
+                            Theme::accent(),
+                            WaitPhase::Pre,
+                            cue.wait_phase,
+                            cue.wait_started_at,
+                            cue.wait_duration_secs,
                             editing,
                             editing_focus_pending,
                             &mut action,
                             indent,
                         );
 
-                        // Duration
-                        ui.add_sized(
-                            [column_widths[5], row_h],
-                            Label::new(
-                                RichText::new(format_duration(cue.effective_duration()))
-                                    .color(Theme::TEXT_DIM)
-                                    .monospace()
-                                    .size(11.0),
-                            )
-                            .selectable(false)
-                            .sense(Sense::hover()),
-                        );
-
-                        // Post-Wait
-                        post_wait_rect = Self::wait_cell(
-                            ui,
-                            cue.id,
-                            EditField::PostWait,
-                            cue.post_wait_secs,
-                            column_widths[6],
-                            row_h,
-                            Theme::ACCENT2,
+                        // Duration. Fade events can be edited directly in the Cue List.
+                        let is_fade_cue = matches!(&cue.cue_type, CueType::Fade { .. });
+                        let is_editing_duration = matches!(
                             editing,
-                            editing_focus_pending,
-                            &mut action,
-                            indent,
+                            Some((id, EditField::Duration, _)) if *id == cue.id
                         );
-
-                        // Status
-                        ui.add_sized([column_widths[7], row_h], |ui: &mut Ui| {
-                            let (rect, resp) = ui.allocate_exact_size(
-                                vec2(column_widths[7], row_h - 8.0),
+                        if is_fade_cue && is_editing_duration {
+                            if let Some((_, _, ref mut buf)) = editing {
+                                let response = ui.add_sized(
+                                    [display_widths[5], row_h - 4.0],
+                                    TextEdit::singleline(buf).font(TextStyle::Monospace),
+                                );
+                                duration_cell_rect = response.rect;
+                                if *editing_focus_pending {
+                                    response.request_focus();
+                                    *editing_focus_pending = false;
+                                }
+                                if response.lost_focus() || ui.input(|i| i.key_pressed(Key::Enter))
+                                {
+                                    action = Some(CueTableAction::EditConfirm(
+                                        cue.id,
+                                        EditField::Duration,
+                                        buf.clone(),
+                                    ));
+                                }
+                                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                    action = Some(CueTableAction::EditCancel);
+                                }
+                            }
+                        } else {
+                            let (rect, response) = ui.allocate_exact_size(
+                                vec2(display_widths[5], row_h - 8.0),
                                 Sense::hover(),
                             );
-                            let fade_post_wait = matches!(&cue.cue_type, CueType::Fade { .. })
-                                && matches!(&cue.state, CueState::Waiting);
-                            if cue.is_active() && cue.effective_duration() > 0.0 && !fade_post_wait {
-                                let progress = cue.progress();
+                            duration_cell_rect = rect;
+                            let is_playing = matches!(
+                                &cue.state,
+                                CueState::Playing | CueState::FadingIn | CueState::FadingOut
+                            );
+                            if is_playing && cue.effective_duration() > 0.0 {
+                                let duration = cue.effective_duration();
+                                let (progress, remaining) =
+                                    if matches!(&cue.cue_type, CueType::Fade { .. }) {
+                                        (
+                                            (cue.position_secs / duration.max(0.001))
+                                                .clamp(0.0, 1.0)
+                                                as f32,
+                                            (duration - cue.position_secs).max(0.0),
+                                        )
+                                    } else {
+                                        (cue.progress(), cue.remaining_secs())
+                                    };
                                 let bar_rect = Rect::from_min_size(
                                     rect.min,
                                     vec2(rect.width() * progress, rect.height()),
@@ -634,16 +785,19 @@ impl CueTable {
                                 ui.painter().rect_filled(
                                     bar_rect,
                                     2.0_f32,
-                                    Theme::BG_ACTIVE.linear_multiply(0.8_f32),
+                                    Theme::bg_active().linear_multiply(0.8_f32),
                                 );
                                 ui.painter().text(
                                     rect.center(),
                                     Align2::CENTER_CENTER,
-                                    format_duration(cue.remaining_secs()),
+                                    format_duration(remaining),
                                     FontId::monospace(10.0),
-                                    Theme::TEXT_ACTIVE,
+                                    Theme::text_active(),
                                 );
-                            } else {
+                            } else if matches!(
+                                &cue.state,
+                                CueState::Paused | CueState::Loading | CueState::Error(_)
+                            ) {
                                 let (label, color) = status_label(&cue.state);
                                 ui.painter().text(
                                     rect.center(),
@@ -652,35 +806,91 @@ impl CueTable {
                                     FontId::proportional(11.0),
                                     color,
                                 );
+                            } else if matches!(&cue.cue_type, CueType::Comment { .. }) {
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "comment",
+                                    FontId::proportional(10.0),
+                                    Theme::text_dim(),
+                                );
+                            } else {
+                                let duration = cue.effective_duration();
+                                let (label, color) = if duration > 0.0 {
+                                    (format_duration(duration), Theme::text_dim())
+                                } else if cue.state == CueState::Waiting
+                                    && cue.wait_phase != WaitPhase::None
+                                {
+                                    ("—".to_string(), Theme::text_dim())
+                                } else {
+                                    let (state, state_color) = status_label(&cue.state);
+                                    (state.to_string(), state_color)
+                                };
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    label,
+                                    FontId::monospace(10.0),
+                                    color,
+                                );
                             }
-                            resp
-                        });
+                            let _ = response;
+                        }
+
+                        // Post-Wait
+                        post_wait_rect = Self::wait_cell(
+                            ui,
+                            cue.id,
+                            EditField::PostWait,
+                            cue.post_wait_secs,
+                            display_widths[6],
+                            row_h,
+                            Theme::accent2(),
+                            WaitPhase::Post,
+                            cue.wait_phase,
+                            cue.wait_started_at,
+                            cue.wait_duration_secs,
+                            editing,
+                            editing_focus_pending,
+                            &mut action,
+                            indent,
+                        );
 
                         // Continue
                         let continue_response = ui.push_id(("continue_combo", cue.id), |ui| {
-                            egui::ComboBox::from_id_salt("cont")
-                                .width(column_widths[8])
-                                .selected_text(cue.continue_mode.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in ContinueMode::ALL {
-                                        ui.selectable_value(
-                                            &mut cue.continue_mode,
-                                            mode.clone(),
-                                            mode.label(),
-                                        );
-                                    }
-                                })
+                            if matches!(&cue.cue_type, CueType::Comment { .. }) {
+                                ui.add_sized(
+                                    [display_widths[7], row_h],
+                                    Label::new(RichText::new("—").color(Theme::text_dim()))
+                                        .selectable(false)
+                                        .sense(Sense::hover()),
+                                )
+                            } else {
+                                egui::ComboBox::from_id_salt("cont")
+                                    .width(display_widths[7])
+                                    .selected_text(cue.continue_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in ContinueMode::ALL {
+                                            ui.selectable_value(
+                                                &mut cue.continue_mode,
+                                                mode.clone(),
+                                                mode.label(),
+                                            );
+                                        }
+                                    })
+                                    .response
+                            }
                         });
                         continue_cell_rect = continue_response.response.rect;
                         ui.spacing_mut().item_spacing.x = 8.0;
                     });
 
                     let pointer_position = pointer_pos;
-                    let pointer_clicked_in_row = ui.input(|input| {
-                        input.pointer.button_clicked(PointerButton::Primary)
-                    }) && pointer_position
-                        .map(|position| row_rect.contains(position))
-                        .unwrap_or(false);
+                    let pointer_clicked_in_row = ui
+                        .input(|input| input.pointer.button_clicked(PointerButton::Primary))
+                        && pointer_position
+                            .map(|position| row_rect.contains(position))
+                            .unwrap_or(false);
                     // A ComboBox popup is rendered on its own foreground layer.
                     // Do not use the row's manual pointer fallback when the click
                     // belongs to that popup, otherwise selecting a Continue mode
@@ -706,11 +916,12 @@ impl CueTable {
                         );
                     }
 
-                    let row_double_clicked = ui.input(|input| {
-                        input.pointer.button_double_clicked(PointerButton::Primary)
-                    }) && click_is_on_row_layer && pointer_position
-                        .map(|position| row_rect.contains(position))
-                        .unwrap_or(false);
+                    let row_double_clicked = ui
+                        .input(|input| input.pointer.button_double_clicked(PointerButton::Primary))
+                        && click_is_on_row_layer
+                        && pointer_position
+                            .map(|position| row_rect.contains(position))
+                            .unwrap_or(false);
                     if row_resp.double_clicked() || row_double_clicked {
                         if let Some(position) = pointer_position {
                             if cue_number_rect.contains(position) {
@@ -737,43 +948,71 @@ impl CueTable {
                                     EditField::PostWait,
                                     format!("{:.2}", cue.post_wait_secs),
                                 ));
+                            } else if duration_cell_rect.contains(position)
+                                && matches!(&cue.cue_type, CueType::Fade { .. })
+                            {
+                                action = Some(CueTableAction::StartEdit(
+                                    cue.id,
+                                    EditField::Duration,
+                                    format!("{:.2}", cue.effective_duration()),
+                                ));
                             }
                         }
                     }
 
-                    if drag_state.as_ref().map(|state| state.active).unwrap_or(false) {
+                    if drag_state
+                        .as_ref()
+                        .map(|state| state.active)
+                        .unwrap_or(false)
+                    {
                         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                        if let Some(position) = pointer_pos.filter(|position| row_rect.contains(*position)) {
+                        if let Some(position) =
+                            pointer_pos.filter(|position| row_rect.contains(*position))
+                        {
                             if !active_drag_ids.contains(&cue.id) {
-                                let (parent_id, sibling_index) = sibling_locations
-                                    .get(&cue.id)
-                                    .copied()
-                                    .unwrap_or((None, 0));
+                                let (parent_id, sibling_index) =
+                                    sibling_locations.get(&cue.id).copied().unwrap_or((None, 0));
                                 if is_group_row {
                                     // Only the central band of a group row means
                                     // "drop into group". Its upper/lower bands are
                                     // explicit before/after insertion zones.
                                     let relative_y = position.y - row_rect.top();
                                     let group_band = row_h * 0.28;
-                                    if relative_y >= group_band && relative_y <= row_h - group_band {
-                                        let child_count = group_child_counts.get(&cue.id).copied().unwrap_or(0);
+                                    if relative_y >= group_band && relative_y <= row_h - group_band
+                                    {
+                                        let child_count =
+                                            group_child_counts.get(&cue.id).copied().unwrap_or(0);
                                         drop_destination = Some((Some(cue.id), child_count));
                                         drop_line_y = None;
                                         ui.painter().rect_stroke(
                                             row_rect,
                                             2.0_f32,
-                                            Stroke::new(2.0_f32, Theme::ACCENT2),
+                                            Stroke::new(2.0_f32, Theme::accent2()),
                                             StrokeKind::Inside,
                                         );
                                     } else {
                                         let before = relative_y < row_h * 0.5;
-                                        drop_destination = Some((parent_id, sibling_index + (if before { 0 } else { 1 })));
-                                        drop_line_y = Some(if before { row_rect.top() } else { row_rect.bottom() });
+                                        drop_destination = Some((
+                                            parent_id,
+                                            sibling_index + (if before { 0 } else { 1 }),
+                                        ));
+                                        drop_line_y = Some(if before {
+                                            row_rect.top()
+                                        } else {
+                                            row_rect.bottom()
+                                        });
                                     }
                                 } else {
                                     let before = position.y < row_rect.center().y;
-                                    drop_destination = Some((parent_id, sibling_index + (if before { 0 } else { 1 })));
-                                    drop_line_y = Some(if before { row_rect.top() } else { row_rect.bottom() });
+                                    drop_destination = Some((
+                                        parent_id,
+                                        sibling_index + (if before { 0 } else { 1 }),
+                                    ));
+                                    drop_line_y = Some(if before {
+                                        row_rect.top()
+                                    } else {
+                                        row_rect.bottom()
+                                    });
                                 }
                             }
                         }
@@ -789,16 +1028,16 @@ impl CueTable {
                         let pointer_over_target = pointer_pos
                             .map(|position| target_cell_rect.contains(position))
                             .unwrap_or(false);
-                        let released_over_target = ui.input(|input| {
-                            input.pointer.button_released(PointerButton::Primary)
-                        });
+                        let released_over_target =
+                            ui.input(|input| input.pointer.button_released(PointerButton::Primary));
                         if let Some(pid) = primary_dragged_id {
-                            let valid_target = pid != cue.id && is_targetable && targetable_ids.contains(&pid);
+                            let valid_target =
+                                pid != cue.id && is_targetable && targetable_ids.contains(&pid);
                             if pointer_over_target && valid_target {
                                 ui.painter().rect_stroke(
                                     target_cell_rect,
                                     2.0,
-                                    Stroke::new(2.0, Theme::ACCENT2),
+                                    Stroke::new(2.0, Theme::accent2()),
                                     StrokeKind::Inside,
                                 );
                                 if released_over_target {
@@ -877,75 +1116,76 @@ impl CueTable {
                         } else {
                             cue.file_path.display().to_string()
                         };
-                        tooltip_response.on_hover_text(format!(
-                            "Missing media file: {missing_path}"
-                        ));
+                        tooltip_response
+                            .on_hover_text(format!("Missing media file: {missing_path}"));
                     }
 
                     ui.add_space(1.0);
-                        }
-                        while let Some((_, rect)) = group_frame_stack.pop() {
-                            completed_group_frames.push(rect);
-                        }
-                        for rect in completed_group_frames {
-                            // A clear outline encloses the group header and every
-                            // visible descendant. Collapsed groups retain a frame
-                            // around their header row so they remain recognizable.
-                            let outline = rect.expand2(vec2(3.0, 2.0));
-                            ui.painter().rect_stroke(
-                                outline,
-                                5.0,
-                                Stroke::new(2.0, Theme::ACCENT2),
-                                StrokeKind::Inside,
-                            );
-                            ui.painter().line_segment(
-                                [
-                                    pos2(outline.left() + 1.0, outline.top() + 5.0),
-                                    pos2(outline.left() + 1.0, outline.bottom() - 5.0),
-                                ],
-                                Stroke::new(3.0, Theme::ACCENT),
-                            );
-                        }
+                }
+                while let Some((_, rect)) = group_frame_stack.pop() {
+                    completed_group_frames.push(rect);
+                }
+                for rect in completed_group_frames {
+                    // A clear outline encloses the group header and every
+                    // visible descendant. Collapsed groups retain a frame
+                    // around their header row so they remain recognizable.
+                    let outline = rect.expand2(vec2(3.0, 2.0));
+                    ui.painter().rect_stroke(
+                        outline,
+                        5.0,
+                        Stroke::new(2.0, Theme::accent2()),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            pos2(outline.left() + 1.0, outline.top() + 5.0),
+                            pos2(outline.left() + 1.0, outline.bottom() - 5.0),
+                        ],
+                        Stroke::new(3.0, Theme::accent()),
+                    );
+                }
 
-                        // A real end-of-list drop target lives inside the vertical
-                        // scroll content. If the final visible cue is a group child,
-                        // the drop remains in that group's sibling sequence.
-                        let tail_height = (viewport_rect.bottom() - ui.cursor().min.y).max(row_h);
-                        let (tail_rect, _) = ui.allocate_exact_size(
-                            vec2(table_width, tail_height),
-                            Sense::hover(),
+                // A real end-of-list drop target lives inside the vertical
+                // scroll content. If the final visible cue is a group child,
+                // the drop remains in that group's sibling sequence.
+                let tail_height = (viewport_rect.bottom() - ui.cursor().min.y).max(row_h);
+                let (tail_rect, _) =
+                    ui.allocate_exact_size(vec2(table_width, tail_height), Sense::hover());
+                if drag_state
+                    .as_ref()
+                    .map(|state| state.active)
+                    .unwrap_or(false)
+                    && ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .map(|position| tail_rect.contains(position))
+                        .unwrap_or(false)
+                {
+                    if let Some(last_id) = display_ids.last().copied() {
+                        let (parent_id, sibling_index) = sibling_locations
+                            .get(&last_id)
+                            .copied()
+                            .unwrap_or((None, 0));
+                        drop_destination = Some((parent_id, sibling_index + 1));
+                    } else {
+                        drop_destination = Some((None, 0));
+                    }
+                    drop_line_y = Some(tail_rect.top() + 2.0);
+                }
+
+                if let Some(y) = drop_line_y {
+                    let left = viewport_rect.left();
+                    let right = left + table_width;
+                    let mut x = left;
+                    while x < right {
+                        let end_x = (x + 7.0).min(right);
+                        ui.painter().line_segment(
+                            [pos2(x, y), pos2(end_x, y)],
+                            Stroke::new(2.0, Theme::accent2()),
                         );
-                        if drag_state.as_ref().map(|state| state.active).unwrap_or(false)
-                            && ui.ctx().pointer_latest_pos()
-                                .map(|position| tail_rect.contains(position))
-                                .unwrap_or(false)
-                        {
-                            if let Some(last_id) = display_ids.last().copied() {
-                                let (parent_id, sibling_index) = sibling_locations
-                                    .get(&last_id)
-                                    .copied()
-                                    .unwrap_or((None, 0));
-                                drop_destination = Some((parent_id, sibling_index + 1));
-                            } else {
-                                drop_destination = Some((None, 0));
-                            }
-                            drop_line_y = Some(tail_rect.top() + 2.0);
-                        }
-
-                        if let Some(y) = drop_line_y {
-                            let left = viewport_rect.left();
-                            let right = left + table_width;
-                            let mut x = left;
-                            while x < right {
-                                let end_x = (x + 7.0).min(right);
-                                ui.painter().line_segment(
-                                    [pos2(x, y), pos2(end_x, y)],
-                                    Stroke::new(2.0, Theme::ACCENT2),
-                                );
-                                x += 12.0;
-                            }
-                        }
-                    });
+                        x += 12.0;
+                    }
+                }
             });
 
         if let Some(state) = drag_state.as_ref().filter(|state| state.active) {
@@ -1003,7 +1243,11 @@ impl CueTable {
             ui.input(|input| input.pointer.button_clicked(PointerButton::Primary));
         if primary_clicked {
             if let Some(position) = ui.ctx().pointer_latest_pos() {
-                let inside_table = viewport_rect.contains(position);
+                let table_area_rect = Rect::from_min_size(
+                    viewport_rect.min,
+                    vec2(table_width, viewport_rect.height()),
+                );
+                let inside_table = table_area_rect.contains(position);
                 let on_header = header_rect.contains(position);
                 let on_row = row_rects.iter().any(|rect| rect.contains(position));
                 if inside_table && !on_header && !on_row && action.is_none() {
@@ -1067,6 +1311,10 @@ impl CueTable {
         width: f32,
         row_h: f32,
         accent: Color32,
+        phase: WaitPhase,
+        active_phase: WaitPhase,
+        wait_started_at: Option<Instant>,
+        wait_duration_secs: f64,
         editing: &mut Option<(Uuid, EditField, String)>,
         editing_focus_pending: &mut bool,
         action: &mut Option<CueTableAction>,
@@ -1093,6 +1341,47 @@ impl CueTable {
             } else {
                 Rect::NOTHING
             }
+        } else if active_phase == phase && wait_duration_secs > 0.0 {
+            if let Some(started_at) =
+                wait_started_at.filter(|started_at| Instant::now() >= *started_at)
+            {
+                let now = Instant::now();
+                let elapsed = now
+                    .duration_since(started_at)
+                    .as_secs_f64()
+                    .min(wait_duration_secs);
+                let progress = (elapsed / wait_duration_secs.max(0.001)).clamp(0.0, 1.0) as f32;
+                let (rect, _) = ui.allocate_exact_size(vec2(width, row_h - 8.0), Sense::hover());
+                let bar_rect =
+                    Rect::from_min_size(rect.min, vec2(rect.width() * progress, rect.height()));
+                ui.painter()
+                    .rect_filled(bar_rect, 2.0_f32, accent.linear_multiply(0.28_f32));
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    if wait_duration_secs - elapsed <= 0.0 {
+                        "00:00.00".to_string()
+                    } else {
+                        format_duration(wait_duration_secs - elapsed)
+                    },
+                    FontId::monospace(10.0),
+                    accent,
+                );
+                rect
+            } else {
+                ui.add_sized(
+                    [width, row_h],
+                    Label::new(
+                        RichText::new(format_duration(wait_duration_secs))
+                            .color(accent)
+                            .monospace()
+                            .size(11.0),
+                    )
+                    .selectable(false)
+                    .sense(Sense::hover()),
+                )
+                .rect
+            }
         } else {
             let txt = if value > 0.0 {
                 format_duration(value)
@@ -1103,7 +1392,11 @@ impl CueTable {
                 [width, row_h],
                 Label::new(
                     RichText::new(txt)
-                        .color(if value > 0.0 { accent } else { Theme::TEXT_DIM })
+                        .color(if value > 0.0 {
+                            accent
+                        } else {
+                            Theme::text_dim()
+                        })
                         .monospace()
                         .size(11.0),
                 )
@@ -1145,24 +1438,26 @@ impl CueTable {
                 channel, message, ..
             } => format!("Ch {} • {}", channel, message.label()),
             CueType::Osc { address, .. } => address.clone(),
+            CueType::Comment { text } => text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("Comment")
+                .to_string(),
             CueType::Group { mode, children, .. } => {
                 format!("{} ({} cues)", mode.label(), children.len())
             }
         }
     }
 
-    fn row_bg(cue: &Cue, selected: bool, idx: usize) -> Color32 {
-        if selected {
-            return Theme::BG_SELECTED;
-        }
+    fn row_bg(cue: &Cue, idx: usize) -> Color32 {
         match cue.state {
-            CueState::Playing | CueState::FadingIn | CueState::FadingOut => Theme::BG_ACTIVE,
-            CueState::Paused | CueState::Waiting => Theme::BG_PAUSED,
+            CueState::Paused | CueState::Waiting => Theme::bg_paused(),
             _ => {
                 if idx % 2 == 0 {
-                    Theme::BG_ROW
+                    Theme::bg_row()
                 } else {
-                    Theme::BG_ROW_ALT
+                    Theme::bg_row_alt()
                 }
             }
         }
@@ -1170,9 +1465,9 @@ impl CueTable {
 
     fn name_color(cue: &Cue) -> Color32 {
         match cue.state {
-            CueState::Playing | CueState::FadingIn => Theme::TEXT_ACTIVE,
-            CueState::Paused | CueState::Waiting => Theme::PAUSE_BTN,
-            _ => Theme::TEXT,
+            CueState::Playing | CueState::FadingIn => Theme::text_active(),
+            CueState::Paused | CueState::Waiting => Theme::pause_btn(),
+            _ => Theme::text(),
         }
     }
 }
@@ -1196,14 +1491,14 @@ pub enum CueTableAction {
 
 fn status_label(state: &CueState) -> (&'static str, Color32) {
     match state {
-        CueState::Stopped => ("stopped", Theme::TEXT_DIM),
-        CueState::Waiting => ("⏳ pre-wait", Theme::PAUSE_BTN),
-        CueState::Playing => ("▶ playing", Theme::TEXT_ACTIVE),
-        CueState::Paused => ("⏸ paused", Theme::PAUSE_BTN),
-        CueState::FadingIn => ("↗ fade in", Theme::ACCENT2),
-        CueState::FadingOut => ("↘ fade out", Theme::ACCENT),
-        CueState::Loading => ("loading…", Theme::ACCENT),
-        CueState::Error(_) => ("⚠ error", Theme::STOP_BTN),
+        CueState::Stopped => ("stopped", Theme::text_dim()),
+        CueState::Waiting => ("⏳ waiting", Theme::pause_btn()),
+        CueState::Playing => ("▶ playing", Theme::text_active()),
+        CueState::Paused => ("⏸ paused", Theme::pause_btn()),
+        CueState::FadingIn => ("↗ fade in", Theme::accent2()),
+        CueState::FadingOut => ("↘ fade out", Theme::accent()),
+        CueState::Loading => ("loading…", Theme::accent()),
+        CueState::Error(_) => ("⚠ error", Theme::stop_btn()),
     }
 }
 
@@ -1219,7 +1514,7 @@ pub fn format_duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_sibling_locations, visible_cue_ids};
+    use super::{build_sibling_locations, visible_cue_ids, visible_navigation_cue_ids};
     use crate::cue::{Cue, CueType, GroupMode};
     use std::collections::HashSet;
 
@@ -1251,6 +1546,25 @@ mod tests {
         let mut expanded = HashSet::new();
         expanded.insert(group.id);
         assert_eq!(visible_cue_ids(&cues, &expanded), expected);
+    }
+
+    #[test]
+    fn comment_rows_remain_visible_but_are_skipped_by_keyboard_navigation() {
+        let before = Cue::new_typed(CueType::Stop { target_id: None });
+        let comment = Cue::new_typed(CueType::Comment {
+            text: "Lights to standby".to_string(),
+        });
+        let after = Cue::new_typed(CueType::Pause { target_id: None });
+        let cues = vec![before.clone(), comment.clone(), after.clone()];
+
+        assert_eq!(
+            visible_cue_ids(&cues, &HashSet::new()),
+            vec![before.id, comment.id, after.id]
+        );
+        assert_eq!(
+            visible_navigation_cue_ids(&cues, &HashSet::new()),
+            vec![before.id, after.id]
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
 // src/audio/engine.rs — аудиодвижок с поддержкой Fade In/Out, Start/End, Loop и смены I/O карт
 
+use crate::audio::OutputChannelInfo;
 use crate::config::AudioBackend;
 use crate::cue::{ChannelRoute, CueState, FadeCurve, OutputChannelSetting};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::RwLock;
 use rodio::Source;
 use std::collections::HashMap;
@@ -19,6 +20,8 @@ use uuid::Uuid;
 pub enum AudioCommand {
     Play {
         id: Uuid,
+        /// Monotonic per-cue generation used to discard stale position updates after Stop/restart.
+        generation: u64,
         file: PathBuf,
         /// None uses the global output device; Some selects a per-cue device.
         output_device: Option<String>,
@@ -26,6 +29,8 @@ pub enum AudioCommand {
         end_secs: Option<f64>,
         duration_secs: f64,
         volume: f32,
+        volume_automation_enabled: bool,
+        volume_automation: Vec<[f64; 2]>,
         fade_in_secs: f64,
         fade_out_secs: f64,
         fade_curve: FadeCurve,
@@ -47,6 +52,11 @@ pub enum AudioCommand {
     Resume(Uuid),
     ResumeAll,
     SetVolume(Uuid, f32),
+    SetVolumeAutomation {
+        id: Uuid,
+        enabled: bool,
+        points: Vec<[f64; 2]>,
+    },
     Fade {
         id: Uuid,
         target_volume: f32,
@@ -57,8 +67,12 @@ pub enum AudioCommand {
     },
     SetOutputDevice(String),
     SetInputDevice(String),
-    /// Play a short low-level test tone through one zero-based stream channel.
+    /// Play a raw multichannel test tone through one native stream channel.
+    /// logical_channel is the user-facing CueLabs output slot; channel is the
+    /// zero-based native CPAL/ASIO stream index selected by that slot.
     TestOutput {
+        device_name: String,
+        logical_channel: usize,
         channel: usize,
     },
     SetRouting {
@@ -71,6 +85,7 @@ pub enum AudioCommand {
 #[derive(Debug, Clone)]
 pub struct PositionUpdate {
     pub id: Uuid,
+    pub generation: u64,
     pub position_secs: f64,
     pub state: CueState,
 }
@@ -171,8 +186,15 @@ pub struct AudioEngine {
     output_device_channels: HashMap<String, usize>,
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
     output_channel_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
+    /// Optional channel names reported by the native ASIO driver, keyed by CPAL device name.
+    output_driver_channel_info: HashMap<String, Vec<OutputChannelInfo>>,
+    /// User-defined aliases override driver-provided names but never change routing indices.
     output_channel_names: HashMap<String, Vec<String>>,
     default_output_pairs: HashMap<String, [usize; 2]>,
+    /// Logical CueLabs output order -> native CPAL/ASIO stream channel index.
+    /// Stored per device so non-standard driver orders do not affect other interfaces.
+    output_channel_orders: HashMap<String, Vec<usize>>,
+    detected_default_output_pairs: HashMap<String, [usize; 2]>,
 }
 
 impl AudioEngine {
@@ -181,8 +203,25 @@ impl AudioEngine {
     }
 
     pub fn new_with_backend(backend: AudioBackend) -> Result<Self> {
+        // Query native ASIO channel names before CPAL initializes the driver.
+        // CPAL currently exposes only a channel count, not ASIOGetChannelInfo metadata.
+        let probed_asio_channels = if backend == AudioBackend::Asio {
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            {
+                crate::audio::asio_probe::probe_registered_drivers()
+            }
+            #[cfg(not(all(target_os = "windows", feature = "asio")))]
+            {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
         let host = host_for_backend(backend)?;
         let output_devices = Self::list_output_devices(&host);
+        let output_driver_channel_info =
+            Self::match_asio_channel_info_to_devices(&output_devices, &probed_asio_channels);
         let (output_device_channels, output_device_channel_layouts) =
             Self::list_output_device_info(&host);
         let input_devices = Self::list_input_devices(&host);
@@ -239,6 +278,9 @@ impl AudioEngine {
             );
         });
 
+        let detected_default_output_pairs =
+            Self::detect_default_pairs_for_devices(backend, &output_driver_channel_info);
+
         Ok(Self {
             backend,
             cmd_tx,
@@ -251,9 +293,123 @@ impl AudioEngine {
             output_device_channels,
             output_device_channel_layouts,
             output_channel_settings,
+            output_driver_channel_info,
             output_channel_names: HashMap::new(),
             default_output_pairs: HashMap::new(),
+            output_channel_orders: HashMap::new(),
+            detected_default_output_pairs,
         })
+    }
+
+    fn normalize_device_name(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn match_asio_channel_info_to_devices(
+        output_devices: &[String],
+        probed: &HashMap<String, Vec<OutputChannelInfo>>,
+    ) -> HashMap<String, Vec<OutputChannelInfo>> {
+        let mut matched = HashMap::new();
+        for device_name in output_devices {
+            let normalized_device = Self::normalize_device_name(device_name);
+            let best_match = probed
+                .iter()
+                .filter_map(|(driver_name, channels)| {
+                    let normalized_driver = Self::normalize_device_name(driver_name);
+                    let is_match = normalized_device == normalized_driver
+                        || (normalized_device.len() >= 5
+                            && normalized_driver.len() >= 5
+                            && (normalized_device.contains(&normalized_driver)
+                                || normalized_driver.contains(&normalized_device)));
+                    is_match.then_some((normalized_driver.len(), channels))
+                })
+                .max_by_key(|(match_length, _)| *match_length);
+
+            if let Some((_, channels)) = best_match {
+                info!(
+                    "Matched {} ASIO driver channel names to CPAL device '{}': {:?}",
+                    channels.len(),
+                    device_name,
+                    channels
+                        .iter()
+                        .map(|channel| (&channel.name, channel.index))
+                        .collect::<Vec<_>>()
+                );
+                matched.insert(device_name.clone(), channels.clone());
+            } else {
+                warn!(
+                    "No ASIO channel-name metadata matched CPAL device '{}'; generic channel labels will be used",
+                    device_name
+                );
+            }
+        }
+        matched
+    }
+
+    fn detect_default_stereo_pair(channels: &[OutputChannelInfo]) -> Option<[usize; 2]> {
+        let normalized = |name: &str| {
+            name.chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .map(|character| character.to_ascii_lowercase())
+                .collect::<String>()
+        };
+
+        // Prefer explicit physical monitor/line-output labels. These are the
+        // strongest signals that the driver knows the intended stereo pair.
+        let left = channels.iter().find(|channel| {
+            let name = normalized(&channel.name);
+            name.contains("lineout1l")
+                || name.contains("mainleft")
+                || name.contains("mainl")
+                || name.contains("monitorleft")
+                || name.contains("monitorl")
+                || name.contains("speakerleft")
+                || name.contains("frontleft")
+        });
+        let right = channels.iter().find(|channel| {
+            let name = normalized(&channel.name);
+            name.contains("lineout2r")
+                || name.contains("mainright")
+                || name.contains("mainr")
+                || name.contains("monitorright")
+                || name.contains("monitorr")
+                || name.contains("speakerright")
+                || name.contains("frontright")
+        });
+
+        match (left, right) {
+            (Some(left), Some(right)) if left.index != right.index => {
+                Some([left.index, right.index])
+            }
+            _ => None,
+        }
+    }
+
+    fn detect_default_pairs_for_devices(
+        backend: AudioBackend,
+        device_channels: &HashMap<String, Vec<OutputChannelInfo>>,
+    ) -> HashMap<String, [usize; 2]> {
+        if backend != AudioBackend::Asio {
+            return HashMap::new();
+        }
+
+        device_channels
+            .iter()
+            .filter_map(|(device_name, channels)| {
+                let pair = Self::detect_default_stereo_pair(channels)?;
+                info!(
+                    "Detected default stereo output pair for '{}': ASIO {} / ASIO {}",
+                    device_name,
+                    pair[0] + 1,
+                    pair[1] + 1
+                );
+                Some((format!("{}::{}", backend.label(), device_name), pair))
+            })
+            .collect()
     }
 
     fn list_output_devices(host: &Host) -> Vec<String> {
@@ -368,32 +524,198 @@ impl AudioEngine {
         self.output_device_config_key(device_name)
     }
 
-    /// Display stream channels in their native driver order. Physical labels
-    /// are calibrated per device by the user; no model-specific channel offsets
-    /// are assumed.
-    pub fn output_channel_display_order(&self, device_name: Option<&str>) -> Vec<usize> {
-        let channels = self.output_channels_for_device(device_name);
-        (0..channels).collect()
+    /// Default logical-to-native channel order for devices whose driver exposes
+    /// channels in a different order from the device's mixer buses.
+    ///
+    /// The US-322/US-366 order below is based on the user's measured TASCAM
+    /// Mixer Panel routing: ASIO 3/4 -> Computer 1/2, ASIO 5/6 -> Computer 3/4,
+    /// ASIO 1/2 -> Computer 5/6. This is a presentation/routing profile only;
+    /// samples are still written to the native stream channels unchanged.
+    fn default_output_channel_order(&self, device_name: &str, channels: usize) -> Vec<usize> {
+        Self::default_output_channel_order_for(self.backend, device_name, channels)
     }
 
-    /// Human-readable label for a zero-based stream channel index. A saved
-    /// user-calibrated name takes precedence over the generic driver index.
+    fn default_output_channel_order_for(
+        backend: AudioBackend,
+        device_name: &str,
+        channels: usize,
+    ) -> Vec<usize> {
+        let normalized = Self::normalize_device_name(device_name);
+        let is_tascam_us366 = backend == AudioBackend::Asio
+            && (normalized.contains("us322") || normalized.contains("us366"));
+
+        let mut order = if is_tascam_us366 && channels >= 6 {
+            vec![2, 3, 4, 5, 0, 1]
+        } else {
+            Vec::new()
+        };
+        let mut used = order
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        for index in 0..channels {
+            if used.insert(index) {
+                order.push(index);
+            }
+        }
+        order.truncate(channels);
+        order
+    }
+
+    /// Display logical CueLabs outputs in their configured order. Values remain
+    /// native zero-based stream indices, so existing cue routes keep their exact
+    /// physical destination when a display/order profile is introduced.
+    pub fn output_channel_display_order(&self, device_name: Option<&str>) -> Vec<usize> {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let channels = self.output_channels_for_device(Some(name));
+        let key = self.output_device_config_key(name);
+        let configured = self.output_channel_orders.get(&key);
+        let mut order = Vec::with_capacity(channels);
+        let mut used = std::collections::HashSet::new();
+
+        if let Some(configured) = configured {
+            for &index in configured {
+                if index < channels && used.insert(index) {
+                    order.push(index);
+                }
+            }
+        } else {
+            for index in self.default_output_channel_order(name, channels) {
+                if used.insert(index) {
+                    order.push(index);
+                }
+            }
+        }
+
+        // Be defensive with old or hand-edited settings: complete an incomplete
+        // mapping with every native channel not already assigned.
+        for index in 0..channels {
+            if used.insert(index) {
+                order.push(index);
+            }
+        }
+        order
+    }
+
+    /// Replace the logical output order for one device. The order is normalized
+    /// into a complete permutation before it is persisted.
+    pub fn set_output_channel_order_for_device(&mut self, device_name: &str, order: Vec<usize>) {
+        let channels = self.output_channels_for_device(Some(device_name));
+        let mut normalized = Vec::with_capacity(channels);
+        let mut used = std::collections::HashSet::new();
+        for index in order {
+            if index < channels && used.insert(index) {
+                normalized.push(index);
+            }
+        }
+        for index in 0..channels {
+            if used.insert(index) {
+                normalized.push(index);
+            }
+        }
+        self.output_channel_orders
+            .insert(self.output_device_config_key(device_name), normalized);
+    }
+
+    pub fn set_output_channel_orders(&mut self, orders: HashMap<String, Vec<usize>>) {
+        self.output_channel_orders = orders;
+    }
+
+    /// Raw name reported by ASIOGetChannelInfo, when the driver supplies one.
+    pub fn output_driver_channel_name(
+        &self,
+        device_name: Option<&str>,
+        channel_index: usize,
+    ) -> Option<String> {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        self.output_driver_channel_info
+            .get(name)
+            .and_then(|channels| {
+                channels
+                    .iter()
+                    .find(|channel| channel.index == channel_index)
+            })
+            .map(|channel| channel.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Human-readable label for a zero-based stream channel index. ASIO driver
+    /// names are preferred, while user aliases override them. The actual
+    /// zero-based stream index is always retained for routing.
     pub fn output_channel_label(&self, device_name: Option<&str>, channel_index: usize) -> String {
         let name = device_name.unwrap_or(self.current_device.as_str());
         let key = self.output_device_config_key(name);
-        self.output_channel_names
+        let order = self.output_channel_display_order(Some(name));
+        let logical_index = order
+            .iter()
+            .position(|&native_index| native_index == channel_index)
+            .unwrap_or(channel_index);
+
+        let alias = self
+            .output_channel_names
             .get(&key)
             .and_then(|labels| labels.get(channel_index))
             .map(|label| label.trim())
             .filter(|label| !label.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                if self.backend == AudioBackend::Asio {
-                    format!("ASIO Output {}", channel_index + 1)
-                } else {
-                    format!("Output {}", channel_index + 1)
-                }
-            })
+            .map(str::to_owned);
+
+        let driver_name = self.output_driver_channel_name(Some(name), channel_index);
+        let driver_name = driver_name.filter(|driver_name| {
+            let normalized = Self::normalize_device_name(driver_name);
+            let generic_output = normalized == format!("output{}", channel_index + 1)
+                || normalized == format!("asiooutput{}", channel_index + 1)
+                || normalized == format!("ch{}", channel_index + 1)
+                || normalized == format!("channel{}", channel_index + 1);
+            !generic_output
+        });
+
+        let normalized_device = Self::normalize_device_name(name);
+        let tascam_bus_name = if self.backend == AudioBackend::Asio
+            && (normalized_device.contains("us322") || normalized_device.contains("us366"))
+        {
+            match channel_index {
+                2 => Some("Computer 1/L"),
+                3 => Some("Computer 1/R"),
+                4 => Some("Computer 3/L"),
+                5 => Some("Computer 3/R"),
+                0 => Some("Computer 5/L"),
+                1 => Some("Computer 5/R"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let base = alias
+            .or(driver_name)
+            .or_else(|| tascam_bus_name.map(str::to_owned));
+
+        match (self.backend, base) {
+            (AudioBackend::Asio, Some(label)) => {
+                format!("{} · ASIO {}", label, channel_index + 1)
+            }
+            (AudioBackend::Asio, None) => format!(
+                "CueLabs Output {} · ASIO {}",
+                logical_index + 1,
+                channel_index + 1
+            ),
+            (_, Some(label)) => format!("{} · Ch. {}", label, channel_index + 1),
+            (_, None) => format!(
+                "CueLabs Output {} · Ch. {}",
+                logical_index + 1,
+                channel_index + 1
+            ),
+        }
+    }
+
+    pub fn detected_default_output_pair_for_device(
+        &self,
+        device_name: Option<&str>,
+    ) -> Option<[usize; 2]> {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        self.detected_default_output_pairs
+            .get(&self.output_device_config_key(name))
+            .copied()
     }
 
     pub fn output_channel_names_for_device(&self, device_name: Option<&str>) -> Vec<String> {
@@ -420,7 +742,14 @@ impl AudioEngine {
         self.default_output_pairs
             .get(&key)
             .copied()
-            .unwrap_or([0, 1])
+            .or_else(|| self.detected_default_output_pairs.get(&key).copied())
+            .unwrap_or_else(|| {
+                let order = self.output_channel_display_order(Some(name));
+                [
+                    order.first().copied().unwrap_or(0),
+                    order.get(1).copied().unwrap_or(1),
+                ]
+            })
     }
 
     pub fn set_default_output_pairs(&mut self, pairs: HashMap<String, [usize; 2]>) {
@@ -444,8 +773,17 @@ impl AudioEngine {
         }
     }
 
-    pub fn test_output_channel(&self, channel: usize) {
-        self.send(AudioCommand::TestOutput { channel });
+    pub fn test_output_channel(
+        &self,
+        device_name: &str,
+        logical_channel: usize,
+        native_channel: usize,
+    ) {
+        self.send(AudioCommand::TestOutput {
+            device_name: device_name.to_string(),
+            logical_channel,
+            channel: native_channel,
+        });
     }
 
     fn list_input_devices(host: &Host) -> Vec<String> {
@@ -520,12 +858,17 @@ struct DynamicFade {
 
 struct ActivePlayer {
     id: Uuid,
+    generation: u64,
     file: PathBuf,
     sink: rodio::Player,
     start_secs: f64,
     end_secs: f64,
     base_volume: f32,
     current_volume: f32,
+    volume_automation_enabled: bool,
+    volume_automation: Vec<[f64; 2]>,
+    automation_update_tx: Sender<VolumeAutomationUpdate>,
+    automation_update_rx: Receiver<VolumeAutomationUpdate>,
     fade_in_secs: f64,
     fade_out_secs: f64,
     fade_curve: FadeCurve,
@@ -561,6 +904,137 @@ fn db_to_linear(db: f32) -> f32 {
         0.0
     } else {
         10.0_f32.powf(db / 20.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VolumeAutomationUpdate {
+    enabled: bool,
+    points: Vec<[f64; 2]>,
+}
+
+/// Evaluate a piecewise-linear volume envelope. Points are [source_time_secs, gain].
+fn volume_automation_gain_at(position_secs: f64, points: &[[f64; 2]], enabled: bool) -> f32 {
+    if !enabled || points.is_empty() {
+        return 1.0;
+    }
+
+    let first = points[0];
+    if position_secs <= first[0] {
+        return first[1].clamp(0.0, 1.0) as f32;
+    }
+
+    for pair in points.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        if position_secs <= right[0] {
+            let span = right[0] - left[0];
+            if span <= f64::EPSILON {
+                return right[1].clamp(0.0, 1.0) as f32;
+            }
+            let t = ((position_secs - left[0]) / span).clamp(0.0, 1.0);
+            let gain = left[1] + (right[1] - left[1]) * t;
+            return gain.clamp(0.0, 1.0) as f32;
+        }
+    }
+
+    points
+        .last()
+        .map(|point| point[1].clamp(0.0, 1.0) as f32)
+        .unwrap_or(1.0)
+}
+
+/// Applies volume automation per audio frame (not on the 5 ms UI/control tick),
+/// so ramps remain smooth and stereo channels always receive the same gain.
+/// Live point edits arrive through a non-blocking channel and are adopted at
+/// the next frame boundary without restarting playback.
+struct VolumeAutomationSource<S> {
+    source: S,
+    start_secs: f64,
+    channels: u64,
+    sample_rate: f64,
+    sample_index: u64,
+    current_gain: f32,
+    enabled: bool,
+    points: Vec<[f64; 2]>,
+    updates: Receiver<VolumeAutomationUpdate>,
+}
+
+impl<S> VolumeAutomationSource<S>
+where
+    S: Source,
+{
+    fn new(
+        source: S,
+        start_secs: f64,
+        enabled: bool,
+        points: Vec<[f64; 2]>,
+        updates: Receiver<VolumeAutomationUpdate>,
+    ) -> Self {
+        let channels = source.channels().get().max(1) as u64;
+        let sample_rate = source.sample_rate().get().max(1) as f64;
+        Self {
+            source,
+            start_secs,
+            channels,
+            sample_rate,
+            sample_index: 0,
+            current_gain: 1.0,
+            enabled,
+            points,
+            updates,
+        }
+    }
+}
+
+impl<S> Iterator for VolumeAutomationSource<S>
+where
+    S: Source,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.source.next()?;
+        let channel_index = self.sample_index % self.channels;
+        let frame_index = self.sample_index / self.channels;
+        if channel_index == 0 {
+            while let Ok(update) = self.updates.try_recv() {
+                self.enabled = update.enabled;
+                self.points = update.points;
+            }
+            let position_secs = self.start_secs + frame_index as f64 / self.sample_rate;
+            self.current_gain =
+                volume_automation_gain_at(position_secs, &self.points, self.enabled);
+        }
+        self.sample_index = self.sample_index.wrapping_add(1);
+        Some(sample * self.current_gain)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.source.size_hint()
+    }
+}
+
+impl<S> Source for VolumeAutomationSource<S>
+where
+    S: Source,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        // Keep the source format stable across spans; this also avoids splitting
+        // multichannel frames at arbitrary sample boundaries in Rodio.
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
     }
 }
 
@@ -692,11 +1166,14 @@ where
     S: Source,
 {
     fn current_span_len(&self) -> Option<usize> {
-        self.source.current_span_len().map(|samples| {
-            (samples / self.input_channels)
-                .saturating_mul(self.output_channels)
-                .saturating_add(self.output_channels.saturating_sub(self.output_index))
-        })
+        // A cue keeps one fixed channel count and sample rate for its lifetime.
+        // Returning the decoder's transformed span length here lets Rodio's
+        // UniformSourceIterator split it at its internal 32,768-sample limit.
+        // That limit is not necessarily divisible by our output channel count
+        // (for 6 channels: 32,768 % 6 == 2), so the next converter span can
+        // restart in the middle of an interleaved frame and rotate channels.
+        // `None` means the format remains stable until this cue ends.
+        None
     }
 
     fn channels(&self) -> std::num::NonZeroU16 {
@@ -721,16 +1198,77 @@ fn open_sink_at(
     output_channels: usize,
     routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
+    automation_enabled: bool,
+    automation_points: Vec<[f64; 2]>,
+    automation_updates: Receiver<VolumeAutomationUpdate>,
 ) -> Option<rodio::Player> {
     let file = std::fs::File::open(file_path).ok()?;
     let player = rodio::Player::connect_new(mixer);
     let decoder = rodio::Decoder::try_from(file).ok()?;
     let source = decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)));
-    let routed = ChannelRouter::new(source, routes, output_settings, output_channels);
+    let automated = VolumeAutomationSource::new(
+        source,
+        offset_secs.max(0.0),
+        automation_enabled,
+        automation_points,
+        automation_updates,
+    );
+    let routed = ChannelRouter::new(automated, routes, output_settings, output_channels);
     player.set_volume(initial_vol);
     player.append(routed);
     player.play();
     Some(player)
+}
+
+/// Continuous multichannel test tone. `current_span_len = None` is deliberate:
+/// Rodio's UniformSourceIterator must not split a 6-channel source at an arbitrary
+/// sample count such as 32,768, because that count is not frame-aligned for 6ch.
+struct RawOutputTestTone {
+    output_channels: usize,
+    selected_channel: usize,
+    sample_rate: u32,
+    sample_index: u64,
+}
+
+impl Iterator for RawOutputTestTone {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let channels = self.output_channels.max(1) as u64;
+        let channel = (self.sample_index % channels) as usize;
+        let frame = self.sample_index / channels;
+        self.sample_index = self.sample_index.wrapping_add(1);
+
+        if channel != self.selected_channel {
+            return Some(0.0);
+        }
+
+        let phase = std::f32::consts::TAU * 440.0 * frame as f32 / self.sample_rate.max(1) as f32;
+        Some(phase.sin() * 0.12)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl Source for RawOutputTestTone {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::new(self.output_channels as u16)
+            .expect("test tone requires at least one output channel")
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(self.sample_rate).expect("test tone requires a valid sample rate")
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
 }
 
 struct DeviceOutput {
@@ -738,6 +1276,7 @@ struct DeviceOutput {
     _stream: rodio::MixerDeviceSink,
     mixer: rodio::mixer::Mixer,
     channels: usize,
+    sample_rate: u32,
     settings: Arc<RwLock<Vec<OutputChannelSetting>>>,
 }
 
@@ -784,6 +1323,7 @@ fn build_device_output(
         _stream: stream,
         mixer,
         channels,
+        sample_rate,
         settings,
     })
 }
@@ -818,6 +1358,7 @@ fn ensure_device_output(
 ) -> Option<(
     rodio::mixer::Mixer,
     usize,
+    u32,
     Arc<RwLock<Vec<OutputChannelSetting>>>,
 )> {
     if !streams.contains_key(device_name) {
@@ -831,6 +1372,7 @@ fn ensure_device_output(
     Some((
         output.mixer.clone(),
         output.channels,
+        output.sample_rate,
         output.settings.clone(),
     ))
 }
@@ -906,7 +1448,7 @@ fn audio_worker(
                         }
                     });
                     default_device_name = dev_name.clone();
-                    if let Some((_, channels, settings)) = ensure_device_output(
+                    if let Some((_, channels, _, settings)) = ensure_device_output(
                         &mut streams,
                         &dev_name,
                         &host,
@@ -942,11 +1484,12 @@ fn audio_worker(
             }
         }
 
-        let mut finished_ids = Vec::new();
+        let mut finished_ids: Vec<(Uuid, u64)> = Vec::new();
         for player in &mut players {
             if player.sink.is_paused() {
                 let _ = pos_tx.try_send(PositionUpdate {
                     id: player.id,
+                    generation: player.generation,
                     position_secs: player.current_pos(),
                     state: CueState::Paused,
                 });
@@ -971,13 +1514,16 @@ fn audio_worker(
                         player.output_channels,
                         player.channel_routes.clone(),
                         player.output_settings.clone(),
+                        player.volume_automation_enabled,
+                        player.volume_automation.clone(),
+                        player.automation_update_rx.clone(),
                     ) {
                         player.sink = new_sink;
                         player.segment_start_pos = player.loop_start;
                         player.segment_instant = Instant::now();
                         pos = player.loop_start;
                     } else {
-                        finished_ids.push(player.id);
+                        finished_ids.push((player.id, player.generation));
                         continue;
                     }
                 }
@@ -985,7 +1531,7 @@ fn audio_worker(
 
             if (player.end_secs > 0.0 && pos >= player.end_secs) || player.sink.empty() {
                 player.sink.stop();
-                finished_ids.push(player.id);
+                finished_ids.push((player.id, player.generation));
                 continue;
             }
 
@@ -1018,7 +1564,7 @@ fn audio_worker(
                     player.dynamic_fade = None;
                     if should_stop {
                         player.sink.stop();
-                        finished_ids.push(player.id);
+                        finished_ids.push((player.id, player.generation));
                         continue;
                     }
                 } else {
@@ -1034,6 +1580,7 @@ fn audio_worker(
                     };
                     let _ = pos_tx.try_send(PositionUpdate {
                         id: player.id,
+                        generation: player.generation,
                         position_secs: pos,
                         state,
                     });
@@ -1045,15 +1592,17 @@ fn audio_worker(
             player.sink.set_volume(player.current_volume);
             let _ = pos_tx.try_send(PositionUpdate {
                 id: player.id,
+                generation: player.generation,
                 position_secs: pos,
                 state,
             });
         }
 
-        for finished_id in finished_ids {
-            players.retain(|player| player.id != finished_id);
+        for (finished_id, generation) in finished_ids {
+            players.retain(|player| player.id != finished_id || player.generation != generation);
             let _ = pos_tx.try_send(PositionUpdate {
                 id: finished_id,
+                generation,
                 position_secs: 0.0,
                 state: CueState::Stopped,
             });
@@ -1085,12 +1634,15 @@ fn handle_command(
     match cmd {
         AudioCommand::Play {
             id,
+            generation,
             file,
             output_device,
             start_secs,
             end_secs,
             duration_secs,
             volume,
+            volume_automation_enabled,
+            mut volume_automation,
             fade_in_secs,
             fade_out_secs,
             fade_curve,
@@ -1102,6 +1654,12 @@ fn handle_command(
             loop_count,
         } => {
             let prepare_started = Instant::now();
+            volume_automation.retain(|point| point[0].is_finite() && point[1].is_finite());
+            volume_automation.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            for point in &mut volume_automation {
+                point[0] = point[0].clamp(0.0, duration_secs.max(0.01));
+                point[1] = point[1].clamp(0.0, 1.0);
+            }
             players.retain(|player| {
                 if player.id == id {
                     player.sink.stop();
@@ -1113,19 +1671,26 @@ fn handle_command(
 
             let uses_global_default = output_device.is_none();
             let device_name = output_device.unwrap_or_else(|| default_device_name.to_string());
-            let Some((mixer, output_channels, output_settings)) = ensure_device_output(
-                streams,
-                &device_name,
-                host,
-                default_device_name,
-                default_settings,
-            ) else {
+            let Some((mixer, output_channels, _sample_rate, output_settings)) =
+                ensure_device_output(
+                    streams,
+                    &device_name,
+                    host,
+                    default_device_name,
+                    default_settings,
+                )
+            else {
                 warn!("Cannot open output device '{}' for cue {}", device_name, id);
                 return;
             };
 
+            info!(
+                "CUE OUTPUT ROUTING: cue={}, device='{}', stream_channels={}, routes={:?}",
+                id, device_name, output_channels, channel_routes
+            );
             let initial_volume = if fade_in_secs > 0.0 { 0.0 } else { volume };
             let route_state = Arc::new(RwLock::new(channel_routes));
+            let (automation_update_tx, automation_update_rx) = unbounded();
             let Some(sink) = open_sink_at(
                 &mixer,
                 &file,
@@ -1134,6 +1699,9 @@ fn handle_command(
                 output_channels,
                 route_state.clone(),
                 output_settings.clone(),
+                volume_automation_enabled,
+                volume_automation.clone(),
+                automation_update_rx.clone(),
             ) else {
                 warn!("Cannot open audio file for playback: {:?}", file);
                 return;
@@ -1160,6 +1728,7 @@ fn handle_command(
 
             players.push(ActivePlayer {
                 id,
+                generation,
                 file,
                 sink,
                 start_secs,
@@ -1170,6 +1739,10 @@ fn handle_command(
                 },
                 base_volume: volume,
                 current_volume: initial_volume,
+                volume_automation_enabled,
+                volume_automation,
+                automation_update_tx,
+                automation_update_rx,
                 fade_in_secs,
                 fade_out_secs,
                 fade_curve,
@@ -1231,6 +1804,9 @@ fn handle_command(
                     player.output_channels,
                     player.channel_routes.clone(),
                     player.output_settings.clone(),
+                    player.volume_automation_enabled,
+                    player.volume_automation.clone(),
+                    player.automation_update_rx.clone(),
                 ) {
                     new_sink.pause();
                     player.sink = new_sink;
@@ -1279,6 +1855,21 @@ fn handle_command(
             }
         }
 
+        AudioCommand::SetVolumeAutomation {
+            id,
+            enabled,
+            points,
+        } => {
+            if let Some(player) = players.iter_mut().find(|player| player.id == id) {
+                player.volume_automation_enabled = enabled;
+                player.volume_automation = points.clone();
+                // The source consumes updates at audio-frame boundaries without blocking.
+                let _ = player
+                    .automation_update_tx
+                    .send(VolumeAutomationUpdate { enabled, points });
+            }
+        }
+
         AudioCommand::Fade {
             id,
             target_volume,
@@ -1306,51 +1897,68 @@ fn handle_command(
             }
         }
 
-        AudioCommand::TestOutput { channel } => {
+        AudioCommand::TestOutput {
+            device_name,
+            logical_channel,
+            channel,
+        } => {
             for (previous_test, _) in test_players.drain(..) {
                 previous_test.stop();
             }
 
-            let Some((mixer, output_channels, _)) = ensure_device_output(
+            // Use the exact device selected in Settings, not an implicitly captured
+            // global default. This matters when a cue or the UI selects a non-default
+            // ASIO endpoint.
+            let Some((mixer, output_channels, sample_rate, _)) = ensure_device_output(
                 streams,
-                default_device_name,
+                &device_name,
                 host,
                 default_device_name,
                 default_settings,
             ) else {
-                warn!("Could not open output device for channel test");
+                warn!(
+                    "Could not open output device '{}' for channel test",
+                    device_name
+                );
                 return;
             };
 
             if channel >= output_channels {
                 warn!(
-                    "Test output channel {} is outside the active {}-channel stream",
+                    "Test output channel {} is outside the active {}-channel stream for '{}'",
                     channel + 1,
-                    output_channels
+                    output_channels,
+                    device_name
                 );
                 return;
             }
 
-            // Test tones bypass the user's mute/gain controls so every physical
-            // route can be identified even if a channel is currently disabled.
-            let test_settings = Arc::new(RwLock::new(vec![
-                OutputChannelSetting::default();
-                output_channels
-            ]));
-            let routes = Arc::new(RwLock::new(vec![ChannelRoute {
-                active: true,
-                output_channel: channel,
-                gain_db: 0.0,
-            }]));
-            let source =
-                rodio::source::SineWave::new(440.0).take_duration(Duration::from_millis(650));
-            let routed = ChannelRouter::new(source, routes, test_settings, output_channels);
+            // IMPORTANT: use a continuous source instead of a finite SamplesBuffer.
+            // Rodio's Mixer wraps every source in UniformSourceIterator, which caps
+            // finite spans at 32,768 samples. For 6 channels that cap ends 2 samples
+            // into the next frame and can rotate the channel phase on the next span.
+            // This source reports a stable format until stopped by the test timer.
+            let source = RawOutputTestTone {
+                output_channels,
+                selected_channel: channel,
+                sample_rate,
+                sample_index: 0,
+            };
+
             let player = rodio::Player::connect_new(&mixer);
-            player.set_volume(0.12);
-            player.append(routed);
+            player.set_volume(1.0);
+            player.append(source);
             player.play();
-            test_players.push((player, Instant::now() + Duration::from_millis(750)));
-            info!("Testing audio stream output channel {}", channel + 1);
+            test_players.push((player, Instant::now() + Duration::from_millis(900)));
+            info!(
+                "OUTPUT TEST: device='{}', CueLabs logical output {} -> native CPAL/ASIO stream channel {} (zero-based index {}), stream={}ch @ {}Hz; ChannelRouter bypassed; continuous frame-aligned source",
+                device_name,
+                logical_channel + 1,
+                channel + 1,
+                channel,
+                output_channels,
+                sample_rate
+            );
         }
         AudioCommand::SetOutputDevice(_)
         | AudioCommand::SetInputDevice(_)
@@ -1362,6 +1970,219 @@ fn handle_command(
 mod channel_router_tests {
     use super::*;
     use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn volume_automation_interpolates_linearly_and_clamps_edges() {
+        let points = vec![[0.0, 1.0], [10.0, 0.25], [20.0, 0.75]];
+        assert!((volume_automation_gain_at(-1.0, &points, true) - 1.0).abs() < 0.0001);
+        assert!((volume_automation_gain_at(5.0, &points, true) - 0.625).abs() < 0.0001);
+        assert!((volume_automation_gain_at(15.0, &points, true) - 0.5).abs() < 0.0001);
+        assert!((volume_automation_gain_at(25.0, &points, true) - 0.75).abs() < 0.0001);
+        assert!((volume_automation_gain_at(5.0, &points, false) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn volume_automation_is_applied_per_stereo_frame() {
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU32::new(2).unwrap(),
+            vec![1.0_f32, 1.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        let (_tx, rx) = unbounded();
+        let mut automated =
+            VolumeAutomationSource::new(source, 0.0, true, vec![[0.0, 1.0], [1.0, 0.0]], rx);
+        let output = (0..6)
+            .map(|_| automated.next().expect("automation sample"))
+            .collect::<Vec<_>>();
+        assert_eq!(output, vec![1.0, 1.0, 0.5, 0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn volume_automation_updates_are_consumed_without_restarting_the_source() {
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU32::new(2).unwrap(),
+            vec![1.0_f32; 8],
+        );
+        let (tx, rx) = unbounded();
+        let mut automated = VolumeAutomationSource::new(source, 0.0, false, Vec::new(), rx);
+        assert_eq!(automated.next(), Some(1.0));
+        tx.send(VolumeAutomationUpdate {
+            enabled: true,
+            points: vec![[0.0, 0.0], [2.0, 0.0]],
+        })
+        .unwrap();
+        // The next frame boundary consumes the live update.
+        assert_eq!(automated.next(), Some(1.0));
+        assert_eq!(automated.next(), Some(0.0));
+        assert_eq!(automated.next(), Some(0.0));
+    }
+
+    #[test]
+    fn tascam_us366_logical_outputs_follow_computer_bus_order() {
+        let order =
+            AudioEngine::default_output_channel_order_for(AudioBackend::Asio, "US-322 / US-366", 6);
+        assert_eq!(order, vec![2, 3, 4, 5, 0, 1]);
+    }
+
+    #[test]
+    fn other_asio_devices_keep_native_channel_order_by_default() {
+        let order =
+            AudioEngine::default_output_channel_order_for(AudioBackend::Asio, "RME Fireface", 6);
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn wasapi_devices_keep_native_channel_order_by_default() {
+        let order = AudioEngine::default_output_channel_order_for(
+            AudioBackend::Wasapi,
+            "US-322 / US-366",
+            6,
+        );
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn raw_test_tone_keeps_selected_channel_stable_past_32768_samples() {
+        use rodio::source::UniformSourceIterator;
+
+        let source = RawOutputTestTone {
+            output_channels: 6,
+            selected_channel: 4,
+            sample_rate: 48_000,
+            sample_index: 0,
+        };
+        let mut uniform = UniformSourceIterator::new(
+            source,
+            std::num::NonZeroU16::new(6).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+        );
+
+        let mut selected_channel_had_signal = false;
+        // 7,000 frames = 42,000 samples, crossing Rodio's former 32,768-sample
+        // internal span boundary. The tone must remain on channel index 4.
+        for _ in 0..7_000 {
+            for channel in 0..6 {
+                let sample = uniform.next().expect("continuous test tone");
+                if channel == 4 {
+                    selected_channel_had_signal |= sample.abs() > 0.01;
+                } else {
+                    assert_eq!(sample, 0.0, "unexpected signal on channel {channel}");
+                }
+            }
+        }
+        assert!(selected_channel_had_signal);
+    }
+
+    #[test]
+    fn channel_router_keeps_six_channel_frame_alignment_across_rodio_spans() {
+        use rodio::source::UniformSourceIterator;
+
+        let routes = Arc::new(RwLock::new(vec![
+            ChannelRoute {
+                active: true,
+                output_channel: 4,
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                output_channel: 5,
+                gain_db: 0.0,
+            },
+        ]));
+        let output_settings = Arc::new(RwLock::new(vec![OutputChannelSetting::default(); 6]));
+        let input_samples = (0..8_000)
+            .flat_map(|_| [0.25_f32, 0.75_f32])
+            .collect::<Vec<_>>();
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(2).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            input_samples,
+        );
+        let router = ChannelRouter::new(source, routes, output_settings, 6);
+        let mut uniform = UniformSourceIterator::new(
+            router,
+            std::num::NonZeroU16::new(6).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+        );
+
+        // Cross the 32,768-sample boundary while checking that L/R remain on 5/6.
+        for _ in 0..6_000 {
+            let frame = (0..6)
+                .map(|_| uniform.next().expect("routed sample"))
+                .collect::<Vec<_>>();
+            assert_eq!(&frame[..4], &[0.0, 0.0, 0.0, 0.0]);
+            assert_eq!(frame[4], 0.25);
+            assert_eq!(frame[5], 0.75);
+        }
+    }
+
+    #[test]
+    fn detects_tascam_physical_stereo_pair_from_driver_channel_names() {
+        let channels = vec![
+            OutputChannelInfo {
+                index: 0,
+                name: "Output 1".to_string(),
+                group: "0".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 1,
+                name: "Output 2".to_string(),
+                group: "0".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 2,
+                name: "Output 3".to_string(),
+                group: "1".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 3,
+                name: "Output 4".to_string(),
+                group: "1".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 4,
+                name: "LINE OUT 1/L".to_string(),
+                group: "2".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 5,
+                name: "LINE OUT 2/R".to_string(),
+                group: "2".to_string(),
+                active: false,
+            },
+        ];
+
+        assert_eq!(
+            AudioEngine::detect_default_stereo_pair(&channels),
+            Some([4, 5])
+        );
+    }
+
+    #[test]
+    fn does_not_guess_a_physical_pair_from_generic_asio_names() {
+        let channels = vec![
+            OutputChannelInfo {
+                index: 0,
+                name: "Output 1".to_string(),
+                group: "0".to_string(),
+                active: false,
+            },
+            OutputChannelInfo {
+                index: 1,
+                name: "Output 2".to_string(),
+                group: "0".to_string(),
+                active: false,
+            },
+        ];
+
+        assert_eq!(AudioEngine::detect_default_stereo_pair(&channels), None);
+    }
 
     #[test]
     fn track_routes_map_source_channels_to_selected_hardware_outputs() {
