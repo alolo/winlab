@@ -4,7 +4,7 @@ use crate::audio::device_registry::{
     AudioEndpoint, DeviceAvailability, DeviceRegistry, DeviceScanResult,
 };
 use crate::audio::OutputChannelInfo;
-use crate::config::AudioBackend;
+use crate::config::{AudioBackend, AudioPerformanceSettings};
 use crate::cue::{ChannelRoute, CueState, FadeCurve, OutputChannelSetting, TimePitchSettings};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -88,6 +88,11 @@ pub enum AudioCommand {
     },
     SetOutputDevice {
         device_name: String,
+        performance: AudioPerformanceSettings,
+        reply: Sender<Result<(usize, u32), String>>,
+    },
+    ReconfigureOutput {
+        performance: AudioPerformanceSettings,
         reply: Sender<Result<(usize, u32), String>>,
     },
     SetInputDevice(String),
@@ -160,16 +165,92 @@ fn supported_output_channel_layouts(device: &Device) -> Vec<usize> {
     layouts
 }
 
-fn preferred_output_config(device: &Device) -> Option<cpal::SupportedStreamConfig> {
-    // Select the configuration with the greatest number of channels first;
-    // prefer F32 only when two configurations expose the same channel count.
-    let config = device
-        .supported_output_configs()
-        .ok()?
+const COMMON_SAMPLE_RATES: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+const COMMON_BUFFER_SIZES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
+
+fn supported_output_sample_rates(device: &Device) -> Vec<u32> {
+    let Ok(configs) = device.supported_output_configs() else {
+        return device
+            .default_output_config()
+            .ok()
+            .map(|config| vec![config.sample_rate()])
+            .unwrap_or_default();
+    };
+    let configs: Vec<_> = configs.collect();
+    let Some(max_channels) = configs.iter().map(|config| config.channels()).max() else {
+        return Vec::new();
+    };
+
+    let mut rates = Vec::new();
+    for config in configs
+        .iter()
+        .filter(|config| config.channels() == max_channels)
+    {
+        for rate in COMMON_SAMPLE_RATES {
+            if config.contains_rate(*rate) && !rates.contains(rate) {
+                rates.push(*rate);
+            }
+        }
+    }
+    if let Ok(default_config) = device.default_output_config() {
+        let rate = default_config.sample_rate();
+        if default_config.channels() == max_channels && !rates.contains(&rate) {
+            rates.push(rate);
+        }
+    }
+    rates.sort_unstable();
+    rates
+}
+
+fn supported_output_buffer_sizes(device: &Device) -> Vec<u32> {
+    let Ok(configs) = device.supported_output_configs() else {
+        return COMMON_BUFFER_SIZES.to_vec();
+    };
+    let configs: Vec<_> = configs.collect();
+    let Some(max_channels) = configs.iter().map(|config| config.channels()).max() else {
+        return COMMON_BUFFER_SIZES.to_vec();
+    };
+
+    let mut sizes = Vec::new();
+    let mut unknown_range = false;
+    for config in configs
+        .iter()
+        .filter(|config| config.channels() == max_channels)
+    {
+        match config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                for size in COMMON_BUFFER_SIZES {
+                    if *size >= *min && *size <= *max && !sizes.contains(size) {
+                        sizes.push(*size);
+                    }
+                }
+            }
+            cpal::SupportedBufferSize::Unknown => unknown_range = true,
+        }
+    }
+    if unknown_range || sizes.is_empty() {
+        sizes = COMMON_BUFFER_SIZES.to_vec();
+    }
+    sizes.sort_unstable();
+    sizes
+}
+
+fn preferred_output_config(
+    device: &Device,
+    requested_sample_rate: Option<u32>,
+) -> Option<cpal::SupportedStreamConfig> {
+    let configs: Vec<_> = device.supported_output_configs().ok()?.collect();
+    let max_channels = configs.iter().map(|config| config.channels()).max()?;
+    let config = configs
+        .into_iter()
+        .filter(|config| config.channels() == max_channels)
+        .filter(|config| requested_sample_rate.map_or(true, |rate| config.contains_rate(rate)))
         .max_by_key(|config| {
             let min_rate = config.min_sample_rate();
             let max_rate = config.max_sample_rate();
-            let rate_priority = if min_rate <= 48_000 && max_rate >= 48_000 {
+            let rate_priority = if requested_sample_rate.is_some() {
+                4_u8
+            } else if min_rate <= 48_000 && max_rate >= 48_000 {
                 3_u8
             } else if min_rate <= 44_100 && max_rate >= 44_100 {
                 2_u8
@@ -184,15 +265,18 @@ fn preferred_output_config(device: &Device) -> Option<cpal::SupportedStreamConfi
                 (config.sample_format() == cpal::SampleFormat::F32) as u8,
             )
         })?;
-    let min_rate = config.min_sample_rate();
-    let max_rate = config.max_sample_rate();
-    let sample_rate = if min_rate <= 48_000 && max_rate >= 48_000 {
-        48_000
-    } else if min_rate <= 44_100 && max_rate >= 44_100 {
-        44_100
-    } else {
-        max_rate
-    };
+
+    let sample_rate = requested_sample_rate.unwrap_or_else(|| {
+        let min_rate = config.min_sample_rate();
+        let max_rate = config.max_sample_rate();
+        if min_rate <= 48_000 && max_rate >= 48_000 {
+            48_000
+        } else if min_rate <= 44_100 && max_rate >= 44_100 {
+            44_100
+        } else {
+            max_rate
+        }
+    });
     Some(config.with_sample_rate(sample_rate))
 }
 
@@ -209,6 +293,10 @@ pub struct AudioEngine {
     pub current_device_id: String,
     pub current_input_device: String,
     pub output_channels: usize,
+    pub current_sample_rate: u32,
+    pub performance_settings: AudioPerformanceSettings,
+    pub supported_sample_rates: Vec<u32>,
+    pub supported_buffer_sizes: Vec<u32>,
     output_device_channels: HashMap<String, usize>,
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
     /// Per-device output mute/trim settings shared with the audio worker.
@@ -250,24 +338,36 @@ impl AudioEngine {
         selected_device_id: Option<&str>,
         selected_device: Option<&str>,
     ) -> Result<Self> {
+        Self::new_with_backend_and_endpoint_and_performance(
+            backend,
+            selected_device_id,
+            selected_device,
+            AudioPerformanceSettings::default(),
+        )
+    }
+
+    pub fn new_with_backend_and_endpoint_and_performance(
+        backend: AudioBackend,
+        selected_device_id: Option<&str>,
+        selected_device: Option<&str>,
+        performance: AudioPerformanceSettings,
+    ) -> Result<Self> {
         let device_registry = DeviceRegistry::from_scan(Self::scan_output_endpoints());
-        Self::new_with_backend_and_endpoint_using_registry(
+        Self::new_with_backend_and_endpoint_using_registry_and_performance(
             backend,
             selected_device_id,
             selected_device,
             device_registry,
+            performance,
         )
     }
 
-    /// Switch the active backend using the already-populated cross-backend
-    /// registry. This avoids probing ASIO again while the previous ASIO stream
-    /// is still open and preserves endpoints when a backend scan is transiently
-    /// unavailable during the switch.
-    pub fn new_with_backend_and_endpoint_using_registry(
+    pub fn new_with_backend_and_endpoint_using_registry_and_performance(
         backend: AudioBackend,
         selected_device_id: Option<&str>,
         selected_device: Option<&str>,
         mut device_registry: DeviceRegistry,
+        performance: AudioPerformanceSettings,
     ) -> Result<Self> {
         if backend == AudioBackend::DirectSound {
             #[cfg(target_os = "windows")]
@@ -277,7 +377,7 @@ impl AudioEngine {
                     .filter(|endpoint| endpoint.backend == AudioBackend::DirectSound)
                     .map(|endpoint| endpoint.device_name.clone())
                     .or_else(|| selected_device.map(str::to_string));
-                let mut engine = Self::new_directsound(selected_directsound_name)?;
+                let mut engine = Self::new_directsound(selected_directsound_name, performance)?;
                 engine.device_registry = device_registry;
                 for device_name in &engine.output_devices {
                     let channels = engine
@@ -428,11 +528,27 @@ impl AudioEngine {
             input_devices
         );
 
-        let output_config = preferred_output_config(&out_dev)
-            .or_else(|| out_dev.default_output_config().ok())
+        let output_config = preferred_output_config(&out_dev, performance.sample_rate)
+            .or_else(|| {
+                out_dev.default_output_config().ok().filter(|config| {
+                    performance
+                        .sample_rate
+                        .map_or(true, |rate| config.sample_rate() == rate)
+                })
+            })
             .ok_or_else(|| {
-                anyhow::anyhow!("No supported output configuration found for {}", out_name)
+                if let Some(rate) = performance.sample_rate {
+                    anyhow::anyhow!(
+                        "{} does not expose a supported output configuration at {} Hz",
+                        out_name,
+                        rate
+                    )
+                } else {
+                    anyhow::anyhow!("No supported output configuration found for {}", out_name)
+                }
             })?;
+        let supported_sample_rates = supported_output_sample_rates(&out_dev);
+        let supported_buffer_sizes = supported_output_buffer_sizes(&out_dev);
         let preferred_output_channels = output_config.channels() as usize;
         info!(
             "Selected output configuration for '{}': {} channels @ {} Hz, {:?}",
@@ -474,11 +590,12 @@ impl AudioEngine {
                 cmd_rx,
                 pos_tx,
                 worker_output_settings,
+                performance,
                 ready_tx,
             );
         });
 
-        let (output_channels, _actual_sample_rate) = ready_rx
+        let (output_channels, actual_sample_rate) = ready_rx
             .recv_timeout(Duration::from_secs(15))
             .map_err(|error| {
                 anyhow::anyhow!("Audio output initialization did not respond: {error}")
@@ -521,6 +638,10 @@ impl AudioEngine {
             current_device_id: out_id,
             current_input_device: in_name,
             output_channels,
+            current_sample_rate: actual_sample_rate,
+            performance_settings: performance,
+            supported_sample_rates,
+            supported_buffer_sizes,
             output_device_channels,
             output_device_channel_layouts,
             output_settings_by_device,
@@ -533,7 +654,10 @@ impl AudioEngine {
     }
 
     #[cfg(target_os = "windows")]
-    fn new_directsound(selected_device: Option<String>) -> Result<Self> {
+    fn new_directsound(
+        selected_device: Option<String>,
+        performance: AudioPerformanceSettings,
+    ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = bounded::<AudioCommand>(256);
         let (pos_tx, pos_rx) = bounded::<PositionUpdate>(1024);
         let output_settings_by_device = Arc::new(RwLock::new(HashMap::new()));
@@ -546,6 +670,7 @@ impl AudioEngine {
                 cmd_rx,
                 pos_tx,
                 worker_output_settings,
+                performance,
                 ready_tx,
             );
         });
@@ -584,6 +709,17 @@ impl AudioEngine {
             current_device: ready.current_device,
             current_input_device: "Default Input".to_string(),
             output_channels: ready.output_channels,
+            current_sample_rate: ready.sample_rate,
+            performance_settings: performance,
+            supported_sample_rates: {
+                let mut rates = COMMON_SAMPLE_RATES.to_vec();
+                if !rates.contains(&ready.sample_rate) {
+                    rates.push(ready.sample_rate);
+                    rates.sort_unstable();
+                }
+                rates
+            },
+            supported_buffer_sizes: vec![1_024, 2_048, 4_096, 8_192, 16_384],
             output_device_channels: ready.output_device_channels,
             output_device_channel_layouts: ready.output_device_channel_layouts,
             output_settings_by_device,
@@ -899,6 +1035,8 @@ impl AudioEngine {
             return;
         };
         let layouts = supported_output_channel_layouts(&device);
+        self.supported_sample_rates = supported_output_sample_rates(&device);
+        self.supported_buffer_sizes = supported_output_buffer_sizes(&device);
         let channels = layouts
             .last()
             .copied()
@@ -1307,7 +1445,41 @@ impl AudioEngine {
             .cloned()
     }
 
-    pub fn set_output_endpoint(&mut self, endpoint_id: &str, name: &str) -> Result<()> {
+    /// Rebuild the active stream in its existing worker. This is required for
+    /// ASIO because opening a replacement stream while the old driver stream is
+    /// still alive can fail with a device-busy error.
+    pub fn reconfigure_output(&mut self, performance: AudioPerformanceSettings) -> Result<()> {
+        let (reply_tx, reply_rx) = bounded::<Result<(usize, u32), String>>(1);
+        self.cmd_tx
+            .send(AudioCommand::ReconfigureOutput {
+                performance,
+                reply: reply_tx,
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("Could not send audio performance reconfiguration: {error}")
+            })?;
+
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(20))
+            .map_err(|error| {
+                anyhow::anyhow!("Audio worker did not confirm performance reconfiguration: {error}")
+            })?
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+        self.output_channels = result.0.max(1);
+        self.current_sample_rate = result.1;
+        self.performance_settings = performance;
+        self.output_device_channels
+            .insert(self.current_device.clone(), self.output_channels);
+        Ok(())
+    }
+
+    pub fn set_output_endpoint(
+        &mut self,
+        endpoint_id: &str,
+        name: &str,
+        performance: AudioPerformanceSettings,
+    ) -> Result<()> {
         let resolved_name = self
             .device_registry
             .find_available_by_id(endpoint_id)
@@ -1325,22 +1497,33 @@ impl AudioEngine {
         self.cmd_tx
             .send(AudioCommand::SetOutputDevice {
                 device_name: resolved_name.clone(),
+                performance,
                 reply: reply_tx,
             })
             .map_err(|error| {
                 anyhow::anyhow!("Could not send output-device switch command: {error}")
             })?;
 
-        let (channels, _sample_rate) = reply_rx
+        let switch_result = reply_rx
             .recv_timeout(Duration::from_secs(15))
             .map_err(|error| {
                 anyhow::anyhow!("Audio worker did not confirm output-device switch: {error}")
-            })?
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            })
+            .and_then(|result| result.map_err(|error| anyhow::anyhow!("{error}")));
+        let (channels, _sample_rate) = match switch_result {
+            Ok(result) => result,
+            Err(error) => {
+                let previous_device = self.current_device.clone();
+                self.refresh_output_device_info(&previous_device);
+                return Err(error);
+            }
+        };
 
         self.current_device = resolved_name.clone();
         self.current_device_id = endpoint_id.to_string();
         self.output_channels = channels.max(1);
+        self.current_sample_rate = _sample_rate;
+        self.performance_settings = performance;
         self.output_device_channels
             .insert(resolved_name.clone(), self.output_channels);
         let layouts = self
@@ -2448,9 +2631,7 @@ impl Source for RawOutputTestTone {
 
 const DIRECTSOUND_DEFAULT_DEVICE: &str = "System Default (DirectSound)";
 #[cfg(target_os = "windows")]
-const DIRECTSOUND_QUEUE_TARGET_FRAMES: usize = 2_048;
-#[cfg(target_os = "windows")]
-const DIRECTSOUND_QUEUE_LOW_WATERMARK_FRAMES: usize = 1_024;
+const DIRECTSOUND_DEFAULT_QUEUE_FRAMES: usize = 4_096;
 
 #[allow(dead_code)]
 enum OutputStreamHandle {
@@ -2477,6 +2658,7 @@ struct DirectSoundQueue {
     device_id: sdl2::sys::SDL_AudioDeviceID,
     channels: usize,
     sample_rate: u32,
+    target_queue_frames: usize,
 }
 
 #[cfg(target_os = "windows")]
@@ -2485,6 +2667,7 @@ impl DirectSoundQueue {
         device_name: Option<&str>,
         channels: u8,
         sample_rate: u32,
+        target_queue_frames: usize,
     ) -> std::result::Result<Self, String> {
         let device_name = device_name
             .map(CString::new)
@@ -2500,7 +2683,7 @@ impl DirectSoundQueue {
             format: desired_format,
             channels,
             silence: 0,
-            samples: 1024,
+            samples: target_queue_frames.clamp(256, u16::MAX as usize) as u16,
             padding: 0,
             size: 0,
             callback: None,
@@ -2546,6 +2729,7 @@ impl DirectSoundQueue {
             device_id,
             channels: obtained.channels as usize,
             sample_rate: obtained.freq as u32,
+            target_queue_frames: target_queue_frames.max(256),
         })
     }
 
@@ -2603,6 +2787,7 @@ struct DirectSoundInitInfo {
     output_devices: Vec<String>,
     current_device: String,
     output_channels: usize,
+    sample_rate: u32,
     output_device_channels: HashMap<String, usize>,
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
 }
@@ -2613,6 +2798,7 @@ struct DeviceOutput {
     mixer: rodio::mixer::Mixer,
     channels: usize,
     sample_rate: u32,
+    performance: AudioPerformanceSettings,
     settings: SharedOutputSettings,
     #[cfg(target_os = "windows")]
     directsound_source: Option<rodio::mixer::MixerSource>,
@@ -2646,8 +2832,31 @@ fn shared_output_settings(
 fn output_config_candidates(
     device: &Device,
     preferred: cpal::SupportedStreamConfig,
+    requested_sample_rate: Option<u32>,
 ) -> Vec<cpal::SupportedStreamConfig> {
     let mut candidates = vec![preferred];
+
+    if let Some(rate) = requested_sample_rate {
+        if let Ok(ranges) = device.supported_output_configs() {
+            for range in ranges {
+                if range.channels() == preferred.channels() && range.contains_rate(rate) {
+                    let candidate = range.with_sample_rate(rate);
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        candidates.retain(|config| config.sample_rate() == rate);
+        candidates.sort_by_key(|config| {
+            std::cmp::Reverse((
+                config.channels(),
+                (config.sample_format() == cpal::SampleFormat::F32) as u8,
+            ))
+        });
+        candidates.truncate(48);
+        return candidates;
+    }
 
     if let Ok(ranges) = device.supported_output_configs() {
         for range in ranges {
@@ -2706,8 +2915,9 @@ fn build_device_output(
     preferred_config: cpal::SupportedStreamConfig,
     device_name: &str,
     settings_by_device: &OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
-    let candidates = output_config_candidates(device, preferred_config);
+    let candidates = output_config_candidates(device, preferred_config, performance.sample_rate);
     let mut failures = Vec::new();
 
     for config in candidates {
@@ -2715,14 +2925,18 @@ fn build_device_output(
         let sample_rate = config.sample_rate();
         let sample_format = config.sample_format();
 
+        let requested_buffer = performance
+            .buffer_size_frames
+            .map_or(cpal::BufferSize::Default, cpal::BufferSize::Fixed);
         debug!(
-            "Trying output '{}' with {} channels @ {} Hz ({:?})",
-            device_name, channels, sample_rate, sample_format
+            "Trying output '{}' with {} channels @ {} Hz ({:?}), buffer={:?}",
+            device_name, channels, sample_rate, sample_format, requested_buffer
         );
 
         let mut stream = match rodio::DeviceSinkBuilder::default()
             .with_device(device.clone())
             .with_supported_config(&config)
+            .with_buffer_size(requested_buffer)
             .open_stream()
         {
             Ok(stream) => stream,
@@ -2736,8 +2950,8 @@ fn build_device_output(
         };
 
         info!(
-            "Audio output stream opened successfully: '{}' ({} channels @ {} Hz, {:?})",
-            device_name, channels, sample_rate, sample_format
+            "Audio output stream opened successfully: '{}' ({} channels @ {} Hz, {:?}, requested buffer={:?})",
+            device_name, channels, sample_rate, sample_format, requested_buffer
         );
         stream.log_on_drop(false);
         let mixer = stream.mixer().clone();
@@ -2747,6 +2961,7 @@ fn build_device_output(
             mixer,
             channels,
             sample_rate,
+            performance,
             settings,
             #[cfg(target_os = "windows")]
             directsound_source: None,
@@ -2821,6 +3036,7 @@ fn build_directsound_device_output(
     audio: &sdl2::AudioSubsystem,
     device_name: &str,
     settings_by_device: &OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
     use std::num::{NonZeroU16, NonZeroU32};
 
@@ -2828,8 +3044,18 @@ fn build_directsound_device_output(
     let channels_u8 = u8::try_from(channels).ok().filter(|value| *value > 0)?;
     let selected_device = (device_name != DIRECTSOUND_DEFAULT_DEVICE).then_some(device_name);
 
+    let queue_target_frames = performance
+        .buffer_size_frames
+        .map(|frames| frames as usize)
+        .unwrap_or(DIRECTSOUND_DEFAULT_QUEUE_FRAMES)
+        .clamp(512, 32_768);
     let mut rates = Vec::new();
-    for rate in [preferred_rate, 48_000, 44_100, 96_000] {
+    let requested_rates: Vec<u32> = if let Some(rate) = performance.sample_rate {
+        vec![rate]
+    } else {
+        vec![preferred_rate, 48_000, 44_100, 96_000]
+    };
+    for rate in requested_rates {
         if !rates.contains(&rate) {
             rates.push(rate);
         }
@@ -2837,7 +3063,12 @@ fn build_directsound_device_output(
 
     let mut last_error = None;
     for sample_rate in rates {
-        let queue = match DirectSoundQueue::open(selected_device, channels_u8, sample_rate) {
+        let queue = match DirectSoundQueue::open(
+            selected_device,
+            channels_u8,
+            sample_rate,
+            queue_target_frames,
+        ) {
             Ok(queue) => queue,
             Err(error) => {
                 debug!(
@@ -2864,7 +3095,7 @@ fn build_directsound_device_output(
         let (mixer, source) = rodio::mixer::mixer(mixer_channels, mixer_rate);
 
         // Prime the queue with silence before resuming playback.
-        let initial_silence = vec![0.0_f32; actual_channels * DIRECTSOUND_QUEUE_TARGET_FRAMES];
+        let initial_silence = vec![0.0_f32; actual_channels * queue.target_queue_frames];
         if let Err(error) = queue.queue_audio(&initial_silence) {
             debug!(
                 "Could not prime DirectSound queue for '{}': {}",
@@ -2876,8 +3107,12 @@ fn build_directsound_device_output(
 
         queue.resume();
         info!(
-            "DirectSound output opened: '{}' ({} channels @ {} Hz; float32 queue; SDL driver: directsound)",
-            device_name, actual_channels, actual_sample_rate
+            "DirectSound output opened: '{}' ({} channels @ {} Hz; queue={} frames / {:.1} ms; float32; SDL driver: directsound)",
+            device_name,
+            actual_channels,
+            actual_sample_rate,
+            queue.target_queue_frames,
+            queue.target_queue_frames as f64 * 1_000.0 / actual_sample_rate as f64
         );
 
         let settings = shared_output_settings(settings_by_device, device_name, actual_channels);
@@ -2886,6 +3121,7 @@ fn build_directsound_device_output(
             mixer,
             channels: actual_channels,
             sample_rate: actual_sample_rate,
+            performance,
             settings,
             directsound_source: Some(source),
         });
@@ -2903,6 +3139,7 @@ fn open_device_output(
     device_name: &str,
     context: &AudioOutputContext,
     settings_by_device: &OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
     match context {
         AudioOutputContext::Cpal(host) => {
@@ -2911,12 +3148,24 @@ fn open_device_output(
                 .into_iter()
                 .find(|device| device.to_string() == device_name)?;
             let config =
-                preferred_output_config(&device).or_else(|| device.default_output_config().ok())?;
-            build_device_output(&device, config, device_name, settings_by_device)
+                preferred_output_config(&device, performance.sample_rate).or_else(|| {
+                    device.default_output_config().ok().filter(|config| {
+                        performance
+                            .sample_rate
+                            .map_or(true, |rate| config.sample_rate() == rate)
+                    })
+                })?;
+            build_device_output(
+                &device,
+                config,
+                device_name,
+                settings_by_device,
+                performance,
+            )
         }
         #[cfg(target_os = "windows")]
         AudioOutputContext::DirectSound { audio, .. } => {
-            build_directsound_device_output(audio, device_name, settings_by_device)
+            build_directsound_device_output(audio, device_name, settings_by_device, performance)
         }
     }
 }
@@ -2933,11 +3182,12 @@ fn pump_directsound_queues(streams: &mut HashMap<String, DeviceOutput>) {
         let channels = output.channels.max(1);
         let bytes_per_frame = channels * std::mem::size_of::<f32>();
         let queued_frames = queue.queued_bytes() as usize / bytes_per_frame;
-        if queued_frames >= DIRECTSOUND_QUEUE_LOW_WATERMARK_FRAMES {
+        let low_watermark = (queue.target_queue_frames / 2).max(1);
+        if queued_frames >= low_watermark {
             continue;
         }
 
-        let frames_to_queue = DIRECTSOUND_QUEUE_TARGET_FRAMES.saturating_sub(queued_frames);
+        let frames_to_queue = queue.target_queue_frames.saturating_sub(queued_frames);
         if frames_to_queue == 0 {
             continue;
         }
@@ -2962,9 +3212,22 @@ fn ensure_device_output(
     device_name: &str,
     context: &AudioOutputContext,
     settings_by_device: &OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
 ) -> Option<(rodio::mixer::Mixer, usize, u32, SharedOutputSettings)> {
+    let needs_reopen = streams
+        .get(device_name)
+        .is_some_and(|output| output.performance != performance);
+    if needs_reopen {
+        warn!(
+            "Reopening output '{}' because its performance settings changed: {:?} -> {:?}",
+            device_name,
+            streams.get(device_name).map(|output| output.performance),
+            performance
+        );
+        streams.remove(device_name);
+    }
     if !streams.contains_key(device_name) {
-        let output = open_device_output(device_name, context, settings_by_device)?;
+        let output = open_device_output(device_name, context, settings_by_device, performance)?;
         streams.insert(device_name.to_string(), output);
     }
     let output = streams.get_mut(device_name)?;
@@ -2985,6 +3248,7 @@ fn audio_worker(
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
     ready_tx: Sender<Result<(usize, u32), String>>,
 ) {
     let host = match host_for_backend(backend) {
@@ -3008,6 +3272,7 @@ fn audio_worker(
         initial_config,
         &initial_device_name,
         &output_settings_by_device,
+        performance,
     ) else {
         error!(
             "Could not open initial {} audio output stream",
@@ -3030,6 +3295,7 @@ fn audio_worker(
         cmd_rx,
         pos_tx,
         output_settings_by_device,
+        performance,
     );
 }
 
@@ -3039,6 +3305,7 @@ fn audio_worker_directsound(
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
     ready_tx: Sender<Result<DirectSoundInitInfo, String>>,
 ) {
     let initialization = (|| -> anyhow::Result<_> {
@@ -3082,9 +3349,20 @@ fn audio_worker_directsound(
                 })?,
             None => DIRECTSOUND_DEFAULT_DEVICE.to_string(),
         };
-        let initial_output =
-            build_directsound_device_output(&audio, &current_device, &output_settings_by_device)
-                .ok_or_else(|| anyhow::anyhow!("Could not open the default DirectSound output"))?;
+        let initial_output = build_directsound_device_output(
+            &audio,
+            &current_device,
+            &output_settings_by_device,
+            performance,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not open DirectSound output '{}' using sample rate {:?} and buffer {:?}",
+                current_device,
+                performance.sample_rate,
+                performance.buffer_size_frames
+            )
+        })?;
 
         let mut output_device_channels = HashMap::new();
         let mut output_device_channel_layouts = HashMap::new();
@@ -3098,6 +3376,7 @@ fn audio_worker_directsound(
             output_devices,
             current_device: current_device.clone(),
             output_channels: initial_output.channels,
+            sample_rate: initial_output.sample_rate,
             output_device_channels,
             output_device_channel_layouts,
         };
@@ -3117,6 +3396,7 @@ fn audio_worker_directsound(
                 cmd_rx,
                 pos_tx,
                 output_settings_by_device,
+                performance,
             );
         }
         Err(error) => {
@@ -3134,6 +3414,7 @@ fn audio_worker_loop(
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    mut performance: AudioPerformanceSettings,
 ) {
     let mut streams = HashMap::new();
     streams.insert(initial_device_name.clone(), initial_output);
@@ -3153,8 +3434,80 @@ fn audio_worker_loop(
                     test_generation.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                AudioCommand::ReconfigureOutput {
+                    performance: requested_performance,
+                    reply,
+                } => {
+                    let previous_performance = performance;
+                    test_generation.fetch_add(1, Ordering::Relaxed);
+                    for player in &players {
+                        let _ = pos_tx.try_send(PositionUpdate {
+                            id: player.id,
+                            generation: player.generation,
+                            position_secs: player.current_pos(),
+                            state: CueState::Stopped,
+                        });
+                        player.sink.stop();
+                    }
+                    players.clear();
+                    // Drop the current native stream before reopening the same
+                    // endpoint. ASIO drivers commonly allow only one stream owner.
+                    streams.clear();
+
+                    if let Some((_, channels, sample_rate, settings)) = ensure_device_output(
+                        &mut streams,
+                        &default_device_name,
+                        &context,
+                        &output_settings_by_device,
+                        requested_performance,
+                    ) {
+                        let mut current = settings.write();
+                        current.resize(channels, OutputChannelSetting::default());
+                        current.truncate(channels);
+                        performance = requested_performance;
+                        info!(
+                            "Reconfigured active output '{}': {} channels @ {} Hz, performance={:?}",
+                            default_device_name,
+                            channels,
+                            sample_rate,
+                            performance
+                        );
+                        let _ = reply.send(Ok((channels, sample_rate)));
+                    } else {
+                        streams.clear();
+                        let restored = ensure_device_output(
+                            &mut streams,
+                            &default_device_name,
+                            &context,
+                            &output_settings_by_device,
+                            previous_performance,
+                        );
+                        if restored.is_some() {
+                            warn!(
+                                "Could not apply performance settings {:?} to '{}'; previous settings {:?} were restored",
+                                requested_performance,
+                                default_device_name,
+                                previous_performance
+                            );
+                        } else {
+                            error!(
+                                "Could not apply performance settings {:?} to '{}' and could not restore previous settings {:?}",
+                                requested_performance,
+                                default_device_name,
+                                previous_performance
+                            );
+                        }
+                        let _ = reply.send(Err(format!(
+                            "Could not apply audio performance settings {:?} to '{}'. Previous settings {}.",
+                            requested_performance,
+                            default_device_name,
+                            if restored.is_some() { "were restored" } else { "could not be restored" }
+                        )));
+                    }
+                }
                 AudioCommand::SetOutputDevice {
                     device_name: dev_name,
+                    performance: requested_performance,
                     reply,
                 } => {
                     let previous_default_device = default_device_name.clone();
@@ -3207,16 +3560,19 @@ fn audio_worker_loop(
                         &dev_name,
                         &context,
                         &output_settings_by_device,
+                        requested_performance,
                     ) {
                         let mut current = settings.write();
                         current.resize(channels, OutputChannelSetting::default());
                         current.truncate(channels);
+                        performance = requested_performance;
                         info!(
-                            "Switched global output device to: {} — {} ({} channels @ {} Hz)",
+                            "Switched global output device to: {} — {} ({} channels @ {} Hz; performance={:?})",
                             backend.short_label(),
                             dev_name,
                             channels,
-                            sample_rate
+                            sample_rate,
+                            performance
                         );
                         let _ = reply.send(Ok((channels, sample_rate)));
                     } else {
@@ -3235,6 +3591,7 @@ fn audio_worker_loop(
                                 &previous_default_device,
                                 &context,
                                 &output_settings_by_device,
+                                performance,
                             )
                         } else {
                             streams.get_mut(&previous_default_device).map(|output| {
@@ -3290,6 +3647,7 @@ fn audio_worker_loop(
                     &context,
                     &default_device_name,
                     &output_settings_by_device,
+                    performance,
                     &test_generation,
                 ),
             }
@@ -3435,6 +3793,7 @@ fn handle_command(
     context: &AudioOutputContext,
     default_device_name: &str,
     output_settings_by_device: &OutputSettingsByDevice,
+    performance: AudioPerformanceSettings,
     test_generation: &Arc<AtomicU64>,
 ) {
     match cmd {
@@ -3515,7 +3874,13 @@ fn handle_command(
             let uses_global_default = output_device.is_none();
             let device_name = output_device.unwrap_or_else(|| default_device_name.to_string());
             let Some((mixer, output_channels, _sample_rate, output_settings)) =
-                ensure_device_output(streams, &device_name, context, output_settings_by_device)
+                ensure_device_output(
+                    streams,
+                    &device_name,
+                    context,
+                    output_settings_by_device,
+                    performance,
+                )
             else {
                 warn!("Cannot open output device '{}' for cue {}", device_name, id);
                 return;
@@ -3784,9 +4149,13 @@ fn handle_command(
             // Use the exact active worker stream selected in Settings. The source
             // is added directly to that stream's mixer and emits non-zero samples
             // only on the requested native interleaved channel.
-            let Some((mixer, output_channels, sample_rate, _)) =
-                ensure_device_output(streams, &device_name, context, output_settings_by_device)
-            else {
+            let Some((mixer, output_channels, sample_rate, _)) = ensure_device_output(
+                streams,
+                &device_name,
+                context,
+                output_settings_by_device,
+                performance,
+            ) else {
                 warn!(
                     "Could not open output device '{}' for channel test",
                     device_name
@@ -3832,6 +4201,7 @@ fn handle_command(
             );
         }
         AudioCommand::SetOutputDevice { .. }
+        | AudioCommand::ReconfigureOutput { .. }
         | AudioCommand::SetInputDevice(_)
         | AudioCommand::Shutdown => {}
     }

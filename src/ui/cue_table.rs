@@ -969,22 +969,47 @@ impl CueTable {
                                         ui.spacing_mut().button_padding = vec2(0.0, 0.0);
                                         ui.spacing_mut().interact_size.y =
                                             compact_rect.height().max(18.0);
-                                        egui::ComboBox::from_id_salt("cont")
+                                        let combo = egui::ComboBox::from_id_salt("cont")
                                             .width(display_widths[7].max(0.0))
                                             .height(130.0)
-                                            .selected_text(
-                                                RichText::new(cue.continue_mode.label()).size(12.0),
-                                            )
+                                            // Paint the selected label ourselves below so it can
+                                            // be centered independently of the ComboBox arrow.
+                                            .selected_text("")
                                             .show_ui(ui, |ui| {
-                                                for mode in ContinueMode::ALL {
-                                                    ui.selectable_value(
-                                                        &mut cue.continue_mode,
-                                                        mode.clone(),
-                                                        mode.label(),
-                                                    );
-                                                }
-                                            })
-                                            .response
+                                                ui.set_min_width(display_widths[7].max(0.0));
+                                                ui.with_layout(
+                                                    egui::Layout::top_down_justified(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        for mode in ContinueMode::ALL {
+                                                            ui.selectable_value(
+                                                                &mut cue.continue_mode,
+                                                                mode.clone(),
+                                                                RichText::new(mode.label())
+                                                                    .size(12.0),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+
+                                        let combo_rect = combo.response.rect;
+                                        let selected_text_rect = egui::Rect::from_min_max(
+                                            combo_rect.left_top(),
+                                            egui::pos2(
+                                                (combo_rect.right() - 18.0).max(combo_rect.left()),
+                                                combo_rect.bottom(),
+                                            ),
+                                        );
+                                        ui.painter().text(
+                                            selected_text_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            cue.continue_mode.label(),
+                                            egui::FontId::proportional(12.0),
+                                            Theme::text(),
+                                        );
+                                        combo.response
                                     },
                                 )
                                 .inner

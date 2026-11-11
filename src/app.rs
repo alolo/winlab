@@ -4,8 +4,8 @@ use crate::audio::device_registry::DeviceRegistryMonitor;
 use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::waveform::{generate_waveform, get_channel_count, get_duration};
 use crate::config::{
-    AppAction, AppSettings, AudioBackend, MidiControlBinding, MidiControlKind, ThemePreset,
-    UiDesign,
+    AppAction, AppSettings, AudioBackend, AudioPerformanceSettings, MidiControlBinding,
+    MidiControlKind, ThemePreset, UiDesign,
 };
 use crate::cue::{
     ContinueMode, Cue, CueList, CueState, CueType, FadeCurve, GroupMode, MidiMessageKind,
@@ -286,22 +286,38 @@ impl TheatreShowCueApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let mut settings = AppSettings::load();
         let requested_backend = settings.audio_backend;
+        let requested_performance = AudioPerformanceSettings {
+            sample_rate: settings.audio_sample_rate,
+            buffer_size_frames: settings.audio_buffer_size_frames,
+        };
         Theme::apply(&cc.egui_ctx, &settings.appearance);
-        let mut audio = match AudioEngine::new_with_backend_and_endpoint(
+        let mut audio = match AudioEngine::new_with_backend_and_endpoint_and_performance(
             settings.audio_backend,
             settings.audio_output_device_id.as_deref(),
             settings.audio_output_device.as_deref(),
+            requested_performance,
         ) {
             Ok(audio) => audio,
             Err(error) => {
                 warn!(
-                    "Could not initialise saved audio endpoint '{} — {}': {}. Retrying the selected backend default.",
+                    "Could not initialise saved audio endpoint '{} — {}' with performance settings {:?}: {}. Retrying the same endpoint with backend defaults.",
                     settings.audio_backend.short_label(),
                     settings.audio_output_device.as_deref().unwrap_or("System Default"),
+                    requested_performance,
                     error
                 );
-                match AudioEngine::new_with_backend(settings.audio_backend) {
-                    Ok(audio) => audio,
+                match AudioEngine::new_with_backend_and_endpoint_and_performance(
+                    settings.audio_backend,
+                    settings.audio_output_device_id.as_deref(),
+                    settings.audio_output_device.as_deref(),
+                    AudioPerformanceSettings::default(),
+                ) {
+                    Ok(audio) => {
+                        settings.audio_sample_rate = None;
+                        settings.audio_buffer_size_frames = None;
+                        let _ = settings.save();
+                        audio
+                    }
                     Err(backend_error) => {
                         warn!(
                             "Could not initialise {} backend: {}. Falling back to WASAPI/system default.",
@@ -310,6 +326,9 @@ impl TheatreShowCueApp {
                         );
                         settings.audio_backend = AudioBackend::Wasapi;
                         settings.audio_output_device = None;
+                        settings.audio_output_device_id = None;
+                        settings.audio_sample_rate = None;
+                        settings.audio_buffer_size_frames = None;
                         AudioEngine::new().unwrap_or_else(|fallback_error| {
                             panic!("Cannot initialise audio engine: {fallback_error}");
                         })
@@ -4014,16 +4033,20 @@ impl TheatreShowCueApp {
         backend: AudioBackend,
         device_name: &str,
         endpoint_id: &str,
-    ) {
+    ) -> bool {
         let same_endpoint =
             self.audio.backend == backend && self.audio.current_device_id == endpoint_id;
         if same_endpoint && !self.active_output_needs_reopen {
-            return;
+            return true;
         }
 
         let previous_backend = self.audio.backend;
         let backend_changed = previous_backend != backend;
         let reinitialize_current = same_endpoint && self.active_output_needs_reopen;
+        let performance = AudioPerformanceSettings {
+            sample_rate: self.settings.audio_sample_rate,
+            buffer_size_frames: self.settings.audio_buffer_size_frames,
+        };
         info!(
             "Audio endpoint switch requested: {} — '{}' -> {} — '{}'",
             previous_backend.short_label(),
@@ -4032,17 +4055,52 @@ impl TheatreShowCueApp {
             device_name
         );
 
-        if backend_changed || reinitialize_current {
+        if backend_changed {
             self.stop_all();
             let previous_device_registry = self.audio.device_registry.clone();
             let mut replacement: AudioEngine =
-                match AudioEngine::new_with_backend_and_endpoint_using_registry(
+                match AudioEngine::new_with_backend_and_endpoint_using_registry_and_performance(
                     backend,
                     Some(endpoint_id),
                     Some(device_name),
-                    previous_device_registry,
+                    previous_device_registry.clone(),
+                    performance,
                 ) {
                     Ok(engine) => engine,
+                    Err(error)
+                        if backend_changed
+                            && performance != AudioPerformanceSettings::default() =>
+                    {
+                        warn!(
+                            "The selected endpoint does not accept the previous performance profile {:?}: {}. Retrying with Automatic settings.",
+                            performance,
+                            error
+                        );
+                        match AudioEngine::new_with_backend_and_endpoint_using_registry_and_performance(
+                            backend,
+                            Some(endpoint_id),
+                            Some(device_name),
+                            previous_device_registry,
+                            AudioPerformanceSettings::default(),
+                        ) {
+                            Ok(engine) => {
+                                self.settings.audio_sample_rate = None;
+                                self.settings.audio_buffer_size_frames = None;
+                                engine
+                            }
+                            Err(fallback_error) => {
+                                self.status_msg = format!(
+                                    "Could not open {} — {} with saved or Automatic audio settings: {}",
+                                    backend.short_label(),
+                                    device_name,
+                                    fallback_error
+                                );
+                                warn!("{}", self.status_msg);
+                                self.active_output_needs_reopen = false;
+                                return false;
+                            }
+                        }
+                    }
                     Err(error) => {
                         self.status_msg = format!(
                             "Could not open {} — {}: {}",
@@ -4051,7 +4109,8 @@ impl TheatreShowCueApp {
                             error
                         );
                         warn!("{}", self.status_msg);
-                        return;
+                        self.active_output_needs_reopen = false;
+                        return false;
                     }
                 };
 
@@ -4097,15 +4156,59 @@ impl TheatreShowCueApp {
                     }
                 }
             }
-        } else if let Err(error) = self.audio.set_output_endpoint(endpoint_id, device_name) {
-            self.status_msg = format!(
-                "Could not switch to {} — {}: {}",
-                backend.short_label(),
-                device_name,
-                error
-            );
-            warn!("{}", self.status_msg);
-            return;
+        } else if reinitialize_current {
+            self.stop_all();
+            if let Err(error) = self.audio.reconfigure_output(performance) {
+                self.status_msg = format!(
+                    "Could not apply audio performance settings to {} — {}: {}",
+                    backend.short_label(),
+                    device_name,
+                    error
+                );
+                warn!("{}", self.status_msg);
+                self.active_output_needs_reopen = false;
+                return false;
+            }
+        } else if let Err(error) =
+            self.audio
+                .set_output_endpoint(endpoint_id, device_name, performance)
+        {
+            if !same_endpoint && performance != AudioPerformanceSettings::default() {
+                warn!(
+                    "The selected {} endpoint '{}' rejected performance settings {:?}: {}. Retrying with Automatic settings.",
+                    backend.short_label(),
+                    device_name,
+                    performance,
+                    error
+                );
+                if let Err(fallback_error) = self.audio.set_output_endpoint(
+                    endpoint_id,
+                    device_name,
+                    AudioPerformanceSettings::default(),
+                ) {
+                    self.status_msg = format!(
+                        "Could not switch to {} — {} with saved or Automatic audio settings: {}",
+                        backend.short_label(),
+                        device_name,
+                        fallback_error
+                    );
+                    warn!("{}", self.status_msg);
+                    self.active_output_needs_reopen = false;
+                    return false;
+                }
+                self.settings.audio_sample_rate = None;
+                self.settings.audio_buffer_size_frames = None;
+            } else {
+                self.status_msg = format!(
+                    "Could not switch to {} — {}: {}",
+                    backend.short_label(),
+                    device_name,
+                    error
+                );
+                warn!("{}", self.status_msg);
+                self.active_output_needs_reopen = false;
+                return false;
+            }
         }
 
         self.active_output_needs_reopen = false;
@@ -4195,6 +4298,7 @@ impl TheatreShowCueApp {
             backend.short_label(),
             active_device_name
         );
+        true
     }
 
     fn save_app_settings(&mut self) {
@@ -4493,7 +4597,134 @@ impl TheatreShowCueApp {
                         }
 
                         let output = self.audio.current_device.clone();
-                        ui.label(format!("Active stream outputs: {}", self.audio.output_channels));
+                        ui.label(format!(
+                            "Active stream: {} channels @ {} Hz",
+                            self.audio.output_channels,
+                            self.audio.current_sample_rate
+                        ));
+
+                        ui.separator();
+                        ui.heading("Audio performance");
+                        ui.label(
+                            RichText::new(
+                                "Sample rate and buffer size are applied by reopening the active output. Smaller buffers reduce control latency but can cause dropouts; larger buffers improve stability.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(10.5),
+                        );
+
+                        let previous_sample_rate = self.settings.audio_sample_rate;
+                        let previous_buffer_size = self.settings.audio_buffer_size_frames;
+                        let mut selected_sample_rate = previous_sample_rate;
+                        let mut selected_buffer_size = previous_buffer_size;
+                        let mut sample_rates = self.audio.supported_sample_rates.clone();
+                        if let Some(rate) = selected_sample_rate {
+                            if !sample_rates.contains(&rate) {
+                                sample_rates.push(rate);
+                                sample_rates.sort_unstable();
+                            }
+                        }
+                        let mut buffer_sizes = self.audio.supported_buffer_sizes.clone();
+                        if self.audio.backend == AudioBackend::DirectSound {
+                            buffer_sizes = vec![1_024, 2_048, 4_096, 8_192, 16_384];
+                        }
+                        if let Some(frames) = selected_buffer_size {
+                            if !buffer_sizes.contains(&frames) {
+                                buffer_sizes.push(frames);
+                                buffer_sizes.sort_unstable();
+                            }
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Sample rate");
+                            let rate_label = selected_sample_rate
+                                .map(|rate| format!("{} Hz", rate))
+                                .unwrap_or_else(|| {
+                                    format!("Auto ({} Hz)", self.audio.current_sample_rate)
+                                });
+                            egui::ComboBox::from_id_salt("global_audio_sample_rate")
+                                .width(190.0)
+                                .selected_text(rate_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut selected_sample_rate,
+                                        None,
+                                        format!("Auto ({} Hz)", self.audio.current_sample_rate),
+                                    );
+                                    for rate in &sample_rates {
+                                        ui.selectable_value(
+                                            &mut selected_sample_rate,
+                                            Some(*rate),
+                                            format!("{} Hz", rate),
+                                        );
+                                    }
+                                });
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Buffer size");
+                            let default_buffer_label = if self.audio.backend == AudioBackend::DirectSound {
+                                let ms = 4_096.0 * 1_000.0 / self.audio.current_sample_rate.max(1) as f64;
+                                format!("Auto (4096 frames / {:.1} ms)", ms)
+                            } else {
+                                "Automatic (recommended)".to_string()
+                            };
+                            let buffer_label = selected_buffer_size
+                                .map(|frames| {
+                                    let rate = selected_sample_rate.unwrap_or(self.audio.current_sample_rate).max(1);
+                                    let ms = frames as f64 * 1_000.0 / rate as f64;
+                                    format!("{} frames / {:.1} ms", frames, ms)
+                                })
+                                .unwrap_or_else(|| default_buffer_label.clone());
+                            egui::ComboBox::from_id_salt("global_audio_buffer_size")
+                                .width(240.0)
+                                .selected_text(buffer_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut selected_buffer_size,
+                                        None,
+                                        default_buffer_label,
+                                    );
+                                    for frames in &buffer_sizes {
+                                        let rate = selected_sample_rate.unwrap_or(self.audio.current_sample_rate).max(1);
+                                        let ms = *frames as f64 * 1_000.0 / rate as f64;
+                                        ui.selectable_value(
+                                            &mut selected_buffer_size,
+                                            Some(*frames),
+                                            format!("{} frames / {:.1} ms", frames, ms),
+                                        );
+                                    }
+                                });
+                        });
+
+                        ui.label(
+                            RichText::new(match self.audio.backend {
+                                AudioBackend::Asio => "ASIO: buffer size is requested from the driver; only driver-supported block sizes will open.",
+                                AudioBackend::Wasapi => "WASAPI Shared: buffer size is a requested callback size; Windows may negotiate a different effective period.",
+                                AudioBackend::DirectSound => "DirectSound: buffer size controls the queued audio safety window. Larger values reduce clicks but increase latency.",
+                            })
+                            .color(Theme::text_dim())
+                            .size(10.0),
+                        );
+
+                        if selected_sample_rate != previous_sample_rate
+                            || selected_buffer_size != previous_buffer_size
+                        {
+                            self.settings.audio_sample_rate = selected_sample_rate;
+                            self.settings.audio_buffer_size_frames = selected_buffer_size;
+                            let backend = self.audio.backend;
+                            let device_name = self.audio.current_device.clone();
+                            let endpoint_id = self.audio.current_device_id.clone();
+                            self.active_output_needs_reopen = true;
+                            if self.switch_audio_endpoint(backend, &device_name, &endpoint_id) {
+                                self.save_app_settings();
+                            } else {
+                                self.settings.audio_sample_rate = previous_sample_rate;
+                                self.settings.audio_buffer_size_frames = previous_buffer_size;
+                                self.save_app_settings();
+                            }
+                        }
+
                         let supported_layouts = self.audio.output_channel_layouts_for_device(Some(&output));
                         let layouts_text = if supported_layouts.is_empty() {
                             "not reported by driver".to_string()
@@ -5523,15 +5754,6 @@ impl TheatreShowCueApp {
                 ui.selectable_value(&mut self.active_panel, Panel::Midi, "🎹 MIDI Settings");
             }
             ui.selectable_value(&mut self.active_panel, Panel::Report, "📋 Report");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Hide ▾")
-                    .on_hover_text("Hide lower panel")
-                    .clicked()
-                {
-                    self.bottom_panel_visible = false;
-                }
-            });
         });
         ui.separator();
 
@@ -6009,7 +6231,12 @@ impl eframe::App for TheatreShowCueApp {
                 ui.add_enabled_ui(!self.settings_open, |ui| {
                     let active = self.cue_list.active_count();
                     let prev_master = self.master_vol;
-                    let action = TransportBar::show(ui, active, &mut self.master_vol);
+                    let action = TransportBar::show(
+                        ui,
+                        active,
+                        &mut self.master_vol,
+                        &mut self.bottom_panel_visible,
+                    );
                     if (self.master_vol - prev_master).abs() > f32::EPSILON {
                         for cue in self.cue_list.cues.iter().filter(|c| c.is_active()) {
                             self.audio.send(AudioCommand::SetVolume(
@@ -6296,24 +6523,6 @@ impl eframe::App for TheatreShowCueApp {
                                         );
                                         ui.add_sized([70.0, 20.0], egui::Label::new(""));
                                     }
-
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if !self.bottom_panel_visible
-                                                && ui
-                                                    .add_sized(
-                                                        [52.0, 52.0],
-                                                        egui::Button::new("▴")
-                                                            .fill(Theme::button_bg()),
-                                                    )
-                                                    .on_hover_text("Show lower panel")
-                                                    .clicked()
-                                            {
-                                                self.bottom_panel_visible = true;
-                                            }
-                                        },
-                                    );
                                 });
 
                                 ui.add_space(3.0);

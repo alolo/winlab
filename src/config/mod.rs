@@ -157,6 +157,16 @@ impl AudioBackend {
     }
 }
 
+/// User-selected global output stream parameters. `None` delegates to the
+/// backend/device default. DirectSound maps the buffer setting to its queued
+/// audio safety window; CPAL backends map it to callback frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AudioPerformanceSettings {
+    pub sample_rate: Option<u32>,
+    pub buffer_size_frames: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemePreset {
     #[default]
@@ -332,6 +342,12 @@ pub struct AppSettings {
     /// Stable CPAL/registry endpoint identity for the global output device.
     #[serde(default)]
     pub audio_output_device_id: Option<String>,
+    /// Requested output sample rate; None uses the device/backend preference.
+    #[serde(default)]
+    pub audio_sample_rate: Option<u32>,
+    /// Requested output buffer in frames; None uses the backend default.
+    #[serde(default)]
+    pub audio_buffer_size_frames: Option<u32>,
     pub audio_input_device: Option<String>,
     pub osc_listen_port: u16,
     pub osc_send_addr: String,
@@ -379,6 +395,8 @@ impl Default for AppSettings {
             audio_backend: AudioBackend::Wasapi,
             audio_output_device: None,
             audio_output_device_id: None,
+            audio_sample_rate: None,
+            audio_buffer_size_frames: None,
             audio_input_device: None,
             osc_listen_port: 7700,
             osc_send_addr: "127.0.0.1:7701".to_string(),
@@ -518,7 +536,7 @@ mod audio_backend_label_tests {
 
 #[cfg(test)]
 mod stable_audio_settings_tests {
-    use super::{AppSettings, AudioBackend};
+    use super::{AppSettings, AudioBackend, AudioPerformanceSettings};
 
     #[test]
     fn legacy_settings_without_stable_output_id_still_load() {
@@ -536,5 +554,19 @@ mod stable_audio_settings_tests {
             Some("Speakers (USB Audio)")
         );
         assert!(settings.audio_output_device_id.is_none());
+        assert!(settings.audio_sample_rate.is_none());
+        assert!(settings.audio_buffer_size_frames.is_none());
+    }
+
+    #[test]
+    fn audio_performance_settings_round_trip() {
+        let settings = AudioPerformanceSettings {
+            sample_rate: Some(96_000),
+            buffer_size_frames: Some(512),
+        };
+        let encoded = serde_json::to_string(&settings).expect("settings should serialize");
+        let decoded: AudioPerformanceSettings =
+            serde_json::from_str(&encoded).expect("settings should deserialize");
+        assert_eq!(decoded, settings);
     }
 }

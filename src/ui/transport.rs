@@ -16,7 +16,12 @@ pub enum TransportAction {
 pub struct TransportBar;
 
 impl TransportBar {
-    pub fn show(ui: &mut Ui, active_count: usize, master_vol: &mut f32) -> Option<TransportAction> {
+    pub fn show(
+        ui: &mut Ui,
+        active_count: usize,
+        master_vol: &mut f32,
+        bottom_panel_visible: &mut bool,
+    ) -> Option<TransportAction> {
         let mut action = None;
 
         ui.horizontal(|ui| {
@@ -173,6 +178,31 @@ impl TransportBar {
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                         .text(""),
                 );
+            });
+
+            // Keep the lower-panel visibility control in one stable location:
+            // at the far right of the complete transport bar, after Master Volume.
+            ui.add_space(12.0);
+            ui.add(Separator::default().vertical());
+            ui.add_space(8.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (label, tooltip) = if *bottom_panel_visible {
+                    ("Hide panel ▾", "Hide lower panel")
+                } else {
+                    ("Show panel ▴", "Show lower panel")
+                };
+                if ui
+                    .add_sized(
+                        [116.0, 44.0],
+                        Button::new(RichText::new(label).size(12.0))
+                            .fill(Theme::button_bg())
+                            .corner_radius(6_u8),
+                    )
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    *bottom_panel_visible = !*bottom_panel_visible;
+                }
             });
         });
 
