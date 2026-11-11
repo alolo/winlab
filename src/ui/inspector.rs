@@ -1,6 +1,7 @@
 // src/ui/inspector.rs — вкладки нижней панели: Inspector, Playback, I/O Routing и MIDI
 
 use crate::audio::engine::AudioEngine;
+use crate::config::AudioBackend;
 use crate::cue::{
     ContinueMode, Cue, CueColor, CueType, FadeCurve, GroupMode, MidiMessageKind, OscCueArg,
 };
@@ -422,6 +423,58 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 );
                             }
                         }
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Time Triggers")
+                                .strong()
+                                .color(Theme::accent()),
+                        );
+                        let is_comment = matches!(&cue.cue_type, CueType::Comment { .. });
+                        ui.add_enabled_ui(!is_comment, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut cue.time_trigger_enabled, "Daily");
+                                ui.label("Local time:");
+                                ui.add(
+                                    TextEdit::singleline(&mut cue.time_trigger_time)
+                                        .desired_width(86.0)
+                                        .hint_text("HH:MM"),
+                                );
+                            });
+                        });
+                        if is_comment {
+                            ui.label(
+                                RichText::new("Comment cues cannot be started by a time trigger.")
+                                    .color(Theme::text_dim())
+                                    .size(10.5),
+                            );
+                        } else if chrono::NaiveTime::parse_from_str(
+                            &cue.time_trigger_time,
+                            "%H:%M",
+                        )
+                        .is_err()
+                            && chrono::NaiveTime::parse_from_str(
+                                &cue.time_trigger_time,
+                                "%H:%M:%S",
+                            )
+                            .is_err()
+                        {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(235, 85, 85),
+                                "Use 24-hour HH:MM (or HH:MM:SS), e.g. 19:30.",
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(if cue.time_trigger_enabled {
+                                    "Runs once per day using the computer's local clock."
+                                } else {
+                                    "Trigger is disabled."
+                                })
+                                .color(Theme::text_dim())
+                                .size(10.5),
+                            );
+                        }
                     });
                 });
 
@@ -469,13 +522,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     }
 
     /// Вкладка 2: Playback
-    pub fn show_playback(ui: &mut Ui, cue: &mut Cue) -> bool {
-        let mut vol_changed = false;
+    pub fn show_playback(ui: &mut Ui, cue: &mut Cue) -> (bool, bool) {
+        let mut volume_changed = false;
+        let mut time_pitch_changed = false;
 
-        // Use vertical scrolling instead of horizontal_wrapped for this settings section.
-        ui.vertical(|ui| {
-            ui.add_space(4.0);
-            Self::section(ui, "Levels & Envelope", |ui| {
+        // Keep the two related control groups side by side, matching the
+        // multi-column layout used by the main Inspector.
+        ui.columns(2, |cols| {
+            Self::section(&mut cols[0], "Levels & Envelope", |ui| {
                 Self::field(ui, "Volume", |ui| {
                     let mut db_val = vol_to_db(cue.volume);
                     if ui
@@ -488,7 +542,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         .changed()
                     {
                         cue.volume = db_to_vol(db_val);
-                        vol_changed = true;
+                        volume_changed = true;
                     }
                 });
 
@@ -534,289 +588,735 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     Self::custom_fade_editor(ui, &mut cue.custom_fade_points, true);
                 }
             });
+
+            Self::section(&mut cols[1], "Time & Pitch", |ui| {
+                Self::field(ui, "Playback speed", |ui| {
+                    if ui
+                        .add(
+                            DragValue::new(&mut cue.time_pitch.speed)
+                                .range(0.1..=4.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix("×"),
+                        )
+                        .changed()
+                    {
+                        cue.time_pitch.speed =
+                            ((cue.time_pitch.speed * 10.0).round() / 10.0).clamp(0.1, 4.0);
+                        time_pitch_changed = true;
+                    }
+                });
+                Self::field(ui, "Speed mode", |ui| {
+                    if ui
+                        .checkbox(
+                            &mut cue.time_pitch.preserve_pitch_on_speed_change,
+                            "Preserve pitch (time-stretch)",
+                        )
+                        .on_hover_text(
+                            "On: speed changes duration but keeps pitch. Off: pitch follows speed (varispeed).",
+                        )
+                        .changed()
+                    {
+                        time_pitch_changed = true;
+                    }
+                });
+
+                let mut semitones = (cue.time_pitch.pitch_cents / 100.0).trunc() as i32;
+                let mut cents = (cue.time_pitch.pitch_cents - semitones as f32 * 100.0) as i32;
+                Self::field(ui, "Pitch shift", |ui| {
+                    ui.horizontal(|ui| {
+                        let semitones_changed = ui
+                            .add(
+                                DragValue::new(&mut semitones)
+                                    .range(-24..=24)
+                                    .speed(1)
+                                    .suffix(" st"),
+                            )
+                            .changed();
+                        let cents_changed = ui
+                            .add(
+                                DragValue::new(&mut cents)
+                                    .range(-99..=99)
+                                    .speed(1)
+                                    .suffix(" cents"),
+                            )
+                            .changed();
+                        if semitones_changed || cents_changed {
+                            cue.time_pitch.pitch_cents =
+                                ((semitones * 100 + cents.clamp(-99, 99)) as f32)
+                                    .clamp(-2400.0, 2400.0);
+                            time_pitch_changed = true;
+                        }
+                    });
+                });
+                Self::field(ui, "Pitch mode", |ui| {
+                    if ui
+                        .checkbox(
+                            &mut cue.time_pitch.pitch_shift_changes_speed,
+                            "Varispeed: pitch shift also changes duration",
+                        )
+                        .on_hover_text(
+                            "On: pitch shift also changes playback speed and duration. Off: pitch changes without changing duration.",
+                        )
+                        .changed()
+                    {
+                        time_pitch_changed = true;
+                    }
+                });
+                ui.label(
+                    RichText::new("Speed: 0.1× steps · Pitch: semitones + fine cents. Waveform automation is edited in the Waveform tab.")
+                        .color(Theme::text_dim())
+                        .size(10.5),
+                );
+            });
         });
 
-        vol_changed
+        (volume_changed, time_pitch_changed)
     }
 
-    /// Per-track source channel mapping and global physical output controls.
+    fn source_channel_short_name(input_channels: usize, source_index: usize) -> String {
+        match input_channels {
+            1 => "Mono".to_string(),
+            2 => (if source_index == 0 { "L" } else { "R" }).to_string(),
+            6 => ["L", "R", "C", "LFE", "Ls", "Rs"]
+                .get(source_index)
+                .copied()
+                .unwrap_or("Ch")
+                .to_string(),
+            8 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lb", "Rb"]
+                .get(source_index)
+                .copied()
+                .unwrap_or("Ch")
+                .to_string(),
+            _ => format!("Ch {}", source_index + 1),
+        }
+    }
+
+    /// Per-track output routing. Each hardware output is a vertical strip with
+    /// its own output trim and a checkbox for every source channel, allowing
+    /// fan-out and downmixing in one compact horizontal matrix.
     pub fn show_io_routing(ui: &mut Ui, cue: Option<&mut Cue>, audio: &mut AudioEngine) -> bool {
-        let output_channels = audio.output_channels.max(1);
-        let mut output_settings = audio.output_channel_settings();
-        output_settings.resize(output_channels, crate::cue::OutputChannelSetting::default());
-        output_settings.truncate(output_channels);
+        let Some(cue) = cue else {
+            ui.label(
+                RichText::new("Select an audio cue to configure its channel routing")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        };
+        if !matches!(&cue.cue_type, CueType::Audio) {
+            ui.label(
+                RichText::new("Select an audio cue to configure its channel routing")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        }
+        if cue.audio_channels == 0 {
+            ui.label(
+                RichText::new("Audio channel count has not been detected for this file yet.")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        }
+
         let mut changed = false;
-        let mut cue_opt = cue;
+        let cue_id = cue.id;
+        let global_device = format!("{} — {}", audio.backend.short_label(), audio.current_device);
+        let mut selected_device = cue.io.output_device.clone();
+        let mut selected_backend = selected_device.as_ref().map(|_| {
+            cue.io
+                .output_backend
+                .or_else(|| {
+                    cue.io
+                        .output_device_id
+                        .as_deref()
+                        .and_then(|id| audio.device_registry.find_by_id(id))
+                        .map(|endpoint| endpoint.backend)
+                })
+                .unwrap_or(audio.backend)
+        });
+        let mut selected_device_id = cue.io.output_device_id.clone();
 
-        ui.columns(2, |cols| {
-            Self::section(&mut cols[0], "Hardware output channels", |ui| {
-                ui.label(format!("Interface: {}", audio.current_device));
-                ui.label(format!("Active stream outputs: {}", output_channels));
-                let layouts = audio.output_channel_layouts_for_device(None);
-                let layouts_text = if layouts.is_empty() {
-                    "not reported".to_string()
-                } else {
-                    layouts
-                        .iter()
-                        .map(|count| format!("{} ch", count))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                ui.label(format!("Driver-supported layouts: {}", layouts_text));
-                ui.add_space(6.0);
+        // Migrate older projects that stored only the backend/name pair.
+        if selected_device_id.is_none() {
+            if let (Some(device_name), Some(backend)) =
+                (selected_device.as_deref(), selected_backend)
+            {
+                selected_device_id = audio.registered_endpoint_id(backend, device_name);
+            }
+        }
 
-                egui::ScrollArea::vertical()
-                    .id_salt("io_hardware_outputs_scroll")
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        let output_order = audio.output_channel_display_order(None);
-                        for index in output_order {
-                            let Some(setting) = output_settings.get_mut(index) else {
-                                continue;
-                            };
-                            let output_label = audio.output_channel_label(None, index);
-                            ui.horizontal(|ui| {
-                                changed |= ui.checkbox(&mut setting.active, "Active").changed();
-                                ui.add_sized(
-                                    [150.0, 22.0],
-                                    Label::new(RichText::new(output_label).strong()),
-                                );
-                                let slider_changed = ui
-                                    .add(
-                                        Slider::new(&mut setting.gain_db, -60.0..=18.0)
-                                            .show_value(false),
-                                    )
-                                    .changed();
-                                if slider_changed {
-                                    ui.ctx().data_mut(|data| {
-                                        data.insert_temp(
-                                            Id::new(("global_output_gain_db", index))
-                                                .with("gain_db_text"),
-                                            format!("{:.1}", setting.gain_db),
-                                        )
-                                    });
-                                }
-                                changed |= slider_changed;
-                                changed |= Self::gain_db_input(
-                                    ui,
-                                    Id::new(("global_output_gain_db", index)),
-                                    &mut setting.gain_db,
-                                );
-                                ui.label("dB");
-                            });
-                        }
-                    });
-            });
-
-            Self::section(&mut cols[1], "Track channel routing", |ui| {
-                if let Some(cue) = cue_opt.as_deref_mut() {
-                    if !matches!(&cue.cue_type, CueType::Audio) {
-                        ui.label(
-                            RichText::new("Select an audio cue to configure its source channels")
-                                .color(Theme::text_dim()),
-                        );
-                        return;
-                    }
-                    let cue_id = cue.id;
-                    let global_device = audio.current_device.clone();
-                    let mut selected_device = cue.io.output_device.clone();
-                    ui.horizontal(|ui| {
-                        ui.label("Output device");
-                        egui::ComboBox::from_id_salt(("cue_output_device", cue_id))
-                            .width(190.0)
-                            .selected_text(
-                                selected_device.clone().unwrap_or_else(|| {
-                                    format!("Global default ({})", global_device)
-                                }),
-                            )
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        selected_device.is_none(),
-                                        format!("Global default ({})", global_device),
-                                    )
-                                    .clicked()
-                                {
-                                    selected_device = None;
-                                }
-                                for device in audio.output_devices.clone() {
-                                    if ui
-                                        .selectable_label(
-                                            selected_device.as_deref() == Some(device.as_str()),
-                                            &device,
-                                        )
-                                        .clicked()
-                                    {
-                                        selected_device = Some(device);
-                                    }
-                                }
-                            });
-                    });
-                    if selected_device != cue.io.output_device {
-                        if let Some(device_name) = selected_device.as_deref() {
-                            audio.refresh_output_device_info(device_name);
-                        }
-                        cue.io.output_device = selected_device;
-                        changed = true;
-                    }
-                    let output_channels = audio
-                        .output_channels_for_device(cue.io.output_device.as_deref())
-                        .max(1);
-                    ui.label(
-                        RichText::new(format!(
-                            "Available outputs for this track: {}",
-                            output_channels
-                        ))
-                        .color(Theme::text_dim())
-                        .size(11.0),
-                    );
-                    let track_layouts =
-                        audio.output_channel_layouts_for_device(cue.io.output_device.as_deref());
-                    if !track_layouts.is_empty() {
-                        ui.label(
-                            RichText::new(format!(
-                                "Driver layouts: {}",
-                                track_layouts
-                                    .iter()
-                                    .map(|count| format!("{} ch", count))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ))
-                            .color(Theme::text_dim())
-                            .size(10.0),
-                        );
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Device selection applies the next time this cue is started.",
+        let selected_endpoint_label = selected_device.as_ref().map_or_else(
+            || format!("Global default ({})", global_device),
+            |device_name| {
+                selected_device_id
+                    .as_deref()
+                    .and_then(|id| audio.device_registry.find_by_id(id))
+                    .map(|endpoint| endpoint.label())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} — {} (not in registry)",
+                            selected_backend.unwrap_or(audio.backend).short_label(),
+                            device_name
                         )
-                        .color(Theme::text_dim())
-                        .size(10.0),
-                    );
-                    let input_channels = cue.audio_channels;
-                    if input_channels == 0 {
-                        ui.label(
-                            RichText::new("Could not detect this track's audio channel format")
-                                .color(Theme::text_dim()),
-                        );
-                        return;
+                    })
+            },
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Output device");
+            egui::ComboBox::from_id_salt(("cue_output_device", cue_id))
+                .width(350.0)
+                .selected_text(&selected_endpoint_label)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            selected_device.is_none(),
+                            format!("Global default ({})", global_device),
+                        )
+                        .clicked()
+                    {
+                        selected_device = None;
+                        selected_backend = None;
+                        selected_device_id = None;
                     }
-                    let default_route_channels =
-                        audio.default_route_output_channels(cue.io.output_device.as_deref());
-                    cue.io.ensure_channel_routes_with_defaults(
+
+                    for endpoint in audio.device_registry.endpoints().to_vec() {
+                        let selected = selected_device_id.as_deref() == Some(endpoint.id.as_str())
+                            || (selected_device_id.is_none()
+                                && selected_device.as_deref()
+                                    == Some(endpoint.device_name.as_str())
+                                && selected_backend == Some(endpoint.backend));
+                        let label = endpoint.label();
+                        ui.add_enabled_ui(endpoint.is_available(), |ui| {
+                            let response = ui.selectable_label(selected, label);
+                            if response.clicked() {
+                                selected_device = Some(endpoint.device_name.clone());
+                                selected_backend = Some(endpoint.backend);
+                                selected_device_id = Some(endpoint.id.clone());
+                            }
+                        });
+                    }
+                });
+        });
+
+        if let Some(endpoint_id) = selected_device_id.as_deref() {
+            if let Some(resolved_name) = audio.resolve_registered_endpoint_name(endpoint_id) {
+                selected_device = Some(resolved_name);
+            }
+        } else if selected_backend == Some(audio.backend) {
+            if let Some(device_name) = selected_device.as_deref() {
+                if let Some(resolved_name) = audio.resolve_output_device_name(device_name) {
+                    selected_device = Some(resolved_name);
+                }
+            }
+        }
+
+        if selected_device != cue.io.output_device
+            || selected_backend != cue.io.output_backend
+            || selected_device_id != cue.io.output_device_id
+        {
+            let endpoint_available = selected_device.as_deref().is_some_and(|device_name| {
+                audio.registered_endpoint_available(
+                    selected_backend.unwrap_or(audio.backend),
+                    selected_device_id.as_deref(),
+                    device_name,
+                )
+            });
+            if endpoint_available && selected_backend == Some(audio.backend) {
+                if let Some(device_name) = selected_device.as_deref() {
+                    audio.refresh_output_device_info(device_name);
+                }
+            }
+            cue.io.output_device = selected_device;
+            cue.io.output_backend = selected_backend;
+            cue.io.output_device_id = selected_device_id;
+            changed = true;
+        }
+
+        if let Some(device_name) = cue.io.output_device.as_deref() {
+            let route_backend = cue.io.output_backend.unwrap_or(audio.backend);
+            if !audio.registered_endpoint_available(
+                route_backend,
+                cue.io.output_device_id.as_deref(),
+                device_name,
+            ) {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "{} — {} is currently unavailable. The saved route is retained and will become available when the device reconnects.",
+                        route_backend.short_label(),
+                        device_name
+                    ),
+                );
+                return changed;
+            }
+            if route_backend != audio.backend {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "This route is saved as {} — {}. Switch the global output to this backend to edit its channel matrix. Simultaneous cross-backend playback becomes available in Stage 4.",
+                        route_backend.short_label(),
+                        device_name
+                    ),
+                );
+                return changed;
+            }
+            if route_backend == AudioBackend::Asio && device_name != audio.current_device.as_str() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "This route is saved as ASIO — {}. Only one ASIO driver can be active in this process. Switch the global output to this device to edit its matrix and play; simultaneous ASIO drivers arrive in Stage 4.",
+                        device_name
+                    ),
+                );
+                return changed;
+            }
+        }
+
+        let output_channels = audio
+            .output_channels_for_device(cue.io.output_device.as_deref())
+            .max(1);
+        let input_channels = cue.audio_channels;
+        let default_route_channels = audio
+            .default_route_channels_for_source(cue.io.output_device.as_deref(), input_channels);
+        cue.io.ensure_channel_routes_with_defaults(
+            input_channels,
+            output_channels,
+            &default_route_channels,
+        );
+        let output_order = audio.output_channel_display_order(cue.io.output_device.as_deref());
+
+        let format = match input_channels {
+            1 => "Mono",
+            2 => "Stereo",
+            6 => "5.1",
+            8 => "7.1",
+            _ => "Multichannel",
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} · {} source channels · {} hardware outputs",
+                    format, input_channels, output_channels
+                ))
+                .strong()
+                .color(Theme::accent()),
+            );
+            ui.label(
+                RichText::new("Select one or more source channels for each output.")
+                    .color(Theme::text_dim())
+                    .size(10.5),
+            );
+        });
+        ui.add_space(6.0);
+
+        // One horizontal scroll area owns the entire matrix. The master is the
+        // first item in that content, so stale nested-scroll offsets cannot leave
+        // a large empty region before the faders.
+        let mut output_gains_db = cue.io.output_gains_db.clone();
+        let routing_matrix_height = (240.0 + input_channels as f32 * 24.0).max(270.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), routing_matrix_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |matrix_ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt((
+                        "io_routing_matrix_v5",
+                        cue_id,
+                        cue.io.output_device.clone(),
                         input_channels,
                         output_channels,
-                        &default_route_channels,
-                    );
-                    let format = match input_channels {
-                        1 => "Mono",
-                        2 => "Stereo",
-                        6 => "6-channel / 5.1 typical",
-                        8 => "8-channel / 7.1 typical",
-                        _ => "Multichannel",
-                    };
-                    ui.label(
-                        RichText::new(format!("{} · {} source channels", format, input_channels))
-                            .color(Theme::accent()),
-                    );
-                    let route_device_name = cue.io.output_device.clone();
-                    let output_order =
-                        audio.output_channel_display_order(route_device_name.as_deref());
-                    ui.add_space(6.0);
-
-                    egui::ScrollArea::vertical()
-                        .id_salt(("io_track_routes_scroll", cue_id))
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            for (source_index, route) in
-                                cue.io.channel_routes.iter_mut().enumerate()
-                            {
+                    ))
+                    .auto_shrink([false, false])
+                    .show(matrix_ui, |ui| {
+                        ui.set_min_height(routing_matrix_height);
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            // Master is a full-width channel strip like OUT 1/2/... .
+                            // Its checkboxes enable/disable individual source channels
+                            // before they are routed to hardware outputs.
+                            Self::mixer_strip(ui, routing_matrix_height, |ui| {
+                                ui.label(RichText::new("MASTER").strong().color(Theme::text()));
+                                ui.add_sized(
+                                    [108.0, 28.0],
+                                    Label::new(
+                                        RichText::new("All source channels")
+                                            .color(Theme::text_dim())
+                                            .size(9.5),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.label(
+                                    RichText::new("Cue trim").color(Theme::text_dim()).size(9.5),
+                                );
+                                let mut master_db = vol_to_db(cue.volume);
+                                let slider = Slider::new(&mut master_db, -60.0..=6.0)
+                                    .vertical()
+                                    .show_value(false);
+                                let slider_response = ui.add_sized([30.0, 116.0], slider);
+                                let reset_to_zero =
+                                    Self::fader_double_clicked(ui, &slider_response);
+                                let slider_changed = slider_response.changed() || reset_to_zero;
+                                if reset_to_zero {
+                                    master_db = 0.0;
+                                }
+                                if slider_changed {
+                                    cue.volume = db_to_vol(master_db);
+                                    changed = true;
+                                }
                                 ui.horizontal(|ui| {
-                                    changed |= ui.checkbox(&mut route.active, "Active").changed();
-                                    let source_name = match (input_channels, source_index) {
-                                        (1, 0) => "Mono (1)".to_string(),
-                                        (2, 0) => "Left (1)".to_string(),
-                                        (2, 1) => "Right (2)".to_string(),
-                                        (_, index) => format!("Channel {}", index + 1),
-                                    };
-                                    ui.add_sized([92.0, 22.0], Label::new(source_name));
+                                    if Self::gain_db_input(
+                                        ui,
+                                        Id::new(("io_master_gain_db", cue_id)),
+                                        &mut master_db,
+                                        -60.0,
+                                        6.0,
+                                        slider_changed,
+                                    ) {
+                                        cue.volume = db_to_vol(master_db);
+                                        changed = true;
+                                    }
+                                });
+                                ui.separator();
 
-                                    egui::ComboBox::from_id_salt((
-                                        "cue_output_route",
-                                        cue_id,
+                                for source_index in 0..input_channels {
+                                    let label = Self::source_channel_short_name(
+                                        input_channels,
                                         source_index,
-                                    ))
-                                    .width(170.0)
-                                    .selected_text(audio.output_channel_label(
-                                        route_device_name.as_deref(),
-                                        route.output_channel,
-                                    ))
-                                    .show_ui(ui, |ui| {
-                                        for output_index in output_order.iter().copied() {
-                                            let output_label = audio.output_channel_label(
-                                                route_device_name.as_deref(),
-                                                output_index,
-                                            );
-                                            changed |= ui
-                                                .selectable_value(
-                                                    &mut route.output_channel,
-                                                    output_index,
-                                                    output_label,
-                                                )
-                                                .changed();
-                                        }
-                                    });
+                                    );
+                                    let route = &mut cue.io.channel_routes[source_index];
+                                    let mut active = route.master_enabled;
+                                    if ui.checkbox(&mut active, label).changed() {
+                                        route.master_enabled = active;
+                                        changed = true;
+                                    }
+                                }
+                            });
 
-                                    let slider_changed = ui
-                                        .add(
-                                            Slider::new(&mut route.gain_db, -60.0..=18.0)
-                                                .show_value(false),
+                            ui.separator();
+
+                            for (logical_index, output_index) in
+                                output_order.iter().copied().enumerate()
+                            {
+                                let Some(output_gain_db) = output_gains_db.get_mut(output_index)
+                                else {
+                                    continue;
+                                };
+                                Self::mixer_strip(ui, routing_matrix_height, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("OUT {}", logical_index + 1))
+                                            .strong()
+                                            .color(Theme::text()),
+                                    );
+                                    ui.add_sized(
+                                        [108.0, 28.0],
+                                        Label::new(
+                                            RichText::new(audio.output_channel_label(
+                                                cue.io.output_device.as_deref(),
+                                                output_index,
+                                            ))
+                                            .color(Theme::text_dim())
+                                            .size(9.5),
                                         )
-                                        .changed();
-                                    if slider_changed {
-                                        ui.ctx().data_mut(|data| {
-                                            data.insert_temp(
-                                                Id::new((
-                                                    "track_output_gain_db",
-                                                    cue_id,
-                                                    source_index,
-                                                ))
-                                                .with("gain_db_text"),
-                                                format!("{:.1}", route.gain_db),
-                                            )
-                                        });
+                                        .wrap(),
+                                    );
+                                    ui.label(
+                                        RichText::new("Cue trim")
+                                            .color(Theme::text_dim())
+                                            .size(9.5),
+                                    );
+                                    let output_slider = Slider::new(output_gain_db, -60.0..=18.0)
+                                        .vertical()
+                                        .show_value(false);
+                                    let slider_response =
+                                        ui.add_sized([30.0, 116.0], output_slider);
+                                    let reset_to_zero =
+                                        Self::fader_double_clicked(ui, &slider_response);
+                                    let slider_changed = slider_response.changed() || reset_to_zero;
+                                    if reset_to_zero {
+                                        *output_gain_db = 0.0;
                                     }
                                     changed |= slider_changed;
-                                    changed |= Self::gain_db_input(
-                                        ui,
-                                        Id::new(("track_output_gain_db", cue_id, source_index)),
-                                        &mut route.gain_db,
-                                    );
-                                    ui.label("dB");
+                                    ui.horizontal(|ui| {
+                                        changed |= Self::gain_db_input(
+                                            ui,
+                                            Id::new(("io_output_gain_db", cue_id, output_index)),
+                                            output_gain_db,
+                                            -60.0,
+                                            18.0,
+                                            slider_changed,
+                                        );
+                                    });
+                                    ui.separator();
+
+                                    for source_index in 0..input_channels {
+                                        let source_name = Self::source_channel_short_name(
+                                            input_channels,
+                                            source_index,
+                                        );
+                                        let route = &mut cue.io.channel_routes[source_index];
+                                        let mut active = route.active
+                                            && route.output_channels.contains(&output_index);
+                                        if ui.checkbox(&mut active, source_name).changed() {
+                                            if active {
+                                                if !route.output_channels.contains(&output_index) {
+                                                    route.output_channels.push(output_index);
+                                                }
+                                            } else {
+                                                route
+                                                    .output_channels
+                                                    .retain(|index| *index != output_index);
+                                            }
+                                            route.output_channels.sort_unstable();
+                                            route.output_channels.dedup();
+                                            route.active = !route.output_channels.is_empty();
+                                            if let Some(primary) =
+                                                route.output_channels.first().copied()
+                                            {
+                                                route.output_channel = primary;
+                                            }
+                                            changed = true;
+                                        }
+                                    }
                                 });
                             }
                         });
-
-                    if let Some(left) = cue.io.channel_routes.first() {
-                        cue.io.left_enabled = left.active;
-                        cue.io.left_gain_db = left.gain_db;
-                    }
-                    if let Some(right) = cue.io.channel_routes.get(1) {
-                        cue.io.right_enabled = right.active;
-                        cue.io.right_gain_db = right.gain_db;
-                    }
-                } else {
-                    ui.label(
-                        RichText::new("Select an audio cue to configure its source channels")
-                            .color(Theme::text_dim()),
-                    );
-                }
-            });
-        });
-
-        if changed {
-            audio.set_output_channel_settings(output_settings);
+                    });
+            },
+        );
+        // The faders edit a local copy inside the nested UI closures. Commit
+        // it when a value actually changes; the old flag was never set, which
+        // meant the edited gains could be discarded every frame.
+        if output_gains_db != cue.io.output_gains_db {
+            cue.io.output_gains_db = output_gains_db;
+            changed = true;
         }
+
+        // Keep legacy L/R fields synchronized for older project versions.
+        if let Some(left) = cue.io.channel_routes.first() {
+            cue.io.left_enabled = left.active;
+            cue.io.left_gain_db = left.gain_db;
+        }
+        if let Some(right) = cue.io.channel_routes.get(1) {
+            cue.io.right_enabled = right.active;
+            cue.io.right_gain_db = right.gain_db;
+        }
+
+        changed
+    }
+
+    /// Dedicated Trim mixer. Its layout intentionally mirrors I/O Routing:
+    /// a master strip on the left, followed by one vertical source-trim strip
+    /// per input channel in a horizontally scrolling row.
+    pub fn show_source_channel_trims(
+        ui: &mut Ui,
+        cue: Option<&mut Cue>,
+        audio: &AudioEngine,
+    ) -> bool {
+        let Some(cue) = cue else {
+            ui.label(
+                RichText::new("Select an audio cue to configure source channel trims")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        };
+        if !matches!(&cue.cue_type, CueType::Audio) {
+            ui.label(
+                RichText::new("Select an audio cue to configure source channel trims")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        }
+        if cue.audio_channels == 0 {
+            ui.label(
+                RichText::new("Audio channel count has not been detected for this file yet.")
+                    .color(Theme::text_dim()),
+            );
+            return false;
+        }
+
+        let input_channels = cue.audio_channels;
+        let output_channels = audio
+            .output_channels_for_device(cue.io.output_device.as_deref())
+            .max(1);
+        let default_routes = audio
+            .default_route_channels_for_source(cue.io.output_device.as_deref(), input_channels);
+        let previous_routes = cue.io.channel_routes.clone();
+        cue.io.ensure_channel_routes_with_defaults(
+            input_channels,
+            output_channels,
+            &default_routes,
+        );
+
+        let format = match input_channels {
+            1 => "Mono",
+            2 => "Stereo",
+            6 => "5.1",
+            8 => "7.1",
+            _ => "Multichannel",
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("{} · {} source channels", format, input_channels))
+                    .strong()
+                    .color(Theme::accent()),
+            );
+            ui.label(
+                RichText::new(
+                    "Adjust the master level and each source channel before output routing.",
+                )
+                .color(Theme::text_dim())
+                .size(10.5),
+            );
+        });
+        ui.add_space(6.0);
+
+        let cue_id = cue.id;
+        let mut changed = cue.io.channel_routes != previous_routes;
+        let matrix_height = (240.0 + input_channels as f32 * 24.0).max(270.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), matrix_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |matrix_ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(("source_trim_matrix_v2", cue_id, input_channels))
+                    .auto_shrink([false, false])
+                    .show(matrix_ui, |ui| {
+                        ui.set_min_height(matrix_height);
+                        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                            // Match the I/O Routing master strip exactly: same
+                            // card width, vertical fader, readout and channel toggles.
+                            Self::mixer_strip(ui, matrix_height, |ui| {
+                                ui.label(RichText::new("MASTER").strong().color(Theme::text()));
+                                ui.add_sized(
+                                    [108.0, 28.0],
+                                    Label::new(
+                                        RichText::new("All source channels")
+                                            .color(Theme::text_dim())
+                                            .size(9.5),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.label(
+                                    RichText::new("Cue trim").color(Theme::text_dim()).size(9.5),
+                                );
+                                let mut master_db = vol_to_db(cue.volume);
+                                let master_slider = Slider::new(&mut master_db, -60.0..=6.0)
+                                    .vertical()
+                                    .show_value(false);
+                                let slider_response = ui.add_sized([30.0, 116.0], master_slider);
+                                let reset_to_zero =
+                                    Self::fader_double_clicked(ui, &slider_response);
+                                let slider_changed = slider_response.changed() || reset_to_zero;
+                                if reset_to_zero {
+                                    master_db = 0.0;
+                                }
+                                if slider_changed {
+                                    cue.volume = db_to_vol(master_db);
+                                    changed = true;
+                                }
+                                ui.horizontal(|ui| {
+                                    if Self::gain_db_input(
+                                        ui,
+                                        Id::new(("trim_master_gain_db", cue_id)),
+                                        &mut master_db,
+                                        -60.0,
+                                        6.0,
+                                        slider_changed,
+                                    ) {
+                                        cue.volume = db_to_vol(master_db);
+                                        changed = true;
+                                    }
+                                });
+                                ui.separator();
+
+                                for source_index in 0..input_channels {
+                                    let label = Self::source_channel_short_name(
+                                        input_channels,
+                                        source_index,
+                                    );
+                                    let route = &mut cue.io.channel_routes[source_index];
+                                    let mut master_enabled = route.master_enabled;
+                                    if ui.checkbox(&mut master_enabled, label).changed() {
+                                        route.master_enabled = master_enabled;
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                            ui.separator();
+
+                            // Each source gets the same vertical-strip treatment
+                            // as an OUT strip in I/O Routing, arranged left-to-right.
+                            for source_index in 0..input_channels {
+                                let source_label =
+                                    Self::source_channel_short_name(input_channels, source_index);
+                                let route = &mut cue.io.channel_routes[source_index];
+                                Self::mixer_strip(ui, matrix_height, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("SOURCE {}", source_index + 1))
+                                            .strong()
+                                            .color(Theme::text()),
+                                    );
+                                    ui.add_sized(
+                                        [108.0, 28.0],
+                                        Label::new(
+                                            RichText::new(source_label.clone())
+                                                .color(Theme::text_dim())
+                                                .size(9.5),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.label(
+                                        RichText::new("Input trim")
+                                            .color(Theme::text_dim())
+                                            .size(9.5),
+                                    );
+                                    let source_slider =
+                                        Slider::new(&mut route.gain_db, -60.0..=18.0)
+                                            .vertical()
+                                            .show_value(false);
+                                    let slider_response =
+                                        ui.add_sized([30.0, 116.0], source_slider);
+                                    let reset_to_zero =
+                                        Self::fader_double_clicked(ui, &slider_response);
+                                    let slider_changed = slider_response.changed() || reset_to_zero;
+                                    if reset_to_zero {
+                                        route.gain_db = 0.0;
+                                    }
+                                    changed |= slider_changed;
+                                    ui.horizontal(|ui| {
+                                        changed |= Self::gain_db_input(
+                                            ui,
+                                            Id::new(("trim_source_gain_db", cue_id, source_index)),
+                                            &mut route.gain_db,
+                                            -60.0,
+                                            18.0,
+                                            slider_changed,
+                                        );
+                                    });
+                                    ui.separator();
+                                    let mut active = route.active;
+                                    if ui.checkbox(&mut active, "Active").changed() {
+                                        route.active = active;
+                                        changed = true;
+                                    }
+                                });
+                            }
+                        });
+                    });
+            },
+        );
+
+        // Keep the legacy stereo fields synchronized for older project versions.
+        if let Some(left) = cue.io.channel_routes.first() {
+            cue.io.left_enabled = left.active;
+            cue.io.left_gain_db = left.gain_db;
+        }
+        if let Some(right) = cue.io.channel_routes.get(1) {
+            cue.io.right_enabled = right.active;
+            cue.io.right_gain_db = right.gain_db;
+        }
+
         changed
     }
 
@@ -1132,35 +1632,84 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         });
     }
 
-    fn gain_db_input(ui: &mut Ui, id: Id, value: &mut f32) -> bool {
+    /// A mixer channel card. Fixed inner dimensions keep MASTER, OUT and SOURCE
+    /// strips identical in width, height, border and spacing across both tabs.
+    fn mixer_strip(ui: &mut Ui, height: f32, contents: impl FnOnce(&mut Ui)) {
+        Frame::group(ui.style()).show(ui, |strip_ui| {
+            strip_ui.set_min_width(116.0);
+            strip_ui.set_max_width(116.0);
+            strip_ui.set_min_height((height - 16.0).max(180.0));
+            strip_ui.vertical_centered(contents);
+        });
+    }
+
+    /// Detect a double-click anywhere on the visible fader hit area.
+    ///
+    /// egui's Slider response only covers the narrow interactive widget itself.
+    /// In practice that makes a double-click reset difficult because the thumb
+    /// moves between clicks. Expand the hit target horizontally while keeping
+    /// the action confined to the fader track (not the dB editor or checkboxes).
+    fn fader_double_clicked(ui: &Ui, slider_response: &Response) -> bool {
+        if slider_response.double_clicked() {
+            return true;
+        }
+
+        ui.input(|input| {
+            input.pointer.button_double_clicked(PointerButton::Primary)
+                && input
+                    .pointer
+                    .interact_pos()
+                    .map(|position| {
+                        slider_response
+                            .rect
+                            .expand2(vec2(12.0, 3.0))
+                            .contains(position)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Editable dB readout. Click to type a value; Enter or focus loss commits it.
+    /// `sync_text` refreshes the edit buffer after the adjacent fader is moved.
+    fn gain_db_input(
+        ui: &mut Ui,
+        id: Id,
+        value: &mut f32,
+        min_db: f32,
+        max_db: f32,
+        sync_text: bool,
+    ) -> bool {
         let text_id = id.with("gain_db_text");
+        if sync_text {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(text_id, format!("{:+.1}", *value));
+            });
+        }
         let mut text = ui
             .ctx()
             .data(|data| data.get_temp::<String>(text_id))
-            .unwrap_or_else(|| format!("{:.1}", *value));
+            .unwrap_or_else(|| format!("{:+.1}", *value));
         let response = ui.add_sized(
-            [66.0, 22.0],
-            TextEdit::singleline(&mut text).desired_width(66.0),
+            [62.0, 22.0],
+            TextEdit::singleline(&mut text)
+                .desired_width(62.0)
+                .font(FontId::monospace(10.0)),
         );
+        ui.label(RichText::new("dB").size(10.0).color(Theme::text_dim()));
+
         let mut changed = false;
-        if response.double_clicked() {
-            *value = 0.0;
-            text = "0.0".to_string();
-            changed = true;
-        } else if response.lost_focus()
-            || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
-        {
-            let parsed = if text.trim() == "-" {
-                Some(-60.0)
-            } else {
-                text.trim().parse::<f32>().ok()
-            };
-            if let Some(parsed) = parsed {
-                let next = parsed.clamp(-60.0, 18.0);
-                changed |= (*value - next).abs() > f32::EPSILON;
-                *value = next;
+        let commit = response.lost_focus()
+            || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)));
+        if commit {
+            let normalized = text.trim().replace(',', ".");
+            if let Ok(parsed) = normalized.parse::<f32>() {
+                if parsed.is_finite() {
+                    let next = parsed.clamp(min_db, max_db);
+                    changed = (*value - next).abs() > f32::EPSILON;
+                    *value = next;
+                }
             }
-            text = format!("{:.1}", *value);
+            text = format!("{:+.1}", *value);
         }
         ui.ctx().data_mut(|data| data.insert_temp(text_id, text));
         changed

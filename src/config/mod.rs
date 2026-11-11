@@ -128,11 +128,11 @@ pub enum AudioBackend {
     Wasapi,
     /// Windows low-latency direct hardware backend. Requires an installed ASIO driver.
     Asio,
+    /// Windows DirectSound output, provided by SDL2's native DirectSound driver.
+    DirectSound,
 }
 
 impl AudioBackend {
-    pub const ALL: &'static [AudioBackend] = &[AudioBackend::Wasapi, AudioBackend::Asio];
-
     pub fn label(self) -> &'static str {
         match self {
             AudioBackend::Wasapi => {
@@ -143,6 +143,16 @@ impl AudioBackend {
                 }
             }
             AudioBackend::Asio => "ASIO",
+            AudioBackend::DirectSound => "DirectSound",
+        }
+    }
+
+    /// Compact user-facing backend name for combined device selectors.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            AudioBackend::Wasapi => "WASAPI",
+            AudioBackend::Asio => "ASIO",
+            AudioBackend::DirectSound => "DirectSound",
         }
     }
 }
@@ -174,6 +184,26 @@ impl ThemePreset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UiDesign {
+    /// Flat, crisp Material-inspired surfaces.
+    #[default]
+    Material,
+    /// Rounded, translucent Liquid Glass-inspired surfaces.
+    LiquidGlass,
+}
+
+impl UiDesign {
+    pub const ALL: &'static [UiDesign] = &[UiDesign::Material, UiDesign::LiquidGlass];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiDesign::Material => "Material",
+            UiDesign::LiquidGlass => "Liquid Glass",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSettings {
@@ -189,6 +219,24 @@ pub struct AppearanceSettings {
     /// Fill and waveform tint used for the active loop region.
     #[serde(default = "default_loop_region_color")]
     pub loop_region_color: [u8; 3],
+    /// Base fill for ordinary buttons, including the main cue-creation toolbar.
+    #[serde(default = "default_button_color")]
+    pub button_color: [u8; 3],
+    /// Outline color used to frame Group cue blocks in the Cue List.
+    #[serde(default = "default_group_outline_color")]
+    pub group_outline_color: [u8; 3],
+    /// Background fill for text inputs and editable fields.
+    #[serde(default = "default_input_color")]
+    pub input_color: [u8; 3],
+    /// Dedicated transport button colors.
+    #[serde(default = "default_go_button_color")]
+    pub go_button_color: [u8; 3],
+    #[serde(default = "default_stop_button_color")]
+    pub stop_button_color: [u8; 3],
+    #[serde(default = "default_pause_button_color")]
+    pub pause_button_color: [u8; 3],
+    #[serde(default)]
+    pub design: UiDesign,
 }
 
 impl Default for AppearanceSettings {
@@ -200,12 +248,43 @@ impl Default for AppearanceSettings {
             text_color: [220, 220, 230],
             muted_text_color: [150, 150, 165],
             loop_region_color: [75, 155, 245],
+            button_color: [42, 45, 54],
+            group_outline_color: [60, 220, 130],
+            input_color: [18, 20, 25],
+            go_button_color: [40, 180, 80],
+            stop_button_color: [200, 50, 50],
+            pause_button_color: [200, 160, 30],
+            design: UiDesign::Material,
         }
     }
 }
 
 fn default_loop_region_color() -> [u8; 3] {
     [75, 155, 245]
+}
+
+fn default_button_color() -> [u8; 3] {
+    [42, 45, 54]
+}
+
+fn default_group_outline_color() -> [u8; 3] {
+    [60, 220, 130]
+}
+
+fn default_input_color() -> [u8; 3] {
+    [18, 20, 25]
+}
+
+fn default_go_button_color() -> [u8; 3] {
+    [40, 180, 80]
+}
+
+fn default_stop_button_color() -> [u8; 3] {
+    [200, 50, 50]
+}
+
+fn default_pause_button_color() -> [u8; 3] {
+    [200, 160, 30]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,9 +323,15 @@ pub struct AppSettings {
     pub hotkeys: HotkeyConfig,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    /// Backend for the global output endpoint. Retained as persisted endpoint
+    /// identity and for migration from settings created before combined selectors.
     #[serde(default)]
     pub audio_backend: AudioBackend,
+    /// Device name paired with audio_backend; retained for display and legacy migration.
     pub audio_output_device: Option<String>,
+    /// Stable CPAL/registry endpoint identity for the global output device.
+    #[serde(default)]
+    pub audio_output_device_id: Option<String>,
     pub audio_input_device: Option<String>,
     pub osc_listen_port: u16,
     pub osc_send_addr: String,
@@ -255,6 +340,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub midi_controls: Vec<MidiControlBinding>,
     pub output_channels: Vec<OutputChannelSetting>,
+    /// Per-device output-channel mute/trim settings. Keys include the audio backend.
+    #[serde(default)]
+    pub output_channel_settings_by_device: HashMap<String, Vec<OutputChannelSetting>>,
     /// Optional user-defined aliases for each device's stream channels.
     /// Native ASIO channel names are queried separately from the driver.
     #[serde(default)]
@@ -277,6 +365,10 @@ pub struct AppSettings {
     /// backups; a backup is still created after every successful save.
     #[serde(default = "default_backup_interval_minutes")]
     pub backup_interval_minutes: u32,
+    /// Optional user-selected destination for diagnostic log files.
+    /// None uses the standard per-user LocalAppData folder.
+    #[serde(default)]
+    pub diagnostic_log_directory: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -286,6 +378,7 @@ impl Default for AppSettings {
             appearance: AppearanceSettings::default(),
             audio_backend: AudioBackend::Wasapi,
             audio_output_device: None,
+            audio_output_device_id: None,
             audio_input_device: None,
             osc_listen_port: 7700,
             osc_send_addr: "127.0.0.1:7701".to_string(),
@@ -293,6 +386,7 @@ impl Default for AppSettings {
             midi_output_port: None,
             midi_controls: Vec::new(),
             output_channels: Vec::new(),
+            output_channel_settings_by_device: HashMap::new(),
             output_channel_names: HashMap::new(),
             default_output_pairs: HashMap::new(),
             output_channel_orders: HashMap::new(),
@@ -300,6 +394,7 @@ impl Default for AppSettings {
             cue_column_widths: default_cue_column_widths(),
             bottom_panel_height: default_bottom_panel_height(),
             backup_interval_minutes: default_backup_interval_minutes(),
+            diagnostic_log_directory: None,
         }
     }
 }
@@ -320,6 +415,10 @@ fn default_backup_interval_minutes() -> u32 {
 
 impl AppSettings {
     fn file_path() -> Option<std::path::PathBuf> {
+        dirs::config_dir().map(|dir| dir.join("TheatreShowCue").join("settings.json"))
+    }
+
+    fn legacy_file_path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|dir| dir.join("CueLabs").join("settings.json"))
     }
 
@@ -327,10 +426,29 @@ impl AppSettings {
         let Some(path) = Self::file_path() else {
             return Self::default();
         };
-        let mut settings: Self = std::fs::read_to_string(&path)
+        let mut migrated_from_legacy = false;
+        let raw = std::fs::read_to_string(&path).or_else(|primary_error| {
+            let Some(legacy_path) = Self::legacy_file_path() else {
+                return Err(primary_error);
+            };
+            match std::fs::read_to_string(legacy_path) {
+                Ok(contents) => {
+                    migrated_from_legacy = true;
+                    Ok(contents)
+                }
+                Err(_) => Err(primary_error),
+            }
+        });
+        let mut settings: Self = raw
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+
+        // Move the old CueLabs preferences to the new application namespace.
+        // The legacy file is deliberately retained as a safety copy.
+        if migrated_from_legacy {
+            let _ = settings.save();
+        }
 
         // Remove legacy MIDI mappings for project/file/Cue List editing actions
         // that are no longer offered in MIDI Control. These actions remain in
@@ -383,5 +501,40 @@ mod midi_control_action_tests {
         }
 
         assert_eq!(AppAction::MIDI_CONTROL_ACTIONS.len(), 9);
+    }
+}
+
+#[cfg(test)]
+mod audio_backend_label_tests {
+    use super::AudioBackend;
+
+    #[test]
+    fn combined_device_labels_use_compact_backend_names() {
+        assert_eq!(AudioBackend::Asio.short_label(), "ASIO");
+        assert_eq!(AudioBackend::Wasapi.short_label(), "WASAPI");
+        assert_eq!(AudioBackend::DirectSound.short_label(), "DirectSound");
+    }
+}
+
+#[cfg(test)]
+mod stable_audio_settings_tests {
+    use super::{AppSettings, AudioBackend};
+
+    #[test]
+    fn legacy_settings_without_stable_output_id_still_load() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "audio_backend":"Wasapi",
+                "audio_output_device":"Speakers (USB Audio)"
+            }"#,
+        )
+        .expect("legacy application settings should deserialize");
+
+        assert_eq!(settings.audio_backend, AudioBackend::Wasapi);
+        assert_eq!(
+            settings.audio_output_device.as_deref(),
+            Some("Speakers (USB Audio)")
+        );
+        assert!(settings.audio_output_device_id.is_none());
     }
 }

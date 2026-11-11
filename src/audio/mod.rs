@@ -1,3 +1,4 @@
+pub mod device_registry;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OutputChannelInfo {
     pub index: usize,
@@ -9,5 +10,5 @@ pub(crate) struct OutputChannelInfo {
 pub mod engine;
 pub mod waveform;
 
-#[cfg(all(target_os = "windows", feature = "asio"))]
+#[cfg(target_os = "windows")]
 pub(crate) mod asio_probe;

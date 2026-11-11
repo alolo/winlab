@@ -1,6 +1,6 @@
 // src/cue/cue_list.rs — список кью
 
-use crate::cue::{Cue, CueState, CueType};
+use crate::cue::{Cue, CueState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,12 +46,6 @@ impl CueList {
         self.cues.iter_mut().find(|c| c.id == id)
     }
 
-    pub fn renumber(&mut self) {
-        for (i, cue) in self.cues.iter_mut().enumerate() {
-            cue.number = format!("{}", i + 1);
-        }
-    }
-
     pub fn active_count(&self) -> usize {
         self.cues.iter().filter(|c| c.is_active()).count()
     }
@@ -81,44 +75,5 @@ impl CueList {
             c.position_secs = 0.0;
             c.clear_wait_runtime();
         }
-    }
-
-    pub fn move_up(&mut self, id: Uuid) {
-        if let Some(i) = self.cues.iter().position(|c| c.id == id) {
-            if i > 0 {
-                self.cues.swap(i, i - 1);
-            }
-        }
-    }
-
-    pub fn move_down(&mut self, id: Uuid) {
-        let len = self.cues.len();
-        if let Some(i) = self.cues.iter().position(|c| c.id == id) {
-            if i + 1 < len {
-                self.cues.swap(i, i + 1);
-            }
-        }
-    }
-
-    /// Все аудио-кью в проекте (для выбора target в Play / Pause / Stop / Fade)
-    pub fn audio_targets(&self) -> Vec<(Uuid, String, std::path::PathBuf)> {
-        self.cues
-            .iter()
-            .filter(|c| {
-                matches!(&c.cue_type, CueType::Audio) || !c.file_path.as_os_str().is_empty()
-            })
-            .map(|c| {
-                let fname = c
-                    .file_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("no file");
-                (
-                    c.id,
-                    format!("#{} — {} ({})", c.number, c.name, fname),
-                    c.file_path.clone(),
-                )
-            })
-            .collect()
     }
 }

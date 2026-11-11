@@ -1,4 +1,4 @@
-// src/project/save_load.rs — сохранение и загрузка проектов .clabs
+// src/project/save_load.rs — сохранение и загрузка проектов .tsq
 
 use crate::cue::{CueList, CueType};
 use anyhow::Result;

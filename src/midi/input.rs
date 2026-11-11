@@ -50,7 +50,7 @@ impl MidiInputManager {
         self._connection = None;
         self.current_port = None;
 
-        let midi_in = match MidiInput::new("CueLabs Input") {
+        let midi_in = match MidiInput::new("Theatre Show Cue Input") {
             Ok(m) => m,
             Err(e) => {
                 warn!("MIDI init failed: {e}");
@@ -82,7 +82,7 @@ impl MidiInputManager {
         let repaint_context = Arc::clone(&self.repaint_context);
         match midi_in.connect(
             port,
-            "cuelabs-in",
+            "tasq-in",
             move |_stamp, raw, _| {
                 if let Some(msg) = parse_midi(raw) {
                     if tx.try_send(msg).is_ok() {
@@ -135,7 +135,7 @@ impl MidiOutputManager {
     pub fn refresh_and_connect(&mut self, preferred_port: Option<&str>) {
         self.connection = None;
         self.current_port = None;
-        let Ok(midi_out) = MidiOutput::new("CueLabs Output") else {
+        let Ok(midi_out) = MidiOutput::new("Theatre Show Cue Output") else {
             self.port_names.clear();
             return;
         };
@@ -156,7 +156,7 @@ impl MidiOutputManager {
 
         if let Some(p) = target_port {
             let pname = midi_out.port_name(p).unwrap_or_default();
-            if let Ok(conn) = midi_out.connect(p, "cuelabs-out") {
+            if let Ok(conn) = midi_out.connect(p, "tasq-out") {
                 info!("Connected MIDI Output: {}", pname);
                 self.current_port = Some(pname);
                 self.connection = Some(conn);

@@ -279,9 +279,21 @@ impl Default for LoopRegion {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChannelRoute {
+    /// Whether this source channel is routed to at least one hardware output.
     pub active: bool,
-    /// Zero-based physical output index. The UI displays it as 1-based.
+    /// Whether the source channel passes through the event's master fader.
+    /// Missing values in older project files default to enabled.
+    #[serde(default = "default_true")]
+    pub master_enabled: bool,
+    /// Legacy primary destination. Kept for compatibility with older projects.
+    /// The UI displays it as 1-based.
     pub output_channel: usize,
+    /// Zero-based destinations for this source channel. A source may be sent
+    /// to several hardware outputs at once; an output may receive several
+    /// source channels (downmixing to mono).
+    #[serde(default)]
+    pub output_channels: Vec<usize>,
+    /// Per-source-channel gain applied before the signal is copied to outputs.
     pub gain_db: f32,
 }
 
@@ -289,7 +301,9 @@ impl Default for ChannelRoute {
     fn default() -> Self {
         Self {
             active: true,
+            master_enabled: true,
             output_channel: 0,
+            output_channels: vec![0],
             gain_db: 0.0,
         }
     }
@@ -313,6 +327,14 @@ impl Default for OutputChannelSetting {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IoRouting {
     pub output_device: Option<String>,
+    /// Stable registry identity. None is accepted for legacy projects and is
+    /// migrated from (backend, output_device) when that endpoint is discovered.
+    #[serde(default)]
+    pub output_device_id: Option<String>,
+    /// Backend for an explicitly selected output device. None means the
+    /// project's legacy route (current global backend) or the global default.
+    #[serde(default)]
+    pub output_backend: Option<crate::config::AudioBackend>,
     pub input_device: Option<String>,
     pub output_channel: u16,
     pub left_gain_db: f32,
@@ -321,12 +343,17 @@ pub struct IoRouting {
     pub right_enabled: bool,
     #[serde(default)]
     pub channel_routes: Vec<ChannelRoute>,
+    /// Per-cue gain trim for each native hardware output channel, in dB.
+    #[serde(default)]
+    pub output_gains_db: Vec<f32>,
 }
 
 impl Default for IoRouting {
     fn default() -> Self {
         Self {
             output_device: None,
+            output_device_id: None,
+            output_backend: None,
             input_device: None,
             output_channel: 0,
             left_gain_db: 0.0,
@@ -334,6 +361,7 @@ impl Default for IoRouting {
             left_enabled: true,
             right_enabled: true,
             channel_routes: Vec::new(),
+            output_gains_db: Vec::new(),
         }
     }
 }
@@ -352,20 +380,50 @@ impl IoRouting {
                 1 => (self.right_enabled, self.right_gain_db),
                 _ => (true, 0.0),
             };
+            let output_channel = if index < output_channels {
+                index
+            } else if output_channels == 2 {
+                index % 2
+            } else {
+                0
+            };
             self.channel_routes.push(ChannelRoute {
                 active,
-                output_channel: if index < output_channels {
-                    index
-                } else if output_channels == 2 {
-                    index % 2
+                master_enabled: true,
+                output_channel,
+                output_channels: if active {
+                    vec![output_channel]
                 } else {
-                    0
+                    Vec::new()
                 },
                 gain_db,
             });
         }
         for route in &mut self.channel_routes {
             route.output_channel = route.output_channel.min(output_channels - 1);
+            route
+                .output_channels
+                .retain(|index| *index < output_channels);
+            route.output_channels.sort_unstable();
+            route.output_channels.dedup();
+
+            // Old project files only have `active` + `output_channel`. Migrate
+            // those records to a one-destination matrix without changing their
+            // audible routing. An intentionally disabled route stays disabled.
+            if route.output_channels.is_empty() && route.active {
+                route.output_channels.push(route.output_channel);
+            }
+            if let Some(primary) = route.output_channels.first().copied() {
+                route.output_channel = primary;
+            }
+        }
+        self.output_gains_db.resize(output_channels, 0.0);
+        self.output_gains_db.truncate(output_channels);
+        for gain in &mut self.output_gains_db {
+            if !gain.is_finite() {
+                *gain = 0.0;
+            }
+            *gain = (*gain).clamp(-60.0, 18.0);
         }
     }
 
@@ -383,8 +441,12 @@ impl IoRouting {
 
         for source_index in existing_routes..self.channel_routes.len() {
             if let Some(output_index) = default_output_channels.get(source_index) {
-                self.channel_routes[source_index].output_channel =
-                    (*output_index).min(output_channels - 1);
+                let route = &mut self.channel_routes[source_index];
+                let output_index = (*output_index).min(output_channels - 1);
+                route.output_channel = output_index;
+                if route.active {
+                    route.output_channels = vec![output_index];
+                }
             }
         }
     }
@@ -418,8 +480,8 @@ impl FadeCurve {
             return self.apply(t);
         }
 
-        let mut previous = points[0];
-        for next in points.iter().copied().skip(1) {
+        let mut previous = [0.0_f32, 0.0_f32];
+        for next in points.iter().copied() {
             if t <= next[0] {
                 let span = (next[0] - previous[0]).max(0.0001);
                 let local_t = ((t - previous[0]) / span).clamp(0.0, 1.0);
@@ -427,7 +489,9 @@ impl FadeCurve {
             }
             previous = next;
         }
-        previous[1].clamp(0.0, 1.0)
+        let span = (1.0 - previous[0]).max(0.0001);
+        let local_t = ((t - previous[0]) / span).clamp(0.0, 1.0);
+        (previous[1] + (1.0 - previous[1]) * local_t).clamp(0.0, 1.0)
     }
 }
 
@@ -523,6 +587,56 @@ fn default_custom_fade_points() -> Vec<[f32; 2]> {
     vec![[0.0, 0.0], [1.0, 1.0]]
 }
 
+/// Playback speed and pitch controls, including independently editable waveform envelopes.
+/// Automation points are `[absolute_source_time_seconds, value]`: speed is a ratio,
+/// pitch is cents. `preserve_pitch_on_speed_change` enables time-stretching while
+/// changing duration; `pitch_shift_changes_speed` makes pitch automation behave as
+/// traditional varispeed instead of keeping the clip duration unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimePitchSettings {
+    #[serde(default = "default_playback_speed")]
+    pub speed: f32,
+    #[serde(default)]
+    pub pitch_cents: f32,
+    #[serde(default = "default_true")]
+    pub preserve_pitch_on_speed_change: bool,
+    #[serde(default)]
+    pub pitch_shift_changes_speed: bool,
+    #[serde(default)]
+    pub speed_automation_enabled: bool,
+    #[serde(default)]
+    pub speed_automation: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub pitch_automation_enabled: bool,
+    #[serde(default)]
+    pub pitch_automation: Vec<[f64; 2]>,
+}
+
+fn default_playback_speed() -> f32 {
+    1.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_time_trigger_time() -> String {
+    "20:00".to_string()
+}
+
+impl Default for TimePitchSettings {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            pitch_cents: 0.0,
+            preserve_pitch_on_speed_change: true,
+            pitch_shift_changes_speed: false,
+            speed_automation_enabled: false,
+            speed_automation: Vec::new(),
+            pitch_automation_enabled: false,
+            pitch_automation: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cue {
     pub id: Uuid,
@@ -550,7 +664,10 @@ pub struct Cue {
     #[serde(default)]
     pub audio_channels: usize,
     pub volume: f32,
-    /// Per-cue volume envelope points as [absolute source time in seconds, linear gain 0..1].
+    /// Playback speed, pitch shift and their independent automation curves.
+    #[serde(default)]
+    pub time_pitch: TimePitchSettings,
+    /// Per-cue volume envelope as [absolute source time in seconds, linear gain 0..1].
     #[serde(default)]
     pub volume_automation_enabled: bool,
     #[serde(default)]
@@ -568,6 +685,11 @@ pub struct Cue {
     pub midi_trigger: Option<MidiTrigger>,
     #[serde(default)]
     pub hotkey: Option<String>,
+    /// Daily trigger in the computer's local 24-hour clock (HH:MM:SS).
+    #[serde(default)]
+    pub time_trigger_enabled: bool,
+    #[serde(default = "default_time_trigger_time")]
+    pub time_trigger_time: String,
     #[serde(skip)]
     pub waveform: Vec<f32>,
     #[serde(skip)]
@@ -600,6 +722,7 @@ impl Cue {
             file_path,
             audio_channels: 2,
             volume: 1.0,
+            time_pitch: TimePitchSettings::default(),
             volume_automation_enabled: false,
             volume_automation: Vec::new(),
             fade_in_secs: 0.0,
@@ -612,6 +735,8 @@ impl Cue {
             io: IoRouting::default(),
             midi_trigger: None,
             hotkey: None,
+            time_trigger_enabled: false,
+            time_trigger_time: default_time_trigger_time(),
             waveform: vec![],
             duration_secs: 0.0,
         }
@@ -638,6 +763,7 @@ impl Cue {
             file_path: PathBuf::new(),
             audio_channels: 0,
             volume: 1.0,
+            time_pitch: TimePitchSettings::default(),
             volume_automation_enabled: false,
             volume_automation: Vec::new(),
             fade_in_secs: 0.0,
@@ -650,6 +776,8 @@ impl Cue {
             io: IoRouting::default(),
             midi_trigger: None,
             hotkey: None,
+            time_trigger_enabled: false,
+            time_trigger_time: default_time_trigger_time(),
             waveform: vec![],
             duration_secs: 0.0,
         }
@@ -755,7 +883,64 @@ mod fade_status_tests {
         routing.ensure_channel_routes_with_defaults(2, 6, &[4, 5]);
 
         assert_eq!(routing.channel_routes[0].output_channel, 4);
+        assert_eq!(routing.channel_routes[0].output_channels, vec![4]);
         assert_eq!(routing.channel_routes[1].output_channel, 5);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![5]);
+        assert_eq!(routing.output_gains_db, vec![0.0; 6]);
+    }
+
+    #[test]
+    fn per_cue_output_gains_resize_to_the_selected_device_channels() {
+        let mut routing = IoRouting::default();
+        routing.ensure_channel_routes_with_defaults(2, 4, &[0, 1]);
+        routing.output_gains_db[2] = -8.0;
+        routing.ensure_channel_routes_with_defaults(2, 6, &[0, 1]);
+
+        assert_eq!(routing.output_gains_db.len(), 6);
+        assert_eq!(routing.output_gains_db[2], -8.0);
+        assert_eq!(routing.output_gains_db[5], 0.0);
+    }
+
+    #[test]
+    fn legacy_io_routing_without_backend_deserializes_as_global_backend_route() {
+        let routing: IoRouting = serde_json::from_str(
+            r#"{
+                "output_device":"Focusrite USB",
+                "input_device":null,
+                "output_channel":0,
+                "left_gain_db":0.0,
+                "right_gain_db":0.0,
+                "left_enabled":true,
+                "right_enabled":true,
+                "channel_routes":[],
+                "output_gains_db":[]
+            }"#,
+        )
+        .expect("legacy I/O routing should deserialize");
+
+        assert_eq!(routing.output_device.as_deref(), Some("Focusrite USB"));
+        assert!(routing.output_device_id.is_none());
+        assert!(routing.output_backend.is_none());
+    }
+
+    #[test]
+    fn legacy_route_without_matrix_destinations_migrates_to_its_primary_output() {
+        let legacy: ChannelRoute =
+            serde_json::from_str(r#"{"active":true,"output_channel":3,"gain_db":0.0}"#)
+                .expect("legacy route should deserialize");
+        let mut routing = IoRouting::default();
+        routing.channel_routes.push(legacy);
+        routing.ensure_channel_routes(1, 6);
+
+        assert_eq!(routing.channel_routes[0].output_channels, vec![3]);
+    }
+
+    #[test]
+    fn custom_fade_curve_is_continuous_at_zero_and_unity_endpoints() {
+        let points = vec![[0.2, 0.2], [0.8, 0.8]];
+        assert!((FadeCurve::Custom.apply_with_points(0.0, &points) - 0.0).abs() < 0.0001);
+        assert!((FadeCurve::Custom.apply_with_points(0.1, &points) - 0.1).abs() < 0.0001);
+        assert!((FadeCurve::Custom.apply_with_points(1.0, &points) - 1.0).abs() < 0.0001);
     }
 
     #[test]
@@ -763,7 +948,9 @@ mod fade_status_tests {
         let mut routing = IoRouting::default();
         routing.channel_routes.push(ChannelRoute {
             active: true,
+            master_enabled: true,
             output_channel: 1,
+            output_channels: vec![1],
             gain_db: -3.0,
         });
         routing.ensure_channel_routes_with_defaults(2, 6, &[4, 5]);
@@ -771,5 +958,14 @@ mod fade_status_tests {
         assert_eq!(routing.channel_routes[0].output_channel, 1);
         assert_eq!(routing.channel_routes[0].gain_db, -3.0);
         assert_eq!(routing.channel_routes[1].output_channel, 5);
+    }
+
+    #[test]
+    fn legacy_channel_route_defaults_master_enabled() {
+        let route: ChannelRoute = serde_json::from_str(
+            r#"{"active":true,"output_channel":0,"output_channels":[0],"gain_db":0.0}"#,
+        )
+        .unwrap();
+        assert!(route.master_enabled);
     }
 }

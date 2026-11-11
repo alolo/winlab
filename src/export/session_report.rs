@@ -33,6 +33,7 @@ impl SessionReport {
     }
 
     pub fn record(&mut self, cue_number: &str, cue_name: &str, duration: f64, action: &str) {
+        self.session_end = None;
         self.events.push(PlayEvent {
             timestamp: Local::now(),
             cue_number: cue_number.to_string(),

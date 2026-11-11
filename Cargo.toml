@@ -1,18 +1,14 @@
 [package]
-name = "cuelabs"
-version = "0.1.0"
+name = "TheatreShowCue"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["CueLabs Team"]
+authors = ["Alo production"]
 description = "Professional audio cue player for live performance"
 
 [[bin]]
-name = "cuelabs"
+name = "TaSQ"
 path = "src/main.rs"
-
-[features]
-default = ["asio"]
-asio = ["cpal/asio", "dep:azo"]
 
 [dependencies]
 # --- GUI ---
@@ -21,7 +17,7 @@ egui = "0.31.1"
 egui_extras = { version = "0.31.1", features = ["all_loaders"] }
 
 # --- Audio ---
-cpal = { version = "0.18.2" }
+cpal = { version = "0.18.2", features = ["asio"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "symphonia-all", "crossbeam-channel"] }
 symphonia = { version = "0.6.1", features = ["all"] }
 
@@ -62,4 +58,6 @@ lto = true
 codegen-units = 1
 
 [target.'cfg(target_os = "windows")'.dependencies]
-azo = { version = "0.5.2", default-features = false, optional = true }
+azo = { version = "0.5.2", default-features = false }
+# SDL2 provides the native Windows DirectSound output driver.
+sdl2 = { version = "0.38.0", features = ["bundled"] }

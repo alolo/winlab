@@ -1,9 +1,11 @@
-// src/app.rs — главное состояние приложения CueLabs
+// src/app.rs — главное состояние приложения Theatre Show Cue
 
+use crate::audio::device_registry::DeviceRegistryMonitor;
 use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::waveform::{generate_waveform, get_channel_count, get_duration};
 use crate::config::{
     AppAction, AppSettings, AudioBackend, MidiControlBinding, MidiControlKind, ThemePreset,
+    UiDesign,
 };
 use crate::cue::{
     ContinueMode, Cue, CueList, CueState, CueType, FadeCurve, GroupMode, MidiMessageKind,
@@ -29,6 +31,9 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+const INTERNAL_CUE_CLIPBOARD_MARKER: &str = "TheatreShowCue::InternalCueClipboard::v1";
+const WAVEFORM_BUCKETS: usize = 4096;
+
 fn edit_rgb_color(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -43,15 +48,16 @@ fn edit_rgb_color(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
 }
 
 fn ensure_project_extension(path: PathBuf) -> PathBuf {
-    if path
+    // New projects use .tsq. Keep .clabs intact when saving an older project
+    // in place so existing files remain editable without forced conversion.
+    let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("clabs"))
-        .unwrap_or(false)
-    {
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("tsq") || extension.eq_ignore_ascii_case("clabs") {
         path
     } else {
-        path.with_extension("clabs")
+        path.with_extension("tsq")
     }
 }
 
@@ -106,6 +112,7 @@ enum Panel {
     Waveform,
     Playback,
     IoRouting,
+    Trim,
     Midi,
     Report,
 }
@@ -119,7 +126,7 @@ enum SettingsTab {
     Midi,
     MidiControl,
     Playback,
-    Backup,
+    BackupLogs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,8 +220,12 @@ fn normal_group_manual_stop_in(
     None
 }
 
-pub struct CueLabsApp {
+pub struct TheatreShowCueApp {
     audio: AudioEngine,
+    device_registry_monitor: DeviceRegistryMonitor,
+    /// True after the active endpoint disappears; the next explicit selection
+    /// of that same endpoint rebuilds the stream after it is reconnected.
+    active_output_needs_reopen: bool,
     midi: MidiInputManager,
     midi_out: MidiOutputManager,
     osc: Option<OscServer>,
@@ -233,8 +244,11 @@ pub struct CueLabsApp {
     midi_cc_pressed: HashSet<(u8, u8)>,
 
     selected: Option<Uuid>,
+    /// One-shot Cue List scroll target used by Select Next/Previous navigation.
+    scroll_to_cue: Option<Uuid>,
     selected_ids: HashSet<Uuid>,
     selection_anchor: Option<Uuid>,
+    cue_clipboard: Vec<Cue>,
     editing: Option<(Uuid, EditField, String)>,
     editing_focus_pending: bool,
     project_name_edit: Option<String>,
@@ -245,8 +259,13 @@ pub struct CueLabsApp {
     status_msg: String,
     cue_column_widths: [f32; 9],
     bottom_panel_height: f32,
-    bottom_panel_dirty: bool,
     bottom_panel_visible: bool,
+    /// True while the lower inspector's resize handle owns the primary pointer drag.
+    /// CueTable must not interpret that same drag as a cue-row move.
+    bottom_panel_resize_active: bool,
+    /// Also suppress the pointer-release frame so the splitter's mouse-up cannot
+    /// be interpreted as a click on the last visible cue row.
+    bottom_panel_resize_release_guard: bool,
     notes_sidebar_open: bool,
     fade_started_at: HashMap<Uuid, Instant>,
     fade_managed_targets: HashSet<Uuid>,
@@ -254,6 +273,8 @@ pub struct CueLabsApp {
     /// playback instance are ignored after a stop/restart race.
     audio_generations: HashMap<Uuid, u64>,
     pending_triggers: Vec<PendingTrigger>,
+    /// Local date + configured clock value used to deduplicate each daily time trigger.
+    time_trigger_last_fired: HashMap<Uuid, String>,
     active_playlists: Vec<ActivePlaylist>,
     active_all_cues: Vec<ActiveAllCues>,
     startup_frame_logged: bool,
@@ -261,27 +282,41 @@ pub struct CueLabsApp {
     last_media_scan_at: Instant,
 }
 
-impl CueLabsApp {
+impl TheatreShowCueApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let mut settings = AppSettings::load();
+        let requested_backend = settings.audio_backend;
         Theme::apply(&cc.egui_ctx, &settings.appearance);
-        let mut audio =
-            AudioEngine::new_with_backend(settings.audio_backend).unwrap_or_else(|error| {
+        let mut audio = match AudioEngine::new_with_backend_and_endpoint(
+            settings.audio_backend,
+            settings.audio_output_device_id.as_deref(),
+            settings.audio_output_device.as_deref(),
+        ) {
+            Ok(audio) => audio,
+            Err(error) => {
                 warn!(
-                    "Could not initialise {} backend: {}. Falling back to WASAPI/shared default.",
-                    settings.audio_backend.label(),
+                    "Could not initialise saved audio endpoint '{} — {}': {}. Retrying the selected backend default.",
+                    settings.audio_backend.short_label(),
+                    settings.audio_output_device.as_deref().unwrap_or("System Default"),
                     error
                 );
-                settings.audio_backend = AudioBackend::Wasapi;
-                AudioEngine::new().unwrap_or_else(|fallback_error| {
-                    panic!("Cannot initialise audio engine: {fallback_error}");
-                })
-            });
-        if let Some(device) = settings.audio_output_device.as_deref() {
-            if audio.output_devices.iter().any(|name| name == device) {
-                audio.set_output_device(device);
+                match AudioEngine::new_with_backend(settings.audio_backend) {
+                    Ok(audio) => audio,
+                    Err(backend_error) => {
+                        warn!(
+                            "Could not initialise {} backend: {}. Falling back to WASAPI/system default.",
+                            settings.audio_backend.label(),
+                            backend_error
+                        );
+                        settings.audio_backend = AudioBackend::Wasapi;
+                        settings.audio_output_device = None;
+                        AudioEngine::new().unwrap_or_else(|fallback_error| {
+                            panic!("Cannot initialise audio engine: {fallback_error}");
+                        })
+                    }
+                }
             }
-        }
+        };
         if let Some(device) = settings.audio_input_device.as_deref() {
             if audio.input_devices.iter().any(|name| name == device) {
                 audio.set_input_device(device);
@@ -298,6 +333,54 @@ impl CueLabsApp {
             .output_channels
             .truncate(audio.output_channels.max(1));
         audio.set_output_channel_settings(settings.output_channels.clone());
+        for device in audio.output_devices.clone() {
+            let settings_key = audio.output_device_settings_key(&device);
+            if let Some(device_settings) = settings
+                .output_channel_settings_by_device
+                .get(&settings_key)
+            {
+                audio.set_output_channel_settings_for_device(&device, device_settings.clone());
+            }
+        }
+        settings.output_channels = audio.output_channel_settings();
+        if let Some(active_directory) = crate::diagnostics::active_log_directory() {
+            let saved_directory = settings
+                .diagnostic_log_directory
+                .as_deref()
+                .map(PathBuf::from);
+            if saved_directory
+                .as_ref()
+                .is_some_and(|saved| saved != &active_directory)
+            {
+                // The configured path was unavailable at startup; keep the
+                // safe fallback rather than persisting an unusable location.
+                settings.diagnostic_log_directory = None;
+                let _ = settings.save();
+            }
+        }
+        if let Err(error) = crate::diagnostics::write_runtime_report(
+            audio.backend.label(),
+            &audio.output_devices,
+            &audio.input_devices,
+            audio.output_channels,
+        ) {
+            warn!("Could not write diagnostic report: {error}");
+        }
+
+        if settings.audio_backend != requested_backend
+            || settings.audio_output_device.as_deref() != Some(audio.current_device.as_str())
+            || settings.audio_output_device_id.as_deref() != Some(audio.current_device_id.as_str())
+        {
+            settings.audio_backend = audio.backend;
+            settings.audio_output_device = Some(audio.current_device.clone());
+            settings.audio_output_device_id = Some(audio.current_device_id.clone());
+            let _ = settings.save();
+        }
+
+        let device_registry_monitor = DeviceRegistryMonitor::spawn(
+            AudioEngine::scan_hotplug_output_endpoints,
+            Duration::from_secs(5),
+        );
 
         let mut midi = MidiInputManager::new();
         midi.set_repaint_context(cc.egui_ctx.clone());
@@ -314,10 +397,12 @@ impl CueLabsApp {
             .ok();
         let cue_column_widths = settings.cue_column_widths;
         let bottom_panel_height = settings.bottom_panel_height.clamp(80.0, 1200.0);
-        info!("CueLabs initialization complete; creating the main window");
+        info!("Theatre Show Cue initialization complete; creating the main window");
 
         Self {
             audio,
+            device_registry_monitor,
+            active_output_needs_reopen: false,
             midi,
             midi_out,
             osc,
@@ -334,8 +419,10 @@ impl CueLabsApp {
             midi_learn_action: None,
             midi_cc_pressed: HashSet::new(),
             selected: None,
+            scroll_to_cue: None,
             selected_ids: HashSet::new(),
             selection_anchor: None,
+            cue_clipboard: Vec::new(),
             editing: None,
             editing_focus_pending: false,
             project_name_edit: None,
@@ -345,6 +432,7 @@ impl CueLabsApp {
             master_vol: 1.0,
             status_msg: "Ready — drag audio files here or add events from the toolbar".to_string(),
             pending_triggers: Vec::new(),
+            time_trigger_last_fired: HashMap::new(),
             active_playlists: Vec::new(),
             active_all_cues: Vec::new(),
             startup_frame_logged: false,
@@ -352,8 +440,9 @@ impl CueLabsApp {
             last_media_scan_at: Instant::now(),
             cue_column_widths,
             bottom_panel_height,
-            bottom_panel_dirty: false,
             bottom_panel_visible: true,
+            bottom_panel_resize_active: false,
+            bottom_panel_resize_release_guard: false,
             notes_sidebar_open: true,
             fade_started_at: HashMap::new(),
             fade_managed_targets: HashSet::new(),
@@ -394,9 +483,17 @@ impl CueLabsApp {
         self.trigger_cue(id);
         // A group may select its own manual boundary while executing. Preserve
         // that selection; otherwise advance past the entire automatic chain.
+        // If there is no next cue for a manual GO, clear the operator cursor:
+        // the playing cue remains visibly marked by its playback outline.
         if self.selected == Some(id) {
             if let Some(next_id) = next_manual {
                 self.select_only(next_id);
+            } else {
+                self.selected = None;
+                self.selected_ids.clear();
+                self.selection_anchor = None;
+                self.editing = None;
+                self.editing_focus_pending = false;
             }
         }
     }
@@ -406,7 +503,8 @@ impl CueLabsApp {
         let mut visited = HashSet::new();
         loop {
             if !visited.insert(current_id) {
-                return Some(current_id);
+                // An automatic cycle has no next manual cue to select.
+                return None;
             }
             let Some(cue) = self.cue_list.find(current_id) else {
                 return None;
@@ -417,10 +515,10 @@ impl CueLabsApp {
                 continue;
             }
             if cue.continue_mode == ContinueMode::Nothing {
-                return self.next_non_comment_after(current_id).or(Some(current_id));
+                return self.next_non_comment_after(current_id);
             }
             let Some(next_id) = self.next_auto_cue_id(current_id) else {
-                return Some(current_id);
+                return None;
             };
             current_id = next_id;
         }
@@ -462,12 +560,28 @@ impl CueLabsApp {
             return;
         }
 
+        // GO on an already-running cue is a fresh trigger. Remove stale waits,
+        // completion callbacks and continuation callbacks from its previous run.
+        self.pending_triggers
+            .retain(|trigger| trigger.cue_id != id && trigger.source_cue_id != Some(id));
+        self.clear_fade_managed_targets_for_cue(id);
+        self.fade_started_at.remove(&id);
+        self.fade_managed_targets.remove(&id);
+
         let Some(cue) = self.cue_list.find(id) else {
             return;
         };
+        info!(
+            "Cue trigger requested: id={}, number='{}', name='{}', state={:?}, pre_wait={:.3}s, post_wait={:.3}s",
+            cue.id,
+            cue.number,
+            cue.name,
+            cue.state,
+            cue.pre_wait_secs,
+            cue.post_wait_secs
+        );
         let pre_wait = cue.pre_wait_secs.max(0.0);
         let post_wait = cue.post_wait_secs.max(0.0);
-        let is_fade_action = matches!(&cue.cue_type, CueType::Fade { .. });
         let continue_mode = cue.continue_mode.clone();
         let is_group_run = matches!(
             &cue.cue_type,
@@ -502,12 +616,14 @@ impl CueLabsApp {
         // Auto-Continue keeps its time-based behaviour in Normal mode. Playlist
         // and All Cues own their child order, so their children cannot schedule
         // a second, competing continuation chain.
-        if continue_mode == ContinueMode::AutoContinue
-            && !is_managed_child
-            && !is_group_run
-            && !is_fade_action
-        {
+        if continue_mode == ContinueMode::AutoContinue && !is_managed_child && !is_group_run {
             if let Some(next_id) = self.next_auto_cue_id(id) {
+                let fade_target_is_next = self.fade_target_is_next_or_container(id, next_id);
+                if fade_target_is_next {
+                    // Fade already started/operates this next cue. Let that cue's
+                    // own Continue setting control what follows it.
+                    return;
+                }
                 let now = Instant::now();
                 let delay = pre_wait + post_wait;
                 if post_wait > 0.0 {
@@ -714,9 +830,145 @@ impl CueLabsApp {
 
         if should_follow {
             if let Some(next_id) = self.next_auto_cue_id(cue_id) {
+                if self.fade_target_is_next_or_container(cue_id, next_id) {
+                    // The target is already the next logical cue and was started
+                    // by this Fade. Do not restart it or jump over its Continue=Nothing.
+                    return;
+                }
                 self.trigger_cue(next_id);
             }
         }
+    }
+
+    fn cue_play_start_position(cue: &Cue) -> f64 {
+        // GO on an active cue is a restart, not a seek-resume. A stopped cue may
+        // still carry a deliberate waveform start position selected by the user.
+        let position = if cue.is_active() {
+            cue.start_secs
+        } else if cue.position_secs > cue.start_secs {
+            cue.position_secs
+        } else {
+            cue.start_secs
+        };
+        position.clamp(cue.start_secs.max(0.0), cue.effective_end_secs())
+    }
+
+    fn cue_output_backend(&self, cue: &Cue) -> AudioBackend {
+        cue.io
+            .output_backend
+            .or_else(|| {
+                cue.io
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| self.audio.device_registry.find_by_id(id))
+                    .map(|endpoint| endpoint.backend)
+            })
+            .unwrap_or(self.audio.backend)
+    }
+
+    /// Resolve a saved Cue endpoint by stable ID. For older projects, migrate
+    /// the legacy (backend, display name) pair to the registry ID when available.
+    fn normalize_cue_output_endpoint(&mut self, cue_id: Uuid, cue: &mut Cue) {
+        let Some(device_name) = cue.io.output_device.clone() else {
+            return;
+        };
+        let route_backend = self.cue_output_backend(cue);
+
+        let endpoint = if let Some(saved_id) = cue.io.output_device_id.as_deref() {
+            self.audio
+                .device_registry
+                .find_available_by_id(saved_id)
+                .filter(|endpoint| endpoint.backend == route_backend)
+                .cloned()
+        } else {
+            self.audio
+                .device_registry
+                .find_available_by_backend_name(route_backend, &device_name)
+                .cloned()
+        };
+
+        if let Some(endpoint) = endpoint {
+            if endpoint.backend == self.audio.backend {
+                self.audio.refresh_output_device_info(&endpoint.device_name);
+            }
+            cue.io.output_device = Some(endpoint.device_name.clone());
+            cue.io.output_device_id = Some(endpoint.id.clone());
+            cue.io.output_backend = Some(endpoint.backend);
+            if let Some(stored_cue) = self.cue_list.find_mut(cue_id) {
+                stored_cue.io.output_device = Some(endpoint.device_name);
+                stored_cue.io.output_device_id = Some(endpoint.id);
+                stored_cue.io.output_backend = Some(endpoint.backend);
+            }
+        }
+    }
+
+    /// Do not start a Cue if its saved endpoint is currently offline or belongs
+    /// to a backend/ASIO driver that this Stage 3 process cannot service.
+    fn cue_output_backend_is_active(&mut self, cue: &Cue) -> bool {
+        let Some(device_name) = cue.io.output_device.as_deref() else {
+            if self
+                .audio
+                .device_registry
+                .find_available_by_id(&self.audio.current_device_id)
+                .is_some()
+            {
+                return true;
+            }
+            let message = format!(
+                "Cue '{}' uses the global output {} — '{}', but that endpoint is currently unavailable.",
+                cue.name,
+                self.audio.backend.short_label(),
+                self.audio.current_device
+            );
+            self.status_msg = message.clone();
+            warn!("{}", message);
+            return false;
+        };
+        let route_backend = self.cue_output_backend(cue);
+
+        if !self.audio.registered_endpoint_available(
+            route_backend,
+            cue.io.output_device_id.as_deref(),
+            device_name,
+        ) {
+            let message = format!(
+                "Cue '{}' is routed to {} — '{}', but that endpoint is currently unavailable. The saved route has been retained; reconnect the device and refresh the registry.",
+                cue.name,
+                route_backend.short_label(),
+                device_name
+            );
+            self.status_msg = message.clone();
+            warn!("{}", message);
+            return false;
+        }
+
+        if route_backend != self.audio.backend {
+            let message = format!(
+                "Cue '{}' is routed to {} — '{}', but the active backend is {}. Cross-backend playback will be enabled in Stage 4.",
+                cue.name,
+                route_backend.short_label(),
+                device_name,
+                self.audio.backend.short_label()
+            );
+            self.status_msg = message.clone();
+            warn!("{}", message);
+            return false;
+        }
+
+        if route_backend == AudioBackend::Asio && device_name != self.audio.current_device.as_str()
+        {
+            let message = format!(
+                "Cue '{}' is routed to ASIO — '{}', but '{}' is the active ASIO driver. Only one ASIO driver can be active in this process; select the Cue's device as the global output or wait for Stage 4.",
+                cue.name,
+                device_name,
+                self.audio.current_device
+            );
+            self.status_msg = message.clone();
+            warn!("{}", message);
+            return false;
+        }
+
+        true
     }
 
     /// Start an Audio cue. An optional override is used by a Fade In cue when
@@ -726,12 +978,18 @@ impl CueLabsApp {
         &mut self,
         id: Uuid,
         fade_override: Option<(f64, FadeCurve, Vec<[f32; 2]>, f32)>,
-    ) {
-        let Some(snapshot) = self.cue_list.find(id).cloned() else {
-            return;
+    ) -> bool {
+        // Fade In can start its target directly, so center that playing audio cue too.
+        self.scroll_to_cue = Some(id);
+        let Some(mut snapshot) = self.cue_list.find(id).cloned() else {
+            return false;
         };
         if !matches!(&snapshot.cue_type, CueType::Audio) {
-            return;
+            return false;
+        }
+        self.normalize_cue_output_endpoint(id, &mut snapshot);
+        if !self.cue_output_backend_is_active(&snapshot) {
+            return false;
         }
 
         let source_channels = snapshot.audio_channels.max(1);
@@ -739,9 +997,10 @@ impl CueLabsApp {
             .audio
             .output_channels_for_device(snapshot.io.output_device.as_deref());
         let mut routing = snapshot.io.clone();
-        let default_route_channels = self
-            .audio
-            .default_route_output_channels(snapshot.io.output_device.as_deref());
+        let default_route_channels = self.audio.default_route_channels_for_source(
+            snapshot.io.output_device.as_deref(),
+            source_channels,
+        );
         routing.ensure_channel_routes_with_defaults(
             source_channels,
             output_channels,
@@ -751,6 +1010,7 @@ impl CueLabsApp {
             cue.state = CueState::Playing;
             cue.audio_channels = source_channels;
             cue.io.channel_routes = routing.channel_routes.clone();
+            cue.io.output_gains_db = routing.output_gains_db.clone();
         }
 
         info!(
@@ -775,31 +1035,31 @@ impl CueLabsApp {
             generation,
             file: snapshot.file_path.clone(),
             output_device: snapshot.io.output_device.clone(),
-            start_secs: if snapshot.position_secs > snapshot.start_secs {
-                snapshot
-                    .position_secs
-                    .clamp(snapshot.start_secs, snapshot.effective_end_secs())
-            } else {
-                snapshot.start_secs
-            },
+            start_secs: Self::cue_play_start_position(&snapshot),
             end_secs: snapshot.end_secs,
             duration_secs: snapshot.duration_secs,
             volume,
             volume_automation_enabled: snapshot.volume_automation_enabled,
             volume_automation: snapshot.volume_automation.clone(),
+            time_pitch: snapshot.time_pitch.clone(),
             fade_in_secs,
             fade_out_secs: snapshot.fade_out_secs,
             fade_curve,
             custom_fade_points,
             channel_routes: routing.channel_routes,
+            output_gains_db: routing.output_gains_db,
             loop_enabled: snapshot.loop_region.enabled,
             loop_start: snapshot.loop_region.start_secs,
             loop_end: snapshot.loop_region.end_secs,
             loop_count: snapshot.loop_region.count,
         });
+        true
     }
 
     fn execute_cue_now(&mut self, id: Uuid) {
+        // Keep the cue that actually starts execution centered in the Cue List.
+        // This also covers Auto-Continue/Auto-Follow and delayed pre-wait cues.
+        self.scroll_to_cue = Some(id);
         if let Some(cue) = self.cue_list.find_mut(id) {
             cue.clear_wait_runtime();
             if cue.state == CueState::Waiting {
@@ -807,13 +1067,54 @@ impl CueLabsApp {
                 cue.position_secs = 0.0;
             }
         }
-        let Some(cue_snapshot) = self.cue_list.find(id).cloned() else {
+        let Some(mut cue_snapshot) = self.cue_list.find(id).cloned() else {
             return;
         };
+        self.normalize_cue_output_endpoint(id, &mut cue_snapshot);
+        info!(
+            "Cue execution started: id={}, number='{}', name='{}'",
+            cue_snapshot.id, cue_snapshot.number, cue_snapshot.name
+        );
+
+        let cue_starts_audio_directly = matches!(
+            &cue_snapshot.cue_type,
+            CueType::Audio | CueType::Play { target_id: None }
+        ) && (matches!(&cue_snapshot.cue_type, CueType::Audio)
+            || !cue_snapshot.file_path.as_os_str().is_empty());
+        if cue_starts_audio_directly && !self.cue_output_backend_is_active(&cue_snapshot) {
+            if let Some(cue) = self.cue_list.find_mut(id) {
+                cue.state = CueState::Stopped;
+            }
+            return;
+        }
+
+        if matches!(&cue_snapshot.cue_type, CueType::Group { .. }) {
+            let descendants = self.group_descendant_ids(id);
+            let has_active_child = descendants.iter().skip(1).any(|child_id| {
+                self.cue_list
+                    .find(*child_id)
+                    .map(|child| child.is_active())
+                    .unwrap_or(false)
+            });
+            let has_pending_child = self.pending_triggers.iter().any(|trigger| {
+                descendants.contains(&trigger.cue_id)
+                    || trigger
+                        .source_cue_id
+                        .is_some_and(|source_id| descendants.contains(&source_id))
+            });
+            let has_group_run = self.active_playlists.iter().any(|run| run.group_id == id)
+                || self.active_all_cues.iter().any(|run| run.group_id == id);
+            if has_active_child || has_pending_child || has_group_run {
+                // Re-triggering a group starts a clean run from its first child.
+                self.stop_target_and_descendants(id);
+            }
+        }
 
         match cue_snapshot.cue_type {
             CueType::Audio => {
-                self.start_audio_cue(id, None);
+                if !self.start_audio_cue(id, None) {
+                    return;
+                }
                 self.report
                     .record(&cue_snapshot.number, &cue_snapshot.name, 0.0, "Play");
                 self.status_msg = format!("▶ Playing: {}", cue_snapshot.name);
@@ -830,9 +1131,10 @@ impl CueLabsApp {
                         .audio
                         .output_channels_for_device(cue_snapshot.io.output_device.as_deref());
                     let mut io_routing = cue_snapshot.io.clone();
-                    let default_route_channels = self
-                        .audio
-                        .default_route_output_channels(cue_snapshot.io.output_device.as_deref());
+                    let default_route_channels = self.audio.default_route_channels_for_source(
+                        cue_snapshot.io.output_device.as_deref(),
+                        source_channels,
+                    );
                     io_routing.ensure_channel_routes_with_defaults(
                         source_channels,
                         track_output_channels,
@@ -842,6 +1144,7 @@ impl CueLabsApp {
                         cue.state = CueState::Playing;
                         cue.audio_channels = source_channels;
                         cue.io.channel_routes = io_routing.channel_routes.clone();
+                        cue.io.output_gains_db = io_routing.output_gains_db.clone();
                     }
                     let generation = self.bump_audio_generation(cue_snapshot.id);
                     self.audio.send(AudioCommand::Play {
@@ -849,23 +1152,19 @@ impl CueLabsApp {
                         generation,
                         file: cue_snapshot.file_path.clone(),
                         output_device: cue_snapshot.io.output_device.clone(),
-                        start_secs: if cue_snapshot.position_secs > cue_snapshot.start_secs {
-                            cue_snapshot
-                                .position_secs
-                                .clamp(cue_snapshot.start_secs, cue_snapshot.effective_end_secs())
-                        } else {
-                            cue_snapshot.start_secs
-                        },
+                        start_secs: Self::cue_play_start_position(&cue_snapshot),
                         end_secs: cue_snapshot.end_secs,
                         duration_secs: cue_snapshot.duration_secs,
                         volume: cue_snapshot.volume * self.master_vol,
                         volume_automation_enabled: cue_snapshot.volume_automation_enabled,
                         volume_automation: cue_snapshot.volume_automation.clone(),
+                        time_pitch: cue_snapshot.time_pitch.clone(),
                         fade_in_secs: cue_snapshot.fade_in_secs,
                         fade_out_secs: cue_snapshot.fade_out_secs,
                         fade_curve: cue_snapshot.fade_curve,
                         custom_fade_points: cue_snapshot.custom_fade_points.clone(),
                         channel_routes: io_routing.channel_routes,
+                        output_gains_db: io_routing.output_gains_db,
                         loop_enabled: cue_snapshot.loop_region.enabled,
                         loop_start: cue_snapshot.loop_region.start_secs,
                         loop_end: cue_snapshot.loop_region.end_secs,
@@ -958,149 +1257,146 @@ impl CueLabsApp {
                 fade_curve,
                 custom_fade_points,
             } => {
-                self.fade_started_at.remove(&id);
-                if let Some(tid) = target_id {
-                    let targets = self.audio_targets_in(tid);
-                    let mut fade_started = false;
-                    let mut fade_blocked_by_continue = false;
-                    for audio_id in targets {
-                        let Some(target) = self.cue_list.find(audio_id).cloned() else {
-                            continue;
-                        };
-                        let target_vol = target_volume.unwrap_or_else(|| {
-                            if fade_in {
-                                // A cue muted at -60 dB has a linear volume of
-                                // zero. In the absence of an explicit Fade target,
-                                // use unity so Fade In can actually raise it.
-                                if target.volume <= 0.000_001 {
-                                    1.0
-                                } else {
-                                    target.volume
-                                }
+                let targets = if let Some(target_id) = target_id {
+                    self.audio_targets_in(target_id)
+                } else {
+                    // "None / All Active" means all currently active audio tracks.
+                    self.cue_list
+                        .cues
+                        .iter()
+                        .filter(|cue| cue_owns_audio_stream(cue) && cue.is_active())
+                        .map(|cue| cue.id)
+                        .collect()
+                };
+
+                let mut fade_started = false;
+                let mut fade_start_blocked = false;
+                let next_id = self.next_auto_cue_id(id);
+                let target_is_next = next_id
+                    .map(|next_id| self.fade_target_is_next_or_container(id, next_id))
+                    .unwrap_or(false);
+
+                for audio_id in targets {
+                    let Some(target) = self.cue_list.find(audio_id).cloned() else {
+                        continue;
+                    };
+                    let target_vol = target_volume.unwrap_or_else(|| {
+                        if fade_in {
+                            if target.volume <= 0.000_001 {
+                                1.0
                             } else {
-                                0.0
+                                target.volume
                             }
-                        }) * self.master_vol;
-                        let stopped =
-                            matches!(&target.state, CueState::Stopped | CueState::Error(_));
-                        let paused = target.state == CueState::Paused;
-                        let playing = matches!(
-                            &target.state,
-                            CueState::Playing | CueState::FadingIn | CueState::FadingOut
-                        );
-
-                        if fade_in
-                            && (stopped || paused)
-                            && cue_snapshot.continue_mode == ContinueMode::Nothing
-                        {
-                            self.status_msg = format!(
-                                "Fade In not started: '{}' is stopped/paused and Continue is Nothing",
-                                target.name
-                            );
-                            fade_blocked_by_continue = true;
-                            continue;
+                        } else {
+                            0.0
                         }
+                    }) * self.master_vol;
 
-                        if fade_in && stopped {
-                            if cue_snapshot.continue_mode != ContinueMode::Nothing {
-                                self.fade_managed_targets.insert(audio_id);
-                            }
-                            self.start_audio_cue(
-                                audio_id,
-                                Some((
-                                    duration_secs,
-                                    fade_curve,
-                                    custom_fade_points.clone(),
-                                    target_vol,
-                                )),
-                            );
+                    let stopped = matches!(&target.state, CueState::Stopped | CueState::Error(_));
+                    let paused = target.state == CueState::Paused;
+                    let playing = matches!(
+                        &target.state,
+                        CueState::Playing | CueState::FadingIn | CueState::FadingOut
+                    );
+
+                    if fade_in
+                        && (stopped || paused)
+                        && cue_snapshot.continue_mode == ContinueMode::Nothing
+                    {
+                        self.status_msg = format!(
+                            "Fade In not started: '{}' is stopped/paused and Continue is Nothing",
+                            target.name
+                        );
+                        fade_start_blocked = true;
+                        continue;
+                    }
+
+                    // If the target is the next row, it owns its own continuation.
+                    // Otherwise this Fade owns the continuation chain and suppresses
+                    // the target's independent auto-follow when it eventually ends.
+                    let fade_owns_continue =
+                        cue_snapshot.continue_mode != ContinueMode::Nothing && !target_is_next;
+                    let suppress_target_continue =
+                        fade_owns_continue || (!fade_in && stop_on_finish && !target_is_next);
+                    if suppress_target_continue {
+                        self.fade_managed_targets.insert(audio_id);
+                    } else {
+                        self.fade_managed_targets.remove(&audio_id);
+                    }
+
+                    if fade_in && stopped {
+                        if self.start_audio_cue(
+                            audio_id,
+                            Some((
+                                duration_secs,
+                                fade_curve,
+                                custom_fade_points.clone(),
+                                target_vol,
+                            )),
+                        ) {
                             if let Some(target) = self.cue_list.find_mut(audio_id) {
                                 target.state = CueState::FadingIn;
                             }
                             fade_started = true;
-                        } else if playing || (fade_in && paused) {
-                            if (!fade_in && stop_on_finish) || (fade_in && paused) {
-                                self.fade_managed_targets.insert(audio_id);
-                            }
-                            if fade_in && paused {
-                                self.audio.send(AudioCommand::Resume(audio_id));
-                            }
-                            self.audio.send(AudioCommand::Fade {
-                                id: audio_id,
-                                target_volume: target_vol,
-                                duration_secs,
-                                stop_on_finish: !fade_in && stop_on_finish,
-                                curve: fade_curve,
-                                custom_fade_points: custom_fade_points.clone(),
-                            });
-                            if let Some(target) = self.cue_list.find_mut(audio_id) {
-                                target.state = if fade_in {
-                                    CueState::FadingIn
-                                } else {
-                                    CueState::FadingOut
-                                };
-                            }
-                            fade_started = true;
+                        } else {
+                            fade_start_blocked = true;
+                            continue;
                         }
-                    }
-                    if fade_started {
-                        if let Some(fade_cue) = self.cue_list.find_mut(id) {
-                            fade_cue.state = if fade_in {
+                    } else if playing || (fade_in && paused) {
+                        if fade_in && paused {
+                            self.audio.send(AudioCommand::Resume(audio_id));
+                        }
+                        self.audio.send(AudioCommand::Fade {
+                            id: audio_id,
+                            target_volume: target_vol,
+                            duration_secs,
+                            stop_on_finish: !fade_in && stop_on_finish,
+                            curve: fade_curve,
+                            custom_fade_points: custom_fade_points.clone(),
+                        });
+                        if let Some(target) = self.cue_list.find_mut(audio_id) {
+                            target.state = if fade_in {
                                 CueState::FadingIn
                             } else {
                                 CueState::FadingOut
                             };
-                            // `duration_secs` and `position_secs` are runtime-only fields
-                            // for the status cell; do not persist an audio End marker on a Fade cue.
-                            fade_cue.duration_secs = duration_secs.max(0.0);
-                            fade_cue.position_secs = 0.0;
                         }
-                        self.fade_started_at.insert(id, Instant::now());
-                        self.status_msg = format!(
-                            "{}: {} · {:.1}s",
-                            if fade_in {
-                                "↗ Fade In"
-                            } else {
-                                "↘ Fade Out"
-                            },
-                            cue_snapshot.name,
-                            duration_secs
-                        );
-
-                        // Fade is a timed cue. Auto-Continue starts the next
-                        // independent cue only after the fade and post-wait;
-                        // the target audio cue is never mistaken for that next cue.
-                        let auto_continue_next = if cue_snapshot.continue_mode
-                            == ContinueMode::AutoContinue
-                            && !self.is_managed_group_child(id)
-                        {
-                            self.next_auto_cue_id(id)
-                        } else {
-                            None
-                        };
-                        self.schedule_cue_completion(id, duration_secs);
-                        if let Some(next_id) = auto_continue_next {
-                            let delay =
-                                duration_secs.max(0.0) + cue_snapshot.post_wait_secs.max(0.0);
-                            self.pending_triggers.push(PendingTrigger {
-                                cue_id: next_id,
-                                source_cue_id: Some(id),
-                                fire_at: Instant::now() + std::time::Duration::from_secs_f64(delay),
-                                action: PendingAction::TriggerCue,
-                            });
-                        }
-                    } else {
-                        self.fade_started_at.remove(&id);
-                        if !fade_blocked_by_continue {
-                            self.status_msg = format!("{}: no active target", cue_snapshot.name);
-                        }
-                        if let Some(fade_cue) = self.cue_list.find_mut(id) {
-                            fade_cue.state = CueState::Stopped;
-                            fade_cue.position_secs = 0.0;
-                        }
+                        fade_started = true;
                     }
+                }
+
+                // A Fade cue remains a timed cue even when its target is already
+                // stopped (Fade Out) or no active target exists. Its own Continue
+                // behaviour must still be honoured. The only blocked case is a
+                // Fade In explicitly targeting a stopped cue with Continue=Nothing.
+                let should_run_timer = fade_started || !fade_start_blocked;
+                if should_run_timer {
+                    if let Some(fade_cue) = self.cue_list.find_mut(id) {
+                        fade_cue.state = if fade_in {
+                            CueState::FadingIn
+                        } else {
+                            CueState::FadingOut
+                        };
+                        fade_cue.duration_secs = duration_secs.max(0.0);
+                        fade_cue.position_secs = 0.0;
+                    }
+                    self.fade_started_at.insert(id, Instant::now());
+                    self.status_msg = format!(
+                        "{}: {} · {:.1}s",
+                        if fade_in {
+                            "↗ Fade In"
+                        } else {
+                            "↘ Fade Out"
+                        },
+                        cue_snapshot.name,
+                        duration_secs
+                    );
+                    // Auto-Follow is handled by complete_cue after duration + post-wait.
+                    // Auto-Continue is handled by trigger_cue after pre/post-wait,
+                    // independently of the Fade duration.
+                    self.schedule_cue_completion(id, duration_secs);
                 } else {
-                    self.status_msg = format!("{}: no target selected", cue_snapshot.name);
+                    self.fade_started_at.remove(&id);
                     if let Some(fade_cue) = self.cue_list.find_mut(id) {
                         fade_cue.state = CueState::Stopped;
                         fade_cue.position_secs = 0.0;
@@ -1355,6 +1651,29 @@ impl CueLabsApp {
             .collect()
     }
 
+    fn clear_fade_managed_targets_for_cue(&mut self, fade_cue_id: Uuid) {
+        let Some(cue) = self.cue_list.find(fade_cue_id) else {
+            return;
+        };
+        let CueType::Fade { target_id, .. } = &cue.cue_type else {
+            return;
+        };
+        let target_id = *target_id;
+        let targets = if let Some(target_id) = target_id {
+            self.audio_targets_in(target_id)
+        } else {
+            self.cue_list
+                .cues
+                .iter()
+                .filter(|cue| cue_owns_audio_stream(cue) && cue.is_active())
+                .map(|cue| cue.id)
+                .collect()
+        };
+        for target_id in targets {
+            self.fade_managed_targets.remove(&target_id);
+        }
+    }
+
     fn bump_audio_generation(&mut self, cue_id: Uuid) -> u64 {
         let generation = self.audio_generations.entry(cue_id).or_insert(0);
         *generation = generation.wrapping_add(1);
@@ -1363,6 +1682,19 @@ impl CueLabsApp {
 
     fn stop_target_and_descendants(&mut self, target_id: Uuid) {
         let affected = self.group_descendant_ids(target_id);
+        let fade_cues: Vec<Uuid> = affected
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.cue_list
+                    .find(*id)
+                    .map(|cue| matches!(&cue.cue_type, CueType::Fade { .. }))
+                    .unwrap_or(false)
+            })
+            .collect();
+        for fade_id in fade_cues {
+            self.clear_fade_managed_targets_for_cue(fade_id);
+        }
         self.pending_triggers.retain(|trigger| {
             !affected.contains(&trigger.cue_id)
                 && !trigger
@@ -1572,40 +1904,54 @@ impl CueLabsApp {
     /// Returns the next cue in the visible project sequence, respecting groups.
     /// Group children are followed in their own order. After the last child, the
     /// sequence continues after the parent group (and bubbles through nested groups).
-    /// Resolve automatic continuation without accidentally starting the cue
-    /// targeted by a Fade event. A target that is immediately after the Fade is
-    /// treated as an operated-on track, not as the next independent cue.
+    /// Resolve the next non-comment cue in the visible project sequence.
+    /// Fade-target collisions are handled separately so the target can act as
+    /// a continuation barrier instead of being silently skipped.
     fn next_auto_cue_id(&self, current_id: Uuid) -> Option<Uuid> {
-        let fade_target = self.cue_list.find(current_id).and_then(|cue| {
-            if let CueType::Fade { target_id, .. } = &cue.cue_type {
-                *target_id
-            } else {
-                None
-            }
-        });
-
         let mut candidate = self.next_cue_id(current_id)?;
         let mut visited = HashSet::new();
         while visited.insert(candidate) {
-            let is_comment = self.is_comment_cue(candidate);
-            let contains_fade_target = fade_target
-                .map(|target_id| {
-                    self.cue_list
-                        .find(candidate)
-                        .map(|next_cue| {
-                            matches!(&next_cue.cue_type, CueType::Group { .. })
-                                && self.group_contains(candidate, target_id)
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if fade_target == Some(candidate) || contains_fade_target || is_comment {
-                candidate = self.next_cue_id(candidate)?;
-                continue;
+            if !self.is_comment_cue(candidate) {
+                return Some(candidate);
             }
-            return Some(candidate);
+            candidate = self.next_cue_id(candidate)?;
         }
         None
+    }
+
+    /// True when the next logical row is the Fade's target itself, or a group
+    /// that contains that target. In that case the target has already been
+    /// started/operated on by the Fade and must not be triggered a second time.
+    fn fade_target_is_next_or_container(&self, fade_id: Uuid, next_id: Uuid) -> bool {
+        let (target_id, fade_in) = self
+            .cue_list
+            .find(fade_id)
+            .and_then(|cue| {
+                if let CueType::Fade {
+                    target_id, fade_in, ..
+                } = &cue.cue_type
+                {
+                    Some((*target_id, *fade_in))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((None, false));
+
+        let Some(target_id) = target_id else {
+            return false;
+        };
+        let target_is_active = self.audio_targets_in(target_id).iter().any(|audio_id| {
+            self.cue_list
+                .find(*audio_id)
+                .map(|cue| cue.is_active())
+                .unwrap_or(false)
+        });
+
+        // Fade In starts a stopped target as part of its operation. Fade Out
+        // does not start a stopped target, so that row remains a valid next cue.
+        let target_is_operated_on = fade_in || target_is_active;
+        target_is_operated_on && (target_id == next_id || self.group_contains(next_id, target_id))
     }
 
     fn next_cue_id(&self, current_id: Uuid) -> Option<Uuid> {
@@ -1725,6 +2071,52 @@ impl CueLabsApp {
         }
     }
 
+    /// Fire enabled cue triggers once per local calendar day at the configured HH:MM or HH:MM:SS.
+    fn poll_time_triggers(&mut self) {
+        let now = chrono::Local::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let current_minute = now.format("%H:%M").to_string();
+        let current_second = now.format("%H:%M:%S").to_string();
+
+        let due: Vec<(Uuid, String, String)> =
+            self.cue_list
+                .cues
+                .iter()
+                .filter_map(|cue| {
+                    let matches_clock =
+                        if chrono::NaiveTime::parse_from_str(&cue.time_trigger_time, "%H:%M:%S")
+                            .is_ok()
+                        {
+                            cue.time_trigger_time == current_second
+                        } else {
+                            chrono::NaiveTime::parse_from_str(&cue.time_trigger_time, "%H:%M")
+                                .is_ok()
+                                && cue.time_trigger_time == current_minute
+                        };
+                    let fire_key = format!("{today}|{}", cue.time_trigger_time);
+
+                    if !cue.time_trigger_enabled
+                        || matches!(&cue.cue_type, CueType::Comment { .. })
+                        || !matches_clock
+                        || self
+                            .time_trigger_last_fired
+                            .get(&cue.id)
+                            .map(String::as_str)
+                            == Some(fire_key.as_str())
+                    {
+                        return None;
+                    }
+                    Some((cue.id, cue.name.clone(), fire_key))
+                })
+                .collect();
+
+        for (cue_id, cue_name, fire_key) in due {
+            self.time_trigger_last_fired.insert(cue_id, fire_key);
+            self.status_msg = format!("⏱ Time trigger: {cue_name}");
+            self.trigger_cue(cue_id);
+        }
+    }
+
     // ── Transport actions ────────────────────────────────────────────────────
 
     fn stop_selected(&mut self) {
@@ -1735,6 +2127,13 @@ impl CueLabsApp {
         if self.is_comment_cue(id) {
             return;
         }
+        if let Some(cue) = self.cue_list.find(id) {
+            info!(
+                "Stop selected: id={}, number='{}', name='{}', position={:.3}s",
+                cue.id, cue.number, cue.name, cue.position_secs
+            );
+        }
+        self.clear_fade_managed_targets_for_cue(id);
         self.fade_started_at.remove(&id);
         self.fade_managed_targets.remove(&id);
         self.pending_triggers
@@ -1759,6 +2158,11 @@ impl CueLabsApp {
     }
 
     fn stop_all(&mut self) {
+        info!(
+            "Stop all requested: cue_count={}, fade={:.3}s",
+            self.cue_list.cues.len(),
+            self.settings.stop_all_fade_secs.max(0.0)
+        );
         self.pending_triggers.clear();
         self.active_playlists.clear();
         self.active_all_cues.clear();
@@ -1844,6 +2248,10 @@ impl CueLabsApp {
             return;
         }
         if let Some(cue) = self.cue_list.find_mut(id) {
+            info!(
+                "Pause selected: id={}, number='{}', name='{}', position={:.3}s",
+                cue.id, cue.number, cue.name, cue.position_secs
+            );
             cue.clear_wait_runtime();
             cue.state = CueState::Paused;
             self.audio.send(AudioCommand::Pause(id));
@@ -1857,6 +2265,14 @@ impl CueLabsApp {
     }
 
     fn pause_all(&mut self) {
+        info!(
+            "Pause all requested: active_cues={}",
+            self.cue_list
+                .cues
+                .iter()
+                .filter(|cue| cue.is_active())
+                .count()
+        );
         let waiting_ids: HashSet<Uuid> = self
             .cue_list
             .cues
@@ -1912,6 +2328,10 @@ impl CueLabsApp {
 
         match snapshot.state {
             CueState::Paused => {
+                info!(
+                    "Resume selected: id={}, number='{}', name='{}', position={:.3}s",
+                    snapshot.id, snapshot.number, snapshot.name, snapshot.position_secs
+                );
                 self.audio.send(AudioCommand::Resume(id));
                 if let Some(cue) = self.cue_list.find_mut(id) {
                     cue.state = CueState::Playing;
@@ -1940,6 +2360,7 @@ impl CueLabsApp {
     }
 
     fn resume_all(&mut self) {
+        info!("Resume all requested");
         self.cue_list.resume_all();
         self.audio.send(AudioCommand::ResumeAll);
         self.status_msg = "▶ All resumed".to_string();
@@ -1974,7 +2395,9 @@ impl CueLabsApp {
         let mut cue = Cue::new_audio(final_path.clone());
         cue.audio_channels = get_channel_count(&final_path);
         if cue.audio_channels > 0 {
-            let default_route_channels = self.audio.default_route_output_channels(None);
+            let default_route_channels = self
+                .audio
+                .default_route_channels_for_source(None, cue.audio_channels);
             cue.io.ensure_channel_routes_with_defaults(
                 cue.audio_channels,
                 self.audio.output_channels,
@@ -1986,9 +2409,15 @@ impl CueLabsApp {
             cue.duration_secs = dur;
             cue.loop_region.end_secs = dur;
         }
-        cue.waveform = generate_waveform(&final_path, 512);
+        cue.waveform = generate_waveform(&final_path, WAVEFORM_BUCKETS);
 
         let name = cue.name.clone();
+        info!(
+            "Audio file imported: path='{}', channels={}, duration={:.3}s",
+            final_path.display(),
+            cue.audio_channels,
+            cue.duration_secs
+        );
         let id = self.insert_cue_after_selected(cue);
         self.select_only(id);
         self.status_msg = format!("Added audio cue: {name}");
@@ -2160,6 +2589,50 @@ impl CueLabsApp {
         self.selection_anchor = Some(id);
     }
 
+    fn select_all_cues(&mut self) {
+        self.selected_ids = self.cue_list.cues.iter().map(|cue| cue.id).collect();
+        self.selected = visible_cue_ids(&self.cue_list.cues, &self.expanded_groups)
+            .into_iter()
+            .find(|id| self.selected_ids.contains(id));
+        if self.selected.is_none() {
+            self.selected = self.cue_list.cues.first().map(|cue| cue.id);
+        }
+        self.selection_anchor = self.selected;
+        self.status_msg = format!("Selected {} events", self.selected_ids.len());
+    }
+
+    /// Move all selected rows as a block while retaining their relative order.
+    /// Unselected rows between disjoint selections remain in their original order.
+    fn move_selected_cues(&mut self, up: bool) {
+        let selected_ids = if self.selected_ids.is_empty() {
+            self.selected.into_iter().collect::<HashSet<_>>()
+        } else {
+            self.selected_ids.clone()
+        };
+        if selected_ids.is_empty() {
+            return;
+        }
+
+        let cues = &mut self.cue_list.cues;
+        if up {
+            for index in 1..cues.len() {
+                if selected_ids.contains(&cues[index].id)
+                    && !selected_ids.contains(&cues[index - 1].id)
+                {
+                    cues.swap(index, index - 1);
+                }
+            }
+        } else if cues.len() > 1 {
+            for index in (0..cues.len() - 1).rev() {
+                if selected_ids.contains(&cues[index].id)
+                    && !selected_ids.contains(&cues[index + 1].id)
+                {
+                    cues.swap(index, index + 1);
+                }
+            }
+        }
+    }
+
     fn select_next(&mut self) {
         let visible = visible_cue_ids(&self.cue_list.cues, &self.expanded_groups);
         if visible.is_empty() {
@@ -2176,6 +2649,7 @@ impl CueLabsApp {
             .find(|id| !self.is_comment_cue(*id))
         {
             self.select_only(next);
+            self.scroll_to_cue = Some(next);
         }
     }
 
@@ -2199,6 +2673,7 @@ impl CueLabsApp {
         };
         if let Some(previous) = previous {
             self.select_only(previous);
+            self.scroll_to_cue = Some(previous);
         }
     }
 
@@ -2216,9 +2691,9 @@ impl CueLabsApp {
         }
 
         if self.project_path.is_none() {
-            let default_name = format!("{}.clabs", self.project.settings.name);
+            let default_name = format!("{}.tsq", self.project.settings.name);
             let path = FileDialog::new()
-                .add_filter("CueLabs Project", &["clabs"])
+                .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
                 .set_file_name(&default_name)
                 .save_file();
             match path {
@@ -2266,6 +2741,11 @@ impl CueLabsApp {
 
         match self.project.save(&path) {
             Ok(_) => {
+                info!(
+                    "Project saved: path='{}', cues={}",
+                    path.display(),
+                    self.cue_list.cues.len()
+                );
                 self.status_msg = format!("💾 Saved: {}", path.display());
                 self.create_project_backup("save");
             }
@@ -2279,10 +2759,10 @@ impl CueLabsApp {
     /// Save the current project under a new filename. Media references are
     /// preserved; use Save as Bundle to copy media into a portable folder.
     fn save_as_project(&mut self) {
-        let default_name = format!("{}.clabs", self.project.settings.name);
+        let default_name = format!("{}.tsq", self.project.settings.name);
 
         let Some(path) = FileDialog::new()
-            .add_filter("CueLabs Project", &["clabs"])
+            .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
             .set_file_name(&default_name)
             .save_file()
         else {
@@ -2308,6 +2788,11 @@ impl CueLabsApp {
 
         match project.save(&path) {
             Ok(()) => {
+                info!(
+                    "Project saved as: path='{}', cues={}",
+                    path.display(),
+                    self.cue_list.cues.len()
+                );
                 self.project = project;
                 self.project_path = Some(path.clone());
                 self.assets.set_project_path(path.clone());
@@ -2324,13 +2809,13 @@ impl CueLabsApp {
     }
 
     /// Create a portable bundle folder:
-    /// <parent>/<project>/<project>.clabs + audio/ with relative media paths.
+    /// <parent>/<project>/<project>.tsq + audio/ with relative media paths.
     fn save_as_bundle(&mut self) {
         let default_name = self.project.settings.name.clone();
-        let default_file_name = format!("{default_name}.clabs");
+        let default_file_name = format!("{default_name}.tsq");
 
         let Some(selected_path) = FileDialog::new()
-            .add_filter("CueLabs Project Bundle", &["clabs"])
+            .add_filter("Theatre Show Cue Project Bundle", &["tsq", "clabs"])
             .set_file_name(&default_file_name)
             .save_file()
         else {
@@ -2347,7 +2832,7 @@ impl CueLabsApp {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let bundle_dir = bundle_parent.join(&bundle_name);
-        let bundle_project_path = bundle_dir.join(format!("{bundle_name}.clabs"));
+        let bundle_project_path = bundle_dir.join(format!("{bundle_name}.tsq"));
         let audio_dir = bundle_dir.join("audio");
 
         if bundle_dir.exists() && !bundle_dir.is_dir() {
@@ -2425,7 +2910,15 @@ impl CueLabsApp {
 
         match project.save(&bundle_project_path) {
             Ok(()) => {
+                info!(
+                    "Project bundle saved: folder='{}', copied_audio={}, missing_audio={}, cues={}",
+                    bundle_dir.display(),
+                    copied_count,
+                    missing_count,
+                    bundle_cues.cues.len()
+                );
                 self.cue_list = bundle_cues;
+                self.cue_clipboard.clear();
                 self.project = project;
                 self.project_path = Some(bundle_project_path.clone());
                 self.assets.set_project_path(bundle_project_path);
@@ -2506,7 +2999,7 @@ impl CueLabsApp {
         let safe_name = sanitize_project_name(&self.project.settings.name)
             .unwrap_or_else(|| "Project".to_string());
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
-        let backup_path = backup_dir.join(format!("{safe_name}__{timestamp}.clabs"));
+        let backup_path = backup_dir.join(format!("{safe_name}__{timestamp}.tsq"));
 
         match self.project.save_backup(&backup_path, &project_path) {
             Ok(()) => {
@@ -2523,7 +3016,8 @@ impl CueLabsApp {
                                     .extension()
                                     .and_then(|extension| extension.to_str())
                                     .is_some_and(|extension| {
-                                        extension.eq_ignore_ascii_case("clabs")
+                                        extension.eq_ignore_ascii_case("tsq")
+                                            || extension.eq_ignore_ascii_case("clabs")
                                     })
                         })
                         .collect(),
@@ -2594,7 +3088,7 @@ impl CueLabsApp {
                 continue;
             }
 
-            if cue.duration_secs > 0.0 && !cue.waveform.is_empty() {
+            if cue.duration_secs > 0.0 && cue.waveform.len() >= WAVEFORM_BUCKETS.saturating_mul(2) {
                 continue;
             }
 
@@ -2602,7 +3096,7 @@ impl CueLabsApp {
             if duration <= 0.0 {
                 continue;
             }
-            let waveform = generate_waveform(&cue.file_path, 512);
+            let waveform = generate_waveform(&cue.file_path, WAVEFORM_BUCKETS);
             if waveform.is_empty() {
                 continue;
             }
@@ -2627,7 +3121,7 @@ impl CueLabsApp {
                     .output_channels_for_device(cue.io.output_device.as_deref());
                 let default_route_channels = self
                     .audio
-                    .default_route_output_channels(cue.io.output_device.as_deref());
+                    .default_route_channels_for_source(cue.io.output_device.as_deref(), channels);
                 cue.io.ensure_channel_routes_with_defaults(
                     channels,
                     output_count,
@@ -2649,7 +3143,7 @@ impl CueLabsApp {
         }
 
         let duration = get_duration(&source_path);
-        let waveform = generate_waveform(&source_path, 512);
+        let waveform = generate_waveform(&source_path, WAVEFORM_BUCKETS);
         let channels = get_channel_count(&source_path);
         if duration <= 0.0 || waveform.is_empty() {
             self.status_msg = format!("Could not decode audio file: {}", source_path.display());
@@ -2703,7 +3197,7 @@ impl CueLabsApp {
                     .output_channels_for_device(cue.io.output_device.as_deref());
                 let default_route_channels = self
                     .audio
-                    .default_route_output_channels(cue.io.output_device.as_deref());
+                    .default_route_channels_for_source(cue.io.output_device.as_deref(), channels);
                 cue.io.ensure_channel_routes_with_defaults(
                     channels,
                     output_count,
@@ -2725,6 +3219,13 @@ impl CueLabsApp {
             }
         }
 
+        info!(
+            "Audio media replaced: cue_id={}, path='{}', channels={}, duration={:.3}s",
+            cue_id,
+            destination.display(),
+            channels,
+            duration
+        );
         self.status_msg = format!(
             "Audio file updated: {} · {}",
             destination.display(),
@@ -2736,7 +3237,7 @@ impl CueLabsApp {
         self.stop_all();
 
         let file = FileDialog::new()
-            .add_filter("CueLabs Project", &["clabs"])
+            .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
             .pick_file();
 
         if let Some(path) = file {
@@ -2753,9 +3254,11 @@ impl CueLabsApp {
                                 let output_count = self
                                     .audio
                                     .output_channels_for_device(cue.io.output_device.as_deref());
-                                let default_route_channels = self
-                                    .audio
-                                    .default_route_output_channels(cue.io.output_device.as_deref());
+                                let default_route_channels =
+                                    self.audio.default_route_channels_for_source(
+                                        cue.io.output_device.as_deref(),
+                                        cue.audio_channels,
+                                    );
                                 cue.io.ensure_channel_routes_with_defaults(
                                     cue.audio_channels,
                                     output_count,
@@ -2768,13 +3271,15 @@ impl CueLabsApp {
                                     cue.duration_secs = d;
                                 }
                             }
-                            if cue.waveform.is_empty() {
-                                cue.waveform = generate_waveform(&cue.file_path, 512);
+                            if cue.waveform.len() < WAVEFORM_BUCKETS * 2 {
+                                cue.waveform = generate_waveform(&cue.file_path, WAVEFORM_BUCKETS);
                             }
                         }
                     }
 
                     self.cue_list = cl;
+                    self.cue_clipboard.clear();
+                    self.time_trigger_last_fired.clear();
                     self.project = proj;
                     let is_backup_project = path
                         .parent()
@@ -2799,6 +3304,11 @@ impl CueLabsApp {
                     self.selected = None;
                     self.selected_ids.clear();
                     self.selection_anchor = None;
+                    info!(
+                        "Project opened: path='{}', cues={}",
+                        path.display(),
+                        self.cue_list.cues.len()
+                    );
                     self.status_msg = format!("📂 Opened: {}", path.display());
                 }
                 Err(e) => {
@@ -2810,8 +3320,11 @@ impl CueLabsApp {
     }
 
     fn new_project(&mut self) {
+        info!("New project requested");
         self.stop_all();
         self.cue_list = CueList::new("Main");
+        self.cue_clipboard.clear();
+        self.time_trigger_last_fired.clear();
         self.project = Project::default();
         self.project_path = None;
         self.project_needs_save_as = false;
@@ -3114,6 +3627,159 @@ impl CueLabsApp {
         }
     }
 
+    fn copy_selected_cues(&mut self) {
+        let mut include = if self.selected_ids.is_empty() {
+            self.selected.into_iter().collect::<HashSet<_>>()
+        } else {
+            self.selected_ids.clone()
+        };
+        if include.is_empty() {
+            self.status_msg = "Select one or more events to copy".to_string();
+            return;
+        }
+
+        // Copy a selected Group together with its descendants, preserving the
+        // internal hierarchy. Multi-selection is kept in Cue List order.
+        let mut stack: Vec<Uuid> = include.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if let Some(cue) = self.cue_list.find(id) {
+                if let CueType::Group { children, .. } = &cue.cue_type {
+                    for child_id in children {
+                        if include.insert(*child_id) {
+                            stack.push(*child_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut copied: Vec<Cue> = self
+            .cue_list
+            .cues
+            .iter()
+            .filter(|cue| include.contains(&cue.id))
+            .cloned()
+            .collect();
+        for cue in &mut copied {
+            cue.state = CueState::Stopped;
+            cue.position_secs = 0.0;
+            cue.clear_wait_runtime();
+        }
+        self.cue_clipboard = copied;
+        self.status_msg = format!("Copied {} event(s)", self.cue_clipboard.len());
+    }
+
+    fn paste_cues_after(&mut self, anchor_id: Option<Uuid>) {
+        if self.cue_clipboard.is_empty() {
+            self.status_msg = "Clipboard is empty".to_string();
+            return;
+        }
+
+        let mut pasted = self.cue_clipboard.clone();
+        let id_map: HashMap<Uuid, Uuid> =
+            pasted.iter().map(|cue| (cue.id, Uuid::new_v4())).collect();
+
+        for cue in &mut pasted {
+            let old_id = cue.id;
+            cue.id = id_map[&old_id];
+            cue.number.clear();
+            cue.state = CueState::Stopped;
+            cue.position_secs = 0.0;
+            cue.clear_wait_runtime();
+
+            let remap_target = |target: &mut Option<Uuid>| {
+                if let Some(old_target) = *target {
+                    if let Some(new_target) = id_map.get(&old_target) {
+                        *target = Some(*new_target);
+                    }
+                }
+            };
+            match &mut cue.cue_type {
+                CueType::Play { target_id }
+                | CueType::Pause { target_id }
+                | CueType::Stop { target_id }
+                | CueType::Fade { target_id, .. } => remap_target(target_id),
+                CueType::Group { children, .. } => {
+                    for child_id in children {
+                        if let Some(new_child_id) = id_map.get(child_id) {
+                            *child_id = *new_child_id;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A copied group includes its children. Only top-level copied cues are
+        // inserted into the destination group's child list.
+        let copied_child_ids: HashSet<Uuid> = pasted
+            .iter()
+            .filter_map(|cue| {
+                if let CueType::Group { children, .. } = &cue.cue_type {
+                    Some(children.iter().copied())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        let root_ids: Vec<Uuid> = pasted
+            .iter()
+            .filter(|cue| !copied_child_ids.contains(&cue.id))
+            .map(|cue| cue.id)
+            .collect();
+
+        let insert_at = anchor_id
+            .and_then(|anchor| {
+                self.cue_list
+                    .cues
+                    .iter()
+                    .position(|cue| cue.id == anchor)
+                    .map(|index| index + 1)
+            })
+            .unwrap_or(self.cue_list.cues.len());
+
+        let parent_id = anchor_id.and_then(|anchor| self.parent_group_of(anchor));
+        if let (Some(parent_id), Some(anchor)) = (parent_id, anchor_id) {
+            if let Some(parent) = self.cue_list.find_mut(parent_id) {
+                if let CueType::Group { children, .. } = &mut parent.cue_type {
+                    let child_insert_at = children
+                        .iter()
+                        .position(|child_id| *child_id == anchor)
+                        .map(|index| index + 1)
+                        .unwrap_or(children.len());
+                    for (offset, new_id) in root_ids.iter().copied().enumerate() {
+                        children.insert(child_insert_at + offset, new_id);
+                    }
+                }
+            }
+        }
+
+        let mut next_number = self
+            .cue_list
+            .cues
+            .iter()
+            .filter_map(|cue| cue.number.trim().parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for cue in &mut pasted {
+            cue.number = next_number.to_string();
+            next_number = next_number.saturating_add(1);
+        }
+
+        let pasted_count = pasted.len();
+        for (offset, cue) in pasted.into_iter().enumerate() {
+            let insert_position = (insert_at + offset).min(self.cue_list.cues.len());
+            self.cue_list.cues.insert(insert_position, cue);
+        }
+
+        self.selected_ids = root_ids.iter().copied().collect();
+        self.selected = root_ids.first().copied();
+        self.selection_anchor = self.selected;
+        self.status_msg = format!("Pasted {} event(s)", pasted_count);
+    }
+
     // ── Горячие клавиши и Drag-and-drop ──────────────────────────────────────
 
     fn handle_keyboard(&mut self, ctx: &Context) {
@@ -3123,17 +3789,20 @@ impl CueLabsApp {
             return;
         }
 
-        let key_events: Vec<(Key, egui::Modifiers)> = ctx.input(|input| {
+        // egui reports logical keys for the active keyboard layout and falls
+        // back to the physical key when a non-Latin layout cannot be mapped.
+        let key_events: Vec<(Key, Option<Key>, egui::Modifiers)> = ctx.input(|input| {
             input
                 .events
                 .iter()
                 .filter_map(|event| match event {
                     egui::Event::Key {
                         key,
+                        physical_key,
                         pressed: true,
                         modifiers,
                         ..
-                    } => Some((*key, *modifiers)),
+                    } => Some((*key, *physical_key, *modifiers)),
                     _ => None,
                 })
                 .collect()
@@ -3141,7 +3810,7 @@ impl CueLabsApp {
 
         // Capture mode has priority over normal application shortcuts.
         if let Some(action) = self.hotkey_capture.clone() {
-            if let Some((key, modifiers)) = key_events.first().copied() {
+            if let Some((key, _, modifiers)) = key_events.first().copied() {
                 if key == Key::Escape {
                     self.hotkey_capture = None;
                 } else {
@@ -3156,20 +3825,71 @@ impl CueLabsApp {
         }
 
         // Do not steal keystrokes from text fields and other editors.
-        if ctx.memory(|memory| memory.focused().is_some()) {
+        if ctx.wants_keyboard_input() {
             return;
         }
 
-        if key_events.iter().any(|(key, modifiers)| {
-            *key == Key::S && modifiers.ctrl && modifiers.shift && !modifiers.alt
-        }) {
+        // Check both the layout-dependent logical key and the physical key.
+        // The latter keeps shortcuts stable when the user switches to Russian.
+        let has_ctrl_shortcut = |target: Key, shift: bool, alt: bool| {
+            key_events.iter().any(|(logical, physical, modifiers)| {
+                (modifiers.ctrl || modifiers.command)
+                    && modifiers.shift == shift
+                    && modifiers.alt == alt
+                    && (*logical == target || *physical == Some(target))
+            })
+        };
+
+        if has_ctrl_shortcut(Key::S, true, false) {
             self.save_as_project();
             return;
         }
-        if key_events.iter().any(|(key, modifiers)| {
-            *key == Key::S && modifiers.ctrl && modifiers.alt && !modifiers.shift
-        }) {
+        if has_ctrl_shortcut(Key::S, false, true) {
             self.save_as_bundle();
+            return;
+        }
+        if has_ctrl_shortcut(Key::C, false, false) {
+            self.copy_selected_cues();
+            if !self.cue_clipboard.is_empty() {
+                ctx.copy_text(INTERNAL_CUE_CLIPBOARD_MARKER.to_string());
+            }
+            return;
+        }
+        if has_ctrl_shortcut(Key::V, false, false) {
+            self.paste_cues_after(self.selected);
+            return;
+        }
+        if has_ctrl_shortcut(Key::A, false, false) {
+            self.select_all_cues();
+            return;
+        }
+
+        // Some egui-winit versions emit clipboard events instead of a Key event.
+        // Only the private marker represents Theatre Show Cue's internal cue buffer; arbitrary
+        // clipboard text is never interpreted as a cue paste command.
+        let clipboard_payload = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        if clipboard_payload.as_deref() == Some(INTERNAL_CUE_CLIPBOARD_MARKER)
+            && !self.cue_clipboard.is_empty()
+        {
+            self.paste_cues_after(self.selected);
+            return;
+        }
+        let clipboard_copy = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+        });
+        if clipboard_copy {
+            self.copy_selected_cues();
+            if !self.cue_clipboard.is_empty() {
+                ctx.copy_text(INTERNAL_CUE_CLIPBOARD_MARKER.to_string());
+            }
             return;
         }
 
@@ -3179,11 +3899,17 @@ impl CueLabsApp {
                 .find(selected_id)
                 .map(|cue| matches!(&cue.cue_type, CueType::Group { .. }))
                 .unwrap_or(false);
-            if selected_is_group && key_events.iter().any(|(key, _)| *key == Key::ArrowRight) {
+            if selected_is_group
+                && key_events.iter().any(|(key, physical, _)| {
+                    *key == Key::ArrowRight || *physical == Some(Key::ArrowRight)
+                })
+            {
                 self.expanded_groups.insert(selected_id);
                 return;
             }
-            if key_events.iter().any(|(key, _)| *key == Key::ArrowLeft) {
+            if key_events.iter().any(|(key, physical, _)| {
+                *key == Key::ArrowLeft || *physical == Some(Key::ArrowLeft)
+            }) {
                 if selected_is_group && self.expanded_groups.remove(&selected_id) {
                     return;
                 }
@@ -3199,8 +3925,15 @@ impl CueLabsApp {
             let Some(binding) = self.settings.hotkeys.bindings.get(action) else {
                 continue;
             };
-            if key_events.iter().any(|(key, modifiers)| {
+            if key_events.iter().any(|(key, physical, modifiers)| {
                 Self::format_hotkey(*key, *modifiers).eq_ignore_ascii_case(binding)
+                    || physical
+                        .as_ref()
+                        .map(|physical_key| {
+                            Self::format_hotkey(*physical_key, *modifiers)
+                                .eq_ignore_ascii_case(binding)
+                        })
+                        .unwrap_or(false)
             }) {
                 self.dispatch_app_action((*action).clone());
                 break;
@@ -3231,6 +3964,7 @@ impl CueLabsApp {
     }
 
     fn dispatch_app_action(&mut self, action: AppAction) {
+        info!("Application command dispatched: {}", action.label());
         match action {
             AppAction::Go => self.go(),
             AppAction::StopSelected => self.stop_selected(),
@@ -3246,11 +3980,18 @@ impl CueLabsApp {
             AppAction::SaveProject => self.save_project(),
             AppAction::AddFile => self.add_files(),
             AppAction::DeleteSelected => {
-                let ids: Vec<Uuid> = if self.selected_ids.is_empty() {
-                    self.selected.into_iter().collect()
+                let selected_ids = if self.selected_ids.is_empty() {
+                    self.selected.into_iter().collect::<HashSet<_>>()
                 } else {
-                    self.selected_ids.iter().copied().collect()
+                    self.selected_ids.clone()
                 };
+                let ids: Vec<Uuid> = self
+                    .cue_list
+                    .cues
+                    .iter()
+                    .filter(|cue| selected_ids.contains(&cue.id))
+                    .map(|cue| cue.id)
+                    .collect();
                 for id in ids {
                     self.delete_cue(id);
                 }
@@ -3263,75 +4004,197 @@ impl CueLabsApp {
                     }
                 }
             }
-            AppAction::MoveUp => {
-                if let Some(id) = self.selected {
-                    self.cue_list.move_up(id);
-                }
-            }
-            AppAction::MoveDown => {
-                if let Some(id) = self.selected {
-                    self.cue_list.move_down(id);
-                }
-            }
+            AppAction::MoveUp => self.move_selected_cues(true),
+            AppAction::MoveDown => self.move_selected_cues(false),
         }
     }
 
-    fn switch_audio_backend(&mut self, backend: AudioBackend) {
-        if self.audio.backend == backend {
+    fn switch_audio_endpoint(
+        &mut self,
+        backend: AudioBackend,
+        device_name: &str,
+        endpoint_id: &str,
+    ) {
+        let same_endpoint =
+            self.audio.backend == backend && self.audio.current_device_id == endpoint_id;
+        if same_endpoint && !self.active_output_needs_reopen {
             return;
         }
 
-        self.stop_all();
-        match AudioEngine::new_with_backend(backend) {
-            Ok(mut replacement) => {
-                if let Some(saved_device) = self.settings.audio_output_device.as_deref() {
-                    if replacement
-                        .output_devices
-                        .iter()
-                        .any(|device| device == saved_device)
-                    {
-                        replacement.set_output_device(saved_device);
-                    }
-                }
-                replacement.set_output_channel_names(self.settings.output_channel_names.clone());
-                replacement.set_default_output_pairs(self.settings.default_output_pairs.clone());
-                replacement.set_output_channel_orders(self.settings.output_channel_orders.clone());
-                let backend_devices = replacement.output_devices.clone();
-                self.audio = replacement;
-                self.settings.audio_backend = backend;
-                self.settings.audio_output_device = Some(self.audio.current_device.clone());
-                self.settings.output_channels = self.audio.output_channel_settings();
-                for cue in &mut self.cue_list.cues {
-                    if matches!(&cue.cue_type, CueType::Audio) {
-                        if cue
-                            .io
-                            .output_device
-                            .as_ref()
-                            .is_some_and(|name| !backend_devices.contains(name))
-                        {
-                            cue.io.output_device = None;
-                        }
-                        let output_count = self
-                            .audio
-                            .output_channels_for_device(cue.io.output_device.as_deref());
-                        let default_route_channels = self
-                            .audio
-                            .default_route_output_channels(cue.io.output_device.as_deref());
-                        cue.io.ensure_channel_routes_with_defaults(
-                            cue.audio_channels.max(1),
-                            output_count,
-                            &default_route_channels,
+        let previous_backend = self.audio.backend;
+        let backend_changed = previous_backend != backend;
+        let reinitialize_current = same_endpoint && self.active_output_needs_reopen;
+        info!(
+            "Audio endpoint switch requested: {} — '{}' -> {} — '{}'",
+            previous_backend.short_label(),
+            self.audio.current_device,
+            backend.short_label(),
+            device_name
+        );
+
+        if backend_changed || reinitialize_current {
+            self.stop_all();
+            let previous_device_registry = self.audio.device_registry.clone();
+            let mut replacement: AudioEngine =
+                match AudioEngine::new_with_backend_and_endpoint_using_registry(
+                    backend,
+                    Some(endpoint_id),
+                    Some(device_name),
+                    previous_device_registry,
+                ) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        self.status_msg = format!(
+                            "Could not open {} — {}: {}",
+                            backend.short_label(),
+                            device_name,
+                            error
                         );
+                        warn!("{}", self.status_msg);
+                        return;
+                    }
+                };
+
+            replacement.set_output_channel_names(self.settings.output_channel_names.clone());
+            replacement.set_default_output_pairs(self.settings.default_output_pairs.clone());
+            replacement.set_output_channel_orders(self.settings.output_channel_orders.clone());
+
+            let backend_devices = replacement.output_devices.clone();
+            for device in &backend_devices {
+                let settings_key = replacement.output_device_settings_key(device);
+                if let Some(device_settings) = self
+                    .settings
+                    .output_channel_settings_by_device
+                    .get(&settings_key)
+                {
+                    replacement
+                        .set_output_channel_settings_for_device(device, device_settings.clone());
+                }
+            }
+
+            // Keep the selected endpoint's saved calibration, falling back to the
+            // previous global channel settings only when no per-device profile exists.
+            let selected_device_name = replacement.current_device.clone();
+            let selected_key = replacement.output_device_settings_key(&selected_device_name);
+            if let Some(device_settings) = self
+                .settings
+                .output_channel_settings_by_device
+                .get(&selected_key)
+            {
+                replacement.set_output_channel_settings(device_settings.clone());
+            } else {
+                replacement.set_output_channel_settings(self.settings.output_channels.clone());
+            }
+
+            self.audio = replacement;
+
+            if backend_changed {
+                // Old project files stored only a device name. Pin those legacy
+                // explicit routes to the backend that was active before this switch.
+                for cue in &mut self.cue_list.cues {
+                    if cue.io.output_device.is_some() && cue.io.output_backend.is_none() {
+                        cue.io.output_backend = Some(previous_backend);
                     }
                 }
-                self.save_app_settings();
-                self.status_msg = format!("Audio backend switched to {}", backend.label());
             }
-            Err(error) => {
-                self.status_msg = format!("Could not switch to {}: {}", backend.label(), error);
-                warn!("{}", self.status_msg);
+        } else if let Err(error) = self.audio.set_output_endpoint(endpoint_id, device_name) {
+            self.status_msg = format!(
+                "Could not switch to {} — {}: {}",
+                backend.short_label(),
+                device_name,
+                error
+            );
+            warn!("{}", self.status_msg);
+            return;
+        }
+
+        self.active_output_needs_reopen = false;
+        let active_device_name = self.audio.current_device.clone();
+        for cue in &mut self.cue_list.cues {
+            let cue_backend = cue
+                .io
+                .output_backend
+                .or_else(|| {
+                    cue.io
+                        .output_device_id
+                        .as_deref()
+                        .and_then(|id| self.audio.device_registry.find_by_id(id))
+                        .map(|endpoint| endpoint.backend)
+                })
+                .unwrap_or(backend);
+            if let Some(endpoint_id) = cue.io.output_device_id.as_deref() {
+                if let Some(endpoint) = self.audio.device_registry.find_available_by_id(endpoint_id)
+                {
+                    if endpoint.backend == cue_backend {
+                        cue.io.output_device = Some(endpoint.device_name.clone());
+                        cue.io.output_backend = Some(endpoint.backend);
+                    }
+                }
+            } else if let Some(device_name) = cue.io.output_device.clone() {
+                if let Some(endpoint_id) =
+                    self.audio.registered_endpoint_id(cue_backend, &device_name)
+                {
+                    cue.io.output_device_id = Some(endpoint_id);
+                    cue.io.output_backend = Some(cue_backend);
+                }
             }
         }
+
+        self.settings.audio_backend = backend;
+        self.settings.audio_output_device = Some(active_device_name.clone());
+        self.settings.audio_output_device_id = Some(self.audio.current_device_id.clone());
+        self.settings.output_channels = self.audio.output_channel_settings();
+
+        let selected_key = self.audio.output_device_settings_key(&active_device_name);
+        self.settings
+            .output_channel_settings_by_device
+            .insert(selected_key, self.settings.output_channels.clone());
+
+        // Rebuild defaults only for cues that use the active backend or the
+        // global default. Routes pinned to another backend are preserved for Stage 4.
+        for cue in &mut self.cue_list.cues {
+            if !matches!(&cue.cue_type, CueType::Audio) || cue.audio_channels == 0 {
+                continue;
+            }
+            let cue_backend = cue.io.output_backend.unwrap_or(backend);
+            if cue.io.output_device.is_some() && cue_backend != backend {
+                continue;
+            }
+            let output_count = self
+                .audio
+                .output_channels_for_device(cue.io.output_device.as_deref());
+            let default_route_channels = self.audio.default_route_channels_for_source(
+                cue.io.output_device.as_deref(),
+                cue.audio_channels,
+            );
+            cue.io.ensure_channel_routes_with_defaults(
+                cue.audio_channels,
+                output_count,
+                &default_route_channels,
+            );
+        }
+
+        self.save_app_settings();
+        if let Err(error) = crate::diagnostics::write_runtime_report(
+            self.audio.backend.label(),
+            &self.audio.output_devices,
+            &self.audio.input_devices,
+            self.audio.output_channels,
+        ) {
+            warn!("Could not refresh diagnostic report after endpoint switch: {error}");
+        }
+
+        info!(
+            "Audio endpoint switch completed: backend='{}', output='{}', channels={}",
+            self.audio.backend.label(),
+            self.audio.current_device,
+            self.audio.output_channels
+        );
+        self.status_msg = format!(
+            "Audio output selected: {} — {}",
+            backend.short_label(),
+            active_device_name
+        );
     }
 
     fn save_app_settings(&mut self) {
@@ -3384,7 +4247,7 @@ impl CueLabsApp {
                     .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(42));
             });
 
-        egui::Window::new("CueLabs Settings")
+        egui::Window::new("Theatre Show Cue Settings")
             .open(&mut is_open)
             .default_size([820.0, 580.0])
             // No forced minimum or maximum: if content does not fit, scroll it.
@@ -3405,7 +4268,7 @@ impl CueLabsApp {
                                 (SettingsTab::MidiControl, "MIDI Control"),
                                 (SettingsTab::Midi, "MIDI Interfaces"),
                                 (SettingsTab::Playback, "Playback"),
-                                (SettingsTab::Backup, "Backups"),
+                                (SettingsTab::BackupLogs, "Backup & Logs"),
                             ] {
                                 ui.selectable_value(&mut self.settings_tab, tab, label);
                             }
@@ -3446,6 +4309,28 @@ impl CueLabsApp {
                                 }
                             }
                         });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Visual design:");
+                            for design in UiDesign::ALL {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.settings.appearance.design,
+                                        *design,
+                                        design.label(),
+                                    )
+                                    .changed()
+                                {
+                                    appearance_changed = true;
+                                }
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Liquid Glass uses translucent, rounded surfaces; Material uses flatter, crisp controls. True backdrop blur is not available in the current egui renderer.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(10.5),
+                        );
 
                         if self.settings.appearance.preset == ThemePreset::Custom {
                             ui.separator();
@@ -3475,8 +4360,38 @@ impl CueLabsApp {
                                 "Loop region color",
                                 &mut self.settings.appearance.loop_region_color,
                             );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "Toolbar and standard button color",
+                                &mut self.settings.appearance.button_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "Group outline color",
+                                &mut self.settings.appearance.group_outline_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "Input field background",
+                                &mut self.settings.appearance.input_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "GO button",
+                                &mut self.settings.appearance.go_button_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "STOP button",
+                                &mut self.settings.appearance.stop_button_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "PAUSE button",
+                                &mut self.settings.appearance.pause_button_color,
+                            );
                             ui.label(
-                                RichText::new("Custom colors are applied to menus, panels, labels, informational text and the loop region. Cue status colors and start/end markers remain semantically colored.")
+                                RichText::new("Custom colors include toolbar buttons, group outlines, text inputs, transport controls, panels, text and the loop region.")
                                     .color(Theme::text_dim())
                                     .size(11.0),
                             );
@@ -3498,61 +4413,86 @@ impl CueLabsApp {
                     }
                     SettingsTab::Audio => {
                         ui.heading("Global audio interface");
-                        let mut selected_backend = self.audio.backend;
-                        ui.horizontal(|ui| {
-                            ui.label("Audio driver");
-                            egui::ComboBox::from_id_salt("settings_audio_backend")
-                                .selected_text(selected_backend.label())
-                                .show_ui(ui, |ui| {
-                                    for backend in AudioBackend::ALL {
-                                        if !cfg!(all(target_os = "windows", feature = "asio")) && *backend == AudioBackend::Asio {
-                                            continue;
-                                        }
-                                        ui.selectable_value(&mut selected_backend, *backend, backend.label());
-                                    }
-                                });
-                        });
-                        if selected_backend != self.audio.backend {
-                            self.switch_audio_backend(selected_backend);
-                        }
-                        if cfg!(all(target_os = "windows", not(feature = "asio"))) {
-                            ui.colored_label(
-                                Theme::text_dim(),
-                                "ASIO is not included in this build. Rebuild with --features asio to enable it.",
-                            );
-                        }
-                        ui.label(format!("Backend: {}", self.audio.backend.label()));
-                        let mut output = self.audio.current_device.clone();
+                        ui.label(
+                            RichText::new(
+                                "Choose the output endpoint together with its driver. The driver is selected automatically from the device entry.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(11.0),
+                        );
+
+                        let selected_endpoint_label = self
+                            .audio
+                            .device_registry
+                            .find_by_id(&self.audio.current_device_id)
+                            .map(|endpoint| endpoint.label())
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{} — {} (not in registry)",
+                                    self.audio.backend.short_label(),
+                                    self.audio.current_device
+                                )
+                            });
+                        let mut selected_endpoint = None;
                         ui.horizontal(|ui| {
                             ui.label("Output device");
-                            egui::ComboBox::from_id_salt("settings_output_device")
-                                .width(340.0)
-                                .selected_text(&output)
+                            egui::ComboBox::from_id_salt("settings_output_endpoint")
+                                .width(390.0)
+                                .selected_text(&selected_endpoint_label)
                                 .show_ui(ui, |ui| {
-                                    for device in self.audio.output_devices.clone() {
-                                        if ui.selectable_label(output == device, &device).clicked() {
-                                            output = device.clone();
-                                            self.audio.set_output_device(&device);
-                                            for cue in &mut self.cue_list.cues {
-                                                if matches!(&cue.cue_type, CueType::Audio) && cue.audio_channels > 0 {
-                                                    let output_count = self.audio.output_channels_for_device(cue.io.output_device.as_deref());
-                                                    let default_route_channels = self
-                                                        .audio
-                                                        .default_route_output_channels(cue.io.output_device.as_deref());
-                                                    cue.io.ensure_channel_routes_with_defaults(
-                                                        cue.audio_channels,
-                                                        output_count,
-                                                        &default_route_channels,
-                                                    );
-                                                }
+                                    for endpoint in self.audio.device_registry.endpoints().to_vec() {
+                                        let selected = endpoint.id == self.audio.current_device_id;
+                                        let label = endpoint.label();
+                                        ui.add_enabled_ui(endpoint.is_available(), |ui| {
+                                            if ui.selectable_label(selected, label).clicked() {
+                                                selected_endpoint = Some(endpoint.clone());
                                             }
-                                            self.settings.audio_output_device = Some(device);
-                                            self.settings.output_channels = self.audio.output_channel_settings();
-                                            self.save_app_settings();
-                                        }
+                                        });
                                     }
                                 });
+                            if ui.button("Refresh devices").clicked() {
+                                self.device_registry_monitor.request_refresh();
+                                self.status_msg = "WASAPI/DirectSound device scan requested".to_string();
+                            }
                         });
+
+                        let last_scan = self
+                            .audio
+                            .device_registry
+                            .last_scan_elapsed()
+                            .map(|elapsed| format!("{}s ago", elapsed.as_secs()))
+                            .unwrap_or_else(|| "not scanned yet".to_string());
+                        ui.label(
+                            RichText::new(format!(
+                                "Device Registry: {} available · {} unavailable · generation {} · last scan {}",
+                                self.audio.device_registry.available_count(),
+                                self.audio.device_registry.unavailable_count(),
+                                self.audio.device_registry.generation(),
+                                last_scan
+                            ))
+                            .color(Theme::text_dim())
+                            .size(10.5),
+                        );
+                        for error in self.audio.device_registry.last_errors() {
+                            ui.colored_label(egui::Color32::YELLOW, error);
+                        }
+                        ui.label(
+                            RichText::new(
+                                "WASAPI/DirectSound are checked every 5 seconds. The ASIO driver inventory is loaded at startup and is not re-enumerated while the app is running, to avoid reinitializing vendor drivers. Restart the app after installing/removing ASIO drivers.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(10.0),
+                        );
+
+                        if let Some(endpoint) = selected_endpoint {
+                            self.switch_audio_endpoint(
+                                endpoint.backend,
+                                &endpoint.device_name,
+                                &endpoint.id,
+                            );
+                        }
+
+                        let output = self.audio.current_device.clone();
                         ui.label(format!("Active stream outputs: {}", self.audio.output_channels));
                         let supported_layouts = self.audio.output_channel_layouts_for_device(Some(&output));
                         let layouts_text = if supported_layouts.is_empty() {
@@ -3570,7 +4510,7 @@ impl CueLabsApp {
                                 "Windows currently exposes this endpoint as stereo. Configure its speaker layout for 4.0/5.1 or enable the device's multichannel/ASIO driver mode, then reselect it here.",
                             );
                         }
-                        let mut output_settings = self.audio.output_channel_settings();
+                        let mut output_settings = self.audio.output_channel_settings_for_device(Some(&output));
                         let mut output_settings_changed = false;
                         let output_count = self
                             .audio
@@ -3590,14 +4530,14 @@ impl CueLabsApp {
                             })
                             .collect();
 
-                        // Logical CueLabs outputs are a device-specific presentation map.
+                        // Logical Theatre Show Cue outputs are a device-specific presentation map.
                         // The stored values remain native stream indices, preserving old cue routes.
                         let mut output_order = self.audio.output_channel_display_order(Some(&output));
                         let mut output_order_changed = false;
                         ui.collapsing("Logical output mapping", |ui| {
                             ui.label(
                                 RichText::new(
-                                    "Map CueLabs Output 1, 2, 3... to the native driver channels. This does not reorder audio samples; it changes which driver channel each logical output represents.",
+                                    "Map TaSQ Output 1, 2, 3... to the native driver channels. This does not reorder audio samples; it changes which driver channel each logical output represents.",
                                 )
                                 .color(Theme::text_dim())
                                 .size(11.0),
@@ -3607,47 +4547,51 @@ impl CueLabsApp {
                                     .get(logical_index)
                                     .copied()
                                     .unwrap_or(logical_index);
-                                let available_native: Vec<usize> = (0..output_count)
-                                    .filter(|candidate| {
-                                        *candidate == selected_native
-                                            || !output_order.iter().enumerate().any(
-                                                |(other_logical, mapped_native)| {
-                                                    other_logical != logical_index
-                                                        && mapped_native == candidate
-                                                },
-                                            )
-                                    })
-                                    .collect();
                                 ui.horizontal(|ui| {
-                                    ui.label(format!("CueLabs Output {}", logical_index + 1));
+                                    ui.add_sized(
+                                        [150.0, 28.0],
+                                        egui::Label::new(format!("TaSQ Output {}", logical_index + 1)),
+                                    );
+                                    let mut next_native = selected_native;
                                     egui::ComboBox::from_id_salt((
                                         "logical_output_channel_map",
                                         output.clone(),
                                         logical_index,
                                     ))
-                                    .width(190.0)
+                                    .width(220.0)
                                     .selected_text(self.audio.output_channel_label(
                                         Some(&output),
                                         selected_native,
                                     ))
                                     .show_ui(ui, |ui| {
-                                        for native_index in &available_native {
+                                        // Show every native channel. Choosing one already
+                                        // assigned to another logical slot swaps the two
+                                        // assignments, so a full permutation remains editable.
+                                        for native_index in 0..output_count {
                                             let label = self.audio.output_channel_label(
                                                 Some(&output),
-                                                *native_index,
+                                                native_index,
                                             );
-                                            if ui
-                                                .selectable_value(
-                                                    &mut output_order[logical_index],
-                                                    *native_index,
-                                                    label,
-                                                )
-                                                .changed()
-                                            {
-                                                output_order_changed = true;
-                                            }
+                                            ui.selectable_value(
+                                                &mut next_native,
+                                                native_index,
+                                                label,
+                                            );
                                         }
                                     });
+                                    if next_native != selected_native {
+                                        let previous_native = selected_native;
+                                        if let Some(other_logical) = output_order
+                                            .iter()
+                                            .position(|mapped| *mapped == next_native)
+                                        {
+                                            if other_logical != logical_index {
+                                                output_order[other_logical] = previous_native;
+                                            }
+                                        }
+                                        output_order[logical_index] = next_native;
+                                        output_order_changed = true;
+                                    }
                                 });
                             }
                             if ui.small_button("Reset to native driver order").clicked() {
@@ -3673,7 +4617,7 @@ impl CueLabsApp {
                         );
                         ui.label(
                             RichText::new(
-                                "Rows use CueLabs logical order. Labels show the TASCAM Computer bus and native ASIO channel; Test checks the mapped native channel.",
+                                "Rows use Theatre Show Cue logical order. Labels show the TASCAM Computer bus and native ASIO channel; Test checks the mapped native channel.",
                             )
                             .color(Theme::text_dim())
                             .size(11.0),
@@ -3683,18 +4627,29 @@ impl CueLabsApp {
                                 continue;
                             };
                             ui.horizontal(|ui| {
-                                output_settings_changed |=
-                                    ui.checkbox(&mut setting.active, "Active").changed();
-                                ui.label(format!("Output {}", logical_index + 1));
-                                ui.label(
-                                    RichText::new(
-                                        self.audio.output_channel_label(Some(&output), index),
+                                output_settings_changed |= ui
+                                    .add_sized(
+                                        [76.0, 26.0],
+                                        egui::Checkbox::new(&mut setting.active, "Active"),
                                     )
+                                    .changed();
+                                ui.add_sized(
+                                    [78.0, 26.0],
+                                    egui::Label::new(format!("Output {}", logical_index + 1)),
+                                );
+                                ui.add_sized(
+                                    [118.0, 26.0],
+                                    egui::Label::new(
+                                        RichText::new(self.audio.output_channel_label(
+                                            Some(&output),
+                                            index,
+                                        ))
                                         .color(Theme::text_dim())
                                         .size(11.0),
+                                    ),
                                 );
                                 let name_response = ui.add_sized(
-                                    [130.0, 22.0],
+                                    [132.0, 26.0],
                                     egui::TextEdit::singleline(&mut output_names[index])
                                         .hint_text("Custom alias"),
                                 );
@@ -3702,19 +4657,25 @@ impl CueLabsApp {
                                 output_names_commit |= name_response.lost_focus()
                                     || (name_response.has_focus()
                                         && ui.input(|input| input.key_pressed(Key::Enter)));
-                                if ui.small_button("Test").clicked() {
+                                if ui
+                                    .add_sized(
+                                        [58.0, 26.0],
+                                        egui::Button::new("Test").fill(Theme::button_bg()),
+                                    )
+                                    .clicked()
+                                {
                                     self.audio
                                         .test_output_channel(&output, logical_index, index);
                                 }
-                                output_settings_changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut setting.gain_db, -60.0..=18.0)
-                                            .show_value(true)
-                                            .custom_formatter(|value, _| {
-                                                format!("{:+.1} dB", value)
-                                            }),
-                                    )
-                                    .changed();
+                                let slider_response = ui.add_sized(
+                                    [190.0, 26.0],
+                                    egui::Slider::new(&mut setting.gain_db, -60.0..=18.0)
+                                        .show_value(true)
+                                        .custom_formatter(|value, _| {
+                                            format!("{:+.1} dB", value)
+                                        }),
+                                );
+                                output_settings_changed |= slider_response.changed();
                             });
                         }
                         if let Some(detected_pair) =
@@ -3753,8 +4714,14 @@ impl CueLabsApp {
                         }
 
                         if output_settings_changed {
-                            self.audio.set_output_channel_settings(output_settings.clone());
-                            self.settings.output_channels = output_settings;
+                            self.audio.set_output_channel_settings_for_device(&output, output_settings.clone());
+                            let settings_key = self.audio.output_device_settings_key(&output);
+                            self.settings
+                                .output_channel_settings_by_device
+                                .insert(settings_key, output_settings.clone());
+                            if output == self.audio.current_device {
+                                self.settings.output_channels = output_settings;
+                            }
                             self.save_app_settings();
                         }
                         if output_names_changed {
@@ -3776,53 +4743,61 @@ impl CueLabsApp {
                         default_pair[1] = default_pair[1].min(output_count - 1);
                         let mut default_pair_changed = false;
                         ui.horizontal(|ui| {
-                            ui.label("Default stereo pair");
-                            if ui.small_button("Use CueLabs Output 1/2").clicked() {
+                            ui.add_sized(
+                                [142.0, 28.0],
+                                egui::Label::new("Default stereo pair"),
+                            );
+                            if ui
+                                .add_sized(
+                                    [174.0, 28.0],
+                                    egui::Button::new("Use TaSQ Output 1/2")
+                                        .fill(Theme::button_bg()),
+                                )
+                                .clicked()
+                            {
                                 if output_order.len() >= 2 {
                                     default_pair = [output_order[0], output_order[1]];
                                     default_pair_changed = true;
                                 }
                             }
-                            ui.label("L");
-                            egui::ComboBox::from_id_salt(("default_output_left", output.clone()))
-                                .width(150.0)
-                                .selected_text(
-                                    channel_options
-                                        .get(default_pair[0])
-                                        .map(|(_, label)| label.as_str())
-                                        .unwrap_or("Output 1"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for (index, label) in &channel_options {
-                                        default_pair_changed |= ui
-                                            .selectable_value(
-                                                &mut default_pair[0],
-                                                *index,
-                                                label,
-                                            )
-                                            .changed();
-                                    }
-                                });
-                            ui.label("R");
-                            egui::ComboBox::from_id_salt(("default_output_right", output.clone()))
-                                .width(150.0)
-                                .selected_text(
-                                    channel_options
-                                        .get(default_pair[1])
-                                        .map(|(_, label)| label.as_str())
-                                        .unwrap_or("Output 1"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for (index, label) in &channel_options {
-                                        default_pair_changed |= ui
-                                            .selectable_value(
-                                                &mut default_pair[1],
-                                                *index,
-                                                label,
-                                            )
-                                            .changed();
-                                    }
-                                });
+                            ui.add_sized([18.0, 26.0], egui::Label::new("L"));
+                            egui::ComboBox::from_id_salt((
+                                "default_output_left",
+                                output.clone(),
+                            ))
+                            .width(180.0)
+                            .selected_text(
+                                channel_options
+                                    .get(default_pair[0])
+                                    .map(|(_, label)| label.as_str())
+                                    .unwrap_or("Output 1"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (index, label) in &channel_options {
+                                    default_pair_changed |= ui
+                                        .selectable_value(&mut default_pair[0], *index, label)
+                                        .changed();
+                                }
+                            });
+                            ui.add_sized([18.0, 26.0], egui::Label::new("R"));
+                            egui::ComboBox::from_id_salt((
+                                "default_output_right",
+                                output.clone(),
+                            ))
+                            .width(180.0)
+                            .selected_text(
+                                channel_options
+                                    .get(default_pair[1])
+                                    .map(|(_, label)| label.as_str())
+                                    .unwrap_or("Output 1"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (index, label) in &channel_options {
+                                    default_pair_changed |= ui
+                                        .selectable_value(&mut default_pair[1], *index, label)
+                                        .changed();
+                                }
+                            });
                         });
                         if default_pair_changed {
                             if output_count > 1 && default_pair[0] == default_pair[1] {
@@ -3837,6 +4812,14 @@ impl CueLabsApp {
                                 .insert(settings_key, default_pair);
                             self.save_app_settings();
                         }
+
+                        ui.label(
+                            RichText::new(
+                                "I/O Routing can save a backend/device route for each Cue. Until Stage 4, a Cue must use the active backend; ASIO Cues must also use the one currently active ASIO driver.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(10.5),
+                        );
 
                         let mut input = self.audio.current_input_device.clone();
                         ui.horizontal(|ui| {
@@ -3858,6 +4841,7 @@ impl CueLabsApp {
                         ui.label(RichText::new(
                             "The selected output device and its driver channel count are global for the application.",
                         ).color(Theme::text_dim()).size(11.0));
+
                     }
                     SettingsTab::Osc => {
                         ui.heading("Open Sound Control");
@@ -4066,11 +5050,11 @@ impl CueLabsApp {
                             self.save_app_settings();
                         }
                     }
-                    SettingsTab::Backup => {
+                    SettingsTab::BackupLogs => {
                         ui.heading("Project backups");
                         ui.label(
                             RichText::new(
-                                "CueLabs creates a lightweight event snapshot after every successful project save.",
+                                "Theatre Show Cue creates a lightweight event snapshot after every successful project save.",
                             )
                             .color(Theme::text_dim())
                             .size(11.0),
@@ -4098,7 +5082,7 @@ impl CueLabsApp {
                                 .size(11.0),
                         );
                         ui.label(
-                            RichText::new("The backup folder stores event/project data only, not audio media. CueLabs keeps the 10 newest snapshots and removes the oldest automatically.")
+                            RichText::new("The backup folder stores event/project data only, not audio media. Theatre Show Cue keeps the 10 newest snapshots and removes the oldest automatically.")
                                 .color(Theme::text_dim())
                                 .size(11.0),
                         );
@@ -4107,6 +5091,156 @@ impl CueLabsApp {
                             self.last_backup_at = Instant::now();
                             self.save_app_settings();
                         }
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.heading("Diagnostic logs");
+                        ui.label(
+                            RichText::new(
+                                "Audio diagnostics and application behaviour are written to separate files. You can export them as one ZIP archive and send it to the developer.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(11.0),
+                        );
+
+                        let current_log_directory = crate::diagnostics::active_log_directory()
+                            .unwrap_or_else(|| {
+                                crate::diagnostics::configured_log_directory(
+                                    self.settings.diagnostic_log_directory.as_deref(),
+                                )
+                            });
+                        let mut displayed_log_directory =
+                            current_log_directory.display().to_string();
+                        let mut selected_log_directory: Option<PathBuf> = None;
+                        ui.horizontal(|ui| {
+                            ui.label("Save logs to");
+                            ui.add_sized(
+                                [430.0, 26.0],
+                                egui::TextEdit::singleline(&mut displayed_log_directory)
+                                    .interactive(false),
+                            );
+                            if ui.button("Browse…").clicked() {
+                                if let Some(path) = FileDialog::new()
+                                    .set_directory(&current_log_directory)
+                                    .pick_folder()
+                                {
+                                    selected_log_directory = Some(path);
+                                }
+                            }
+                        });
+
+                        if let Some(path) = selected_log_directory {
+                            match crate::diagnostics::set_log_directory(&path) {
+                                Ok(()) => {
+                                    self.settings.diagnostic_log_directory =
+                                        Some(path.to_string_lossy().into_owned());
+                                    self.save_app_settings();
+                                    if let Err(error) = crate::diagnostics::write_runtime_report(
+                                        self.audio.backend.label(),
+                                        &self.audio.output_devices,
+                                        &self.audio.input_devices,
+                                        self.audio.output_channels,
+                                    ) {
+                                        warn!("Could not refresh diagnostic report: {error}");
+                                    }
+                                    info!("Diagnostic log directory changed to '{}'", path.display());
+                                    self.status_msg =
+                                        format!("Diagnostic logs will be saved to {}", path.display());
+                                }
+                                Err(error) => {
+                                    self.status_msg =
+                                        format!("Could not change diagnostic log folder: {error}");
+                                    warn!("{}", self.status_msg);
+                                }
+                            }
+                        }
+
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Use default folder").clicked() {
+                                let path = crate::diagnostics::default_log_directory();
+                                match crate::diagnostics::set_log_directory(&path) {
+                                    Ok(()) => {
+                                        self.settings.diagnostic_log_directory = None;
+                                        self.save_app_settings();
+                                        let _ = crate::diagnostics::write_runtime_report(
+                                            self.audio.backend.label(),
+                                            &self.audio.output_devices,
+                                            &self.audio.input_devices,
+                                            self.audio.output_channels,
+                                        );
+                                        info!("Diagnostic log directory reset to default");
+                                        self.status_msg = "Using the default diagnostic log folder".to_string();
+                                    }
+                                    Err(error) => {
+                                        self.status_msg =
+                                            format!("Could not reset diagnostic log folder: {error}");
+                                        warn!("{}", self.status_msg);
+                                    }
+                                }
+                            }
+                            if ui.button("Open log folder").clicked() {
+                                if let Err(error) =
+                                    crate::diagnostics::open_log_directory(&current_log_directory)
+                                {
+                                    self.status_msg = format!("Could not open log folder: {error}");
+                                    warn!("{}", self.status_msg);
+                                }
+                            }
+                            if ui.button("Export diagnostic ZIP…").clicked() {
+                                if let Some(destination) = FileDialog::new()
+                                    .add_filter("ZIP archive", &["zip"])
+                                    .set_directory(&current_log_directory)
+                                    .set_file_name("TheatreShowCue_diagnostics.zip")
+                                    .save_file()
+                                {
+                                    match crate::diagnostics::create_diagnostic_archive(
+                                        &current_log_directory,
+                                        &destination,
+                                    ) {
+                                        Ok(file_count) => {
+                                            self.status_msg = format!(
+                                                "Diagnostic archive created: {} ({} files)",
+                                                destination.display(),
+                                                file_count
+                                            );
+                                            info!("{}", self.status_msg);
+                                        }
+                                        Err(error) => {
+                                            self.status_msg =
+                                                format!("Could not export diagnostic archive: {error:#}");
+                                            warn!("{}", self.status_msg);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        match crate::diagnostics::diagnostic_file_counts(&current_log_directory) {
+                            Ok((audio_count, application_count, report_count)) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Current folder: {audio_count}/30 audio logs · {application_count}/30 application logs · {report_count}/30 diagnostic reports"
+                                    ))
+                                    .color(Theme::text_dim())
+                                    .size(11.0),
+                                );
+                            }
+                            Err(error) => {
+                                ui.label(
+                                    RichText::new(format!("Could not read log folder: {error}"))
+                                        .color(Theme::text_dim())
+                                        .size(11.0),
+                                );
+                            }
+                        }
+
+                        ui.label(
+                            RichText::new(
+                                "Automatic cleanup keeps the newest 30 files of each type. Only Theatre Show Cue diagnostic files are removed; unrelated files are never deleted. The export contains logs and the diagnostic report, not audio media or project files.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(11.0),
+                        );
+
                     }
                 }
                     });
@@ -4238,6 +5372,7 @@ impl CueLabsApp {
                 ui.separator();
                 if ui.button("Export report…").clicked() {
                     if let Some(dir) = FileDialog::new().pick_folder() {
+                        self.report.finish();
                         match self.report.save(&dir) {
                             Ok(p) => self.status_msg = format!("Report saved: {}", p.display()),
                             Err(e) => self.status_msg = format!("Report error: {e}"),
@@ -4289,7 +5424,7 @@ impl CueLabsApp {
                 }
                 if ui.button("📡 Add OSC Cue").clicked() {
                     self.add_typed_cue(CueType::Osc {
-                        address: "/cuelabs/event".to_string(),
+                        address: "/tasq/event".to_string(),
                         args: Vec::new(),
                     });
                     ui.close_menu();
@@ -4328,8 +5463,19 @@ impl CueLabsApp {
                     self.active_panel = Panel::IoRouting;
                     ui.close_menu();
                 }
+                if ui.button("Trim").clicked() {
+                    self.active_panel = Panel::Trim;
+                    ui.close_menu();
+                }
                 if ui.button("Session Report").clicked() {
                     self.active_panel = Panel::Report;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.notes_sidebar_open, "Notes Sidebar")
+                    .changed()
+                {
                     ui.close_menu();
                 }
             });
@@ -4339,14 +5485,8 @@ impl CueLabsApp {
     // ── Нижняя панель (Inspector / Waveform / Playback / I/O Routing / MIDI) ──
 
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
-        // Never impose a minimum height from the content: the resizable
-        // TopBottomPanel owns the viewport, and the Cue List shrinks with it.
-        let full_panel_rect = ui.max_rect();
-        let _background_interaction = ui.interact(
-            full_panel_rect,
-            Id::new("bottom_panel_full_area_blocker"),
-            egui::Sense::click_and_drag(),
-        );
+        // This content is hosted by a real TopBottomPanel. egui reserves its
+        // rectangle from the central work area, preventing pointer fall-through.
 
         let selected_type = self
             .selected
@@ -4358,7 +5498,7 @@ impl CueLabsApp {
         if !selected_is_audio
             && matches!(
                 self.active_panel,
-                Panel::Waveform | Panel::Playback | Panel::IoRouting
+                Panel::Waveform | Panel::Playback | Panel::IoRouting | Panel::Trim
             )
         {
             self.active_panel = Panel::Inspector;
@@ -4377,17 +5517,26 @@ impl CueLabsApp {
                 );
                 ui.selectable_value(&mut self.active_panel, Panel::Playback, "🎚 Playback");
                 ui.selectable_value(&mut self.active_panel, Panel::IoRouting, "🔌 I/O Routing");
+                ui.selectable_value(&mut self.active_panel, Panel::Trim, "🎛 Trim");
             }
             if selected_is_midi {
                 ui.selectable_value(&mut self.active_panel, Panel::Midi, "🎹 MIDI Settings");
             }
             ui.selectable_value(&mut self.active_panel, Panel::Report, "📋 Report");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Hide ▾")
+                    .on_hover_text("Hide lower panel")
+                    .clicked()
+                {
+                    self.bottom_panel_visible = false;
+                }
+            });
         });
         ui.separator();
 
-        // Use the panel's current available height, not the saved previous
-        // height. This is essential: using the old value here prevents the
-        // TopBottomPanel from shrinking after a user drag.
+        // Use the lower region's current available height, not the saved
+        // previous height. This lets the content scroll inside the resized area.
         let content_height = ui.available_height().max(1.0);
         egui::ScrollArea::vertical()
             .id_salt("bottom_panel_content_scroll")
@@ -4457,25 +5606,36 @@ impl CueLabsApp {
                                 .unwrap_or(false);
                             let (
                                 seek_position,
-                                automation_changed,
-                                automation_enabled,
-                                automation_points,
+                                volume_automation_changed,
+                                time_pitch_changed,
+                                volume_automation_enabled,
+                                volume_automation_points,
+                                time_pitch_settings,
                             ) = if let Some(cue) = self.cue_list.find_mut(id) {
-                                let (seek, changed) = WaveformEditor::show(ui, cue);
+                                let (seek, volume_changed, time_pitch_changed) =
+                                    WaveformEditor::show(ui, cue);
                                 (
                                     seek,
-                                    changed,
+                                    volume_changed,
+                                    time_pitch_changed,
                                     cue.volume_automation_enabled,
                                     cue.volume_automation.clone(),
+                                    cue.time_pitch.clone(),
                                 )
                             } else {
-                                (None, false, false, Vec::new())
+                                (None, false, false, false, Vec::new(), Default::default())
                             };
-                            if automation_changed {
+                            if volume_automation_changed {
                                 self.audio.send(AudioCommand::SetVolumeAutomation {
                                     id,
-                                    enabled: automation_enabled,
-                                    points: automation_points,
+                                    enabled: volume_automation_enabled,
+                                    points: volume_automation_points,
+                                });
+                            }
+                            if time_pitch_changed {
+                                self.audio.send(AudioCommand::SetTimePitch {
+                                    id,
+                                    settings: time_pitch_settings,
                                 });
                             }
                             if let Some(position_secs) = seek_position {
@@ -4488,6 +5648,10 @@ impl CueLabsApp {
                                         cue.state = CueState::Stopped;
                                     }
                                 }
+                                info!(
+                                    "Waveform seek: cue_id={}, position={:.3}s, was_active={}",
+                                    id, position_secs, was_active
+                                );
                                 self.audio.send(AudioCommand::Seek { id, position_secs });
                                 self.status_msg =
                                     format!("⏸ Position set to {:.2}s", position_secs);
@@ -4503,14 +5667,23 @@ impl CueLabsApp {
                     Panel::Playback => {
                         if let Some(id) = self.selected {
                             let master = self.master_vol;
-                            let mut new_vol = None;
+                            let mut volume_update = None;
+                            let mut time_pitch_update = None;
                             if let Some(cue) = self.cue_list.find_mut(id) {
-                                if Inspector::show_playback(ui, cue) {
-                                    new_vol = Some(cue.volume * master);
+                                let (volume_changed, time_pitch_changed) =
+                                    Inspector::show_playback(ui, cue);
+                                if volume_changed {
+                                    volume_update = Some(cue.volume * master);
+                                }
+                                if time_pitch_changed {
+                                    time_pitch_update = Some(cue.time_pitch.clone());
                                 }
                             }
-                            if let Some(v) = new_vol {
-                                self.audio.send(AudioCommand::SetVolume(id, v));
+                            if let Some(volume) = volume_update {
+                                self.audio.send(AudioCommand::SetVolume(id, volume));
+                            }
+                            if let Some(settings) = time_pitch_update {
+                                self.audio.send(AudioCommand::SetTimePitch { id, settings });
                             }
                         } else {
                             ui.label(
@@ -4522,6 +5695,21 @@ impl CueLabsApp {
 
                     Panel::IoRouting => {
                         let selected_id = self.selected;
+                        let previous_endpoint = selected_id.and_then(|id| {
+                            self.cue_list.find(id).map(|cue| {
+                                (
+                                    cue.io.output_device.clone(),
+                                    cue.io.output_backend
+                                        .or_else(|| {
+                                            cue.io.output_device_id.as_deref()
+                                                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                                .map(|endpoint| endpoint.backend)
+                                        })
+                                        .unwrap_or(self.audio.backend),
+                                    cue.io.output_device_id.clone(),
+                                )
+                            })
+                        });
                         let routes_changed = if let Some(id) = selected_id {
                             if let Some(cue) = self.cue_list.find_mut(id) {
                                 Inspector::show_io_routing(ui, Some(cue), &mut self.audio)
@@ -4534,15 +5722,101 @@ impl CueLabsApp {
 
                         if routes_changed {
                             if let Some(id) = selected_id {
-                                if let Some(cue) = self.cue_list.find(id) {
-                                    self.audio.send(AudioCommand::SetRouting {
+                                let cue_update = self.cue_list.find(id).map(|cue| {
+                                    let route_backend = cue
+                                        .io
+                                        .output_backend
+                                        .or_else(|| {
+                                            cue.io.output_device_id.as_deref()
+                                                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                                .map(|endpoint| endpoint.backend)
+                                        })
+                                        .unwrap_or(self.audio.backend);
+                                    let endpoint_changed = previous_endpoint.as_ref().is_some_and(
+                                        |(previous_device, previous_backend, previous_id)| {
+                                            let identity_changed = match (
+                                                previous_id.as_deref(),
+                                                cue.io.output_device_id.as_deref(),
+                                            ) {
+                                                (Some(previous), Some(current)) => previous != current,
+                                                (Some(_), None) => true,
+                                                (None, Some(_)) => false,
+                                                (None, None) => previous_device != &cue.io.output_device,
+                                            };
+                                            identity_changed || *previous_backend != route_backend
+                                        },
+                                    );
+                                    (
+                                        cue.io.channel_routes.clone(),
+                                        cue.io.output_gains_db.clone(),
+                                        cue.volume * self.master_vol,
+                                        endpoint_changed,
+                                        cue.io.output_device.is_some()
+                                            && route_backend != self.audio.backend,
+                                        route_backend,
+                                        cue.name.clone(),
+                                    )
+                                });
+                                if let Some((
+                                    routes,
+                                    output_gains_db,
+                                    volume,
+                                    endpoint_changed,
+                                    cross_backend_route,
+                                    route_backend,
+                                    cue_name,
+                                )) = cue_update
+                                {
+                                    if endpoint_changed {
+                                        self.stop_target_and_descendants(id);
+                                        self.status_msg = if cross_backend_route {
+                                            format!(
+                                                "Cue '{}' is assigned to {}. It will play after Stage 4 enables cross-backend workers.",
+                                                cue_name,
+                                                route_backend.short_label()
+                                            )
+                                        } else {
+                                            format!(
+                                                "Cue '{}' stopped because its output endpoint changed. Press GO to play through the new endpoint.",
+                                                cue_name
+                                            )
+                                        };
+                                    }
+                                    self.audio.send(AudioCommand::SetRouting { id, routes });
+                                    self.audio.send(AudioCommand::SetOutputGains {
                                         id,
-                                        routes: cue.io.channel_routes.clone(),
+                                        gains_db: output_gains_db,
                                     });
+                                    self.audio.send(AudioCommand::SetVolume(id, volume));
                                 }
                             }
-                            self.settings.output_channels = self.audio.output_channel_settings();
-                            self.save_app_settings();
+                        }
+                    }
+
+                    Panel::Trim => {
+                        let selected_id = self.selected;
+                        let trim_changed = if let Some(id) = selected_id {
+                            if let Some(cue) = self.cue_list.find_mut(id) {
+                                Inspector::show_source_channel_trims(ui, Some(cue), &self.audio)
+                            } else {
+                                Inspector::show_source_channel_trims(ui, None, &self.audio)
+                            }
+                        } else {
+                            Inspector::show_source_channel_trims(ui, None, &self.audio)
+                        };
+
+                        if trim_changed {
+                            if let Some(id) = selected_id {
+                                if let Some((routes, volume)) = self.cue_list.find(id).map(|cue| {
+                                    (cue.io.channel_routes.clone(), cue.volume * self.master_vol)
+                                }) {
+                                    self.audio.send(AudioCommand::SetRouting { id, routes });
+                                    // The Trim tab's master strip controls the cue's
+                                    // actual playback level, so propagate it live just
+                                    // like the Playback and I/O Routing master faders.
+                                    self.audio.send(AudioCommand::SetVolume(id, volume));
+                                }
+                            }
                         }
                     }
 
@@ -4573,28 +5847,78 @@ impl CueLabsApp {
     }
 }
 
-impl eframe::App for CueLabsApp {
+impl eframe::App for TheatreShowCueApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Re-apply our palette during update as well as at startup. This keeps
         // egui's native-window defaults from overriding custom text colors on Windows.
         Theme::apply(ctx, &self.settings.appearance);
 
         if !self.startup_frame_logged {
-            info!("CueLabs GUI reached its first frame");
+            info!("Theatre Show Cue GUI reached its first frame");
             self.startup_frame_logged = true;
         }
 
-        // A previous build could have persisted the runaway panel's expanded
-        // height. Reset only clearly screen-sized values once, then preserve
-        // normal user resizing from this version onward.
+        // Keep the inspector inside the application viewport and reserve at
+        // least roughly 38% of the window for the Cue List, even after resizing.
         let screen_height = ctx.input(|input| input.screen_rect().height());
-        if screen_height > 0.0 && self.bottom_panel_height > screen_height * 0.72 {
-            self.bottom_panel_height = 225.0_f32.min((screen_height * 0.4).max(80.0));
-            self.settings.bottom_panel_height = self.bottom_panel_height;
+        let max_bottom_panel_height = if screen_height > 0.0 {
+            ((screen_height - 130.0).max(80.0) * 0.55)
+                .min(700.0)
+                .max(80.0)
+        } else {
+            600.0
+        };
+        let clamped_panel_height = self
+            .bottom_panel_height
+            .clamp(80.0, max_bottom_panel_height);
+        if (clamped_panel_height - self.bottom_panel_height).abs() > 1.0 {
+            self.bottom_panel_height = clamped_panel_height;
+            self.settings.bottom_panel_height = clamped_panel_height;
             self.save_app_settings();
         }
 
+        while let Some(scan) = self.device_registry_monitor.try_recv() {
+            let changes = self.audio.device_registry.apply_scan(scan);
+            if changes.changed() {
+                info!(
+                    "Audio device registry changed: +{} new, {} reconnected, {} disconnected, {} renamed",
+                    changes.added,
+                    changes.reconnected,
+                    changes.disconnected,
+                    changes.renamed
+                );
+                let active_endpoint_available = self
+                    .audio
+                    .device_registry
+                    .find_available_by_id(&self.audio.current_device_id)
+                    .is_some();
+                if !active_endpoint_available && !self.active_output_needs_reopen {
+                    self.active_output_needs_reopen = true;
+                    self.stop_all();
+                    let message = format!(
+                        "Active audio endpoint {} — '{}' was disconnected. Playback was stopped; reconnect it and select it again to reopen the stream.",
+                        self.audio.backend.short_label(),
+                        self.audio.current_device
+                    );
+                    self.status_msg = message.clone();
+                    warn!("{}", message);
+                } else if active_endpoint_available && self.active_output_needs_reopen {
+                    self.status_msg = format!(
+                        "{} — '{}' reconnected. Select it in Audio Settings to reopen the output stream.",
+                        self.audio.backend.short_label(),
+                        self.audio.current_device
+                    );
+                } else if changes.added > 0 || changes.reconnected > 0 {
+                    self.status_msg = format!(
+                        "Audio devices updated: {} available endpoint(s)",
+                        self.audio.device_registry.available_count()
+                    );
+                }
+            }
+        }
+
         self.poll_pending_triggers();
+        self.poll_time_triggers();
         self.poll_audio();
         self.poll_wait_progress();
         self.poll_midi();
@@ -4606,6 +5930,15 @@ impl eframe::App for CueLabsApp {
 
         if self.cue_list.active_count() > 0 || !self.pending_triggers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(30));
+        } else if self.cue_list.cues.iter().any(|cue| {
+            cue.time_trigger_enabled
+                && !matches!(&cue.cue_type, CueType::Comment { .. })
+                && (chrono::NaiveTime::parse_from_str(&cue.time_trigger_time, "%H:%M").is_ok()
+                    || chrono::NaiveTime::parse_from_str(&cue.time_trigger_time, "%H:%M:%S")
+                        .is_ok())
+        }) {
+            // Poll clock-based triggers frequently enough not to miss the scheduled minute/second.
+            ctx.request_repaint_after(Duration::from_millis(100));
         } else if (self.settings.backup_interval_minutes > 0 && self.project_path.is_some())
             || self
                 .cue_list
@@ -4615,6 +5948,10 @@ impl eframe::App for CueLabsApp {
         {
             // Timed backups and missing-media recovery are checked once per
             // second even while the show is otherwise idle.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        } else {
+            // The device registry is polled in the background; wake the UI at
+            // low frequency so new hot-plug snapshots are consumed promptly.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
@@ -4694,11 +6031,20 @@ impl eframe::App for CueLabsApp {
                 });
             });
 
-        // ── Нижняя панель инспектора / вейвформы / роутинга / MIDI ────────
-        if self.bottom_panel_visible {
-            let lower_panel = egui::TopBottomPanel::bottom("bottom_inspector")
+        // IMPORTANT: egui requires every TopBottomPanel to be declared before
+        // SidePanel and CentralPanel. If the inspector is declared after the
+        // Notes SidePanel, egui can paint it over the central area without
+        // reserving its height from Cue List. That leaves virtual cue rows
+        // underneath the inspector interactive. Keep this panel here, before
+        // Notes Sidebar, so CentralPanel receives only the remaining rectangle.
+        // The inspector is a real egui panel, not a child painted over the Cue List.
+        // Its rectangle is removed from the central work area, so rows below it
+        // cannot receive clicks, selection, drag, or resize input.
+        let mut inspector_resize_handle: Option<egui::Rect> = None;
+        if self.bottom_panel_visible && !self.settings_open {
+            let lower_panel = egui::TopBottomPanel::bottom("cue_inspector_panel")
                 .resizable(true)
-                .height_range(80.0..=1200.0)
+                .height_range(80.0..=max_bottom_panel_height)
                 .default_height(self.bottom_panel_height)
                 .frame(
                     egui::Frame::NONE
@@ -4706,66 +6052,62 @@ impl eframe::App for CueLabsApp {
                         .inner_margin(egui::Margin::same(8_i8)),
                 )
                 .show(ctx, |ui| {
-                    ui.add_enabled_ui(!self.settings_open, |ui| {
-                        // Reserve the complete lower-panel rectangle for this panel.
-                        // Empty space must not pass pointer clicks through to Cue List.
-                        let panel_content_rect = ui.max_rect();
-                        ui.interact(
-                            panel_content_rect,
-                            Id::new("bottom_panel_full_area_input_blocker"),
-                            egui::Sense::click_and_drag(),
-                        );
-                        self.bottom_panel(ui);
-                    });
+                    self.bottom_panel(ui);
                 });
+
             let panel_rect = lower_panel.response.rect;
-            let measured_panel_height = panel_rect.height();
-            egui::Area::new(Id::new("hide_bottom_panel_button"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -42.0))
-                .show(ctx, |ui| {
-                    if ui.small_button("Hide panel ▾").clicked() {
-                        self.bottom_panel_visible = false;
-                    }
-                });
-            let resize_handle_rect = egui::Rect::from_min_max(
+            // egui's TopBottomPanel resize grip sits on the top edge of the
+            // panel. Track the primary drag while it starts in this narrow
+            // strip; keep CueTable input disabled until the pointer is released.
+            inspector_resize_handle = Some(egui::Rect::from_min_max(
                 egui::pos2(panel_rect.left(), panel_rect.top() - 7.0),
                 egui::pos2(panel_rect.right(), panel_rect.top() + 7.0),
-            );
-            let dragging_panel_handle = ctx.input(|input| {
-                (input.pointer.button_down(egui::PointerButton::Primary)
-                    || input.pointer.button_released(egui::PointerButton::Primary))
-                    && input
-                        .pointer
-                        .interact_pos()
-                        .map(|position| resize_handle_rect.contains(position))
-                        .unwrap_or(false)
-            });
-            if dragging_panel_handle
-                && measured_panel_height.is_finite()
-                && (measured_panel_height - self.bottom_panel_height).abs() > 1.0
-            {
-                self.bottom_panel_height = measured_panel_height.clamp(80.0, 1200.0);
-                self.settings.bottom_panel_height = self.bottom_panel_height;
-                self.bottom_panel_dirty = true;
-            }
-            if self.bottom_panel_dirty && !ctx.input(|input| input.pointer.any_down()) {
-                if measured_panel_height.is_finite() {
-                    self.bottom_panel_height = measured_panel_height.clamp(80.0, 1200.0);
-                    self.settings.bottom_panel_height = self.bottom_panel_height;
+            ));
+
+            let actual_height = panel_rect.height();
+            if (actual_height - self.bottom_panel_height).abs() > 1.0 {
+                // A changing panel height while the primary pointer is down is
+                // definitive evidence that the splitter owns this drag, even if
+                // egui's resize grip is a few pixels outside the reported rect.
+                if ctx.input(|input| input.pointer.button_down(egui::PointerButton::Primary)) {
+                    self.bottom_panel_resize_active = true;
                 }
-                self.save_app_settings();
-                self.bottom_panel_dirty = false;
+                self.bottom_panel_height = actual_height;
+                self.settings.bottom_panel_height = actual_height;
+                if ctx.input(|input| input.pointer.any_released()) {
+                    self.save_app_settings();
+                }
             }
-        } else if !self.settings_open {
-            egui::Area::new(Id::new("show_bottom_panel_button"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -42.0))
-                .show(ctx, |ui| {
-                    if ui.button("Show panel ▴").clicked() {
-                        self.bottom_panel_visible = true;
-                    }
-                });
+        }
+
+        let (primary_down, primary_released, pointer_pos) = ctx.input(|input| {
+            (
+                input.pointer.button_down(egui::PointerButton::Primary),
+                input.pointer.button_released(egui::PointerButton::Primary),
+                input.pointer.interact_pos(),
+            )
+        });
+        if primary_down
+            && pointer_pos
+                .zip(inspector_resize_handle)
+                .map(|(position, handle)| handle.contains(position))
+                .unwrap_or(false)
+        {
+            self.bottom_panel_resize_active = true;
+        }
+
+        if self.bottom_panel_resize_active && primary_released {
+            self.bottom_panel_resize_active = false;
+            self.bottom_panel_resize_release_guard = true;
+        } else if self.bottom_panel_resize_release_guard && !primary_down {
+            // The release event is delivered for one frame. Clear the guard on
+            // the following frame, after CueTable has safely ignored mouse-up.
+            self.bottom_panel_resize_release_guard = false;
+        }
+
+        if inspector_resize_handle.is_none() {
+            self.bottom_panel_resize_active = false;
+            self.bottom_panel_resize_release_guard = false;
         }
 
         // ── Боковая панель Notes выбранного события ────────────────────────
@@ -4820,356 +6162,551 @@ impl eframe::App for CueLabsApp {
                     .inner_margin(egui::Margin::same(0_i8)),
             )
             .show(ctx, |ui| {
-                if self.settings_open {
-                    let blocked_rect = ui.max_rect();
-                    ui.painter()
-                        .rect_filled(blocked_rect, 0.0, Theme::bg_dark());
-                    ui.allocate_rect(blocked_rect, egui::Sense::click_and_drag());
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        let title = self.project.settings.name.clone();
-                        let mut rename_commit: Option<String> = None;
-                        let mut rename_cancel = false;
+                let central_available = ui.available_size();
+                ui.spacing_mut().item_spacing.y = 0.0;
 
-                        if let Some(edit_name) = self.project_name_edit.as_mut() {
-                            let response = ui.add(
-                                egui::TextEdit::singleline(edit_name)
-                                    .desired_width(190.0)
-                                    .font(egui::FontId::proportional(14.0)),
-                            );
-                            if self.project_name_edit_focus_pending {
-                                response.request_focus();
-                                self.project_name_edit_focus_pending = false;
-                            }
-
-                            let enter_pressed = ui.input(|input| input.key_pressed(Key::Enter));
-                            let escape_pressed = ui.input(|input| input.key_pressed(Key::Escape));
-                            if response.has_focus() && escape_pressed {
-                                rename_cancel = true;
-                            } else if (response.has_focus() && enter_pressed)
-                                || response.lost_focus()
-                            {
-                                rename_commit = Some(edit_name.clone());
-                            }
+                // TopBottomPanel has already reserved the inspector rectangle.
+                // The Cue List is built only inside the remaining central rect.
+                ui.allocate_ui_with_layout(
+                    central_available,
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_clip_rect(ui.max_rect());
+                        if self.settings_open {
+                            let blocked_rect = ui.max_rect();
+                            ui.painter()
+                                .rect_filled(blocked_rect, 0.0, Theme::bg_dark());
+                            ui.allocate_rect(blocked_rect, egui::Sense::click_and_drag());
                         } else {
-                            let title_response = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(title.clone())
-                                        .color(Theme::text())
-                                        .size(14.0),
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                            let title_response =
-                                title_response.on_hover_text("Double-click to rename project");
-                            if title_response.double_clicked() {
-                                self.project_name_edit = Some(title);
-                                self.project_name_edit_focus_pending = true;
-                            }
-                        }
-
-                        if rename_cancel {
-                            self.project_name_edit = None;
-                            self.project_name_edit_focus_pending = false;
-                        } else if let Some(new_name) = rename_commit {
-                            self.project_name_edit = None;
-                            self.project_name_edit_focus_pending = false;
-                            self.rename_project(new_name);
-                        }
-
-                        ui.add_space(8.0);
-
-                        if ui
-                            .small_button("🔊")
-                            .on_hover_text("Add audio file(s)")
-                            .clicked()
-                        {
-                            self.add_files();
-                        }
-                        if ui.small_button("▶").on_hover_text("Add Play cue").clicked() {
-                            self.add_typed_cue(CueType::Play { target_id: None });
-                        }
-                        if ui
-                            .small_button("⏸")
-                            .on_hover_text("Add Pause cue")
-                            .clicked()
-                        {
-                            self.add_typed_cue(CueType::Pause { target_id: None });
-                        }
-                        if ui.small_button("⏹").on_hover_text("Add Stop cue").clicked() {
-                            self.add_typed_cue(CueType::Stop { target_id: None });
-                        }
-                        if ui.small_button("↗").on_hover_text("Add Fade cue").clicked() {
-                            self.add_typed_cue(CueType::Fade {
-                                target_id: None,
-                                fade_in: false,
-                                duration_secs: 3.0,
-                                stop_on_finish: true,
-                                target_volume: None,
-                                fade_curve: FadeCurve::Linear,
-                                custom_fade_points: vec![[0.0, 0.0], [1.0, 1.0]],
-                            });
-                        }
-                        if ui
-                            .small_button("🎹")
-                            .on_hover_text("Add MIDI cue")
-                            .clicked()
-                        {
-                            self.add_typed_cue(CueType::Midi {
-                                channel: 1,
-                                message: MidiMessageKind::NoteOn {
-                                    note: 60,
-                                    velocity: 100,
-                                },
-                                raw_hex: "90 3C 64".to_string(),
-                            });
-                        }
-                        if ui.small_button("📡").on_hover_text("Add OSC cue").clicked() {
-                            self.add_typed_cue(CueType::Osc {
-                                address: "/cuelabs/event".to_string(),
-                                args: Vec::new(),
-                            });
-                        }
-                        if ui
-                            .small_button("📁")
-                            .on_hover_text("Add Group cue")
-                            .clicked()
-                        {
-                            self.add_typed_cue(CueType::Group {
-                                mode: GroupMode::Normal,
-                                children: Vec::new(),
-                                fade_in_secs: 0.0,
-                                fade_out_secs: 0.0,
-                            });
-                        }
-                        if ui
-                            .small_button("💬")
-                            .on_hover_text("Add Comment cue")
-                            .clicked()
-                        {
-                            self.add_typed_cue(CueType::Comment {
-                                text: String::new(),
-                            });
-                        }
-
-                        ui.add_space(6.0);
-                        let notes_width = (ui.available_width() - 76.0).max(120.0);
-                        let notes_size = [notes_width, 56.0];
-                        if let Some(selected_id) = self.selected {
-                            if let Some(cue) = self.cue_list.find_mut(selected_id) {
-                                ui.add_sized(
-                                    notes_size,
-                                    egui::TextEdit::multiline(&mut cue.notes)
-                                        .desired_rows(3)
-                                        .font(egui::FontId::proportional(11.0))
-                                        .hint_text("Selected cue notes…"),
-                                )
-                                .on_hover_text("Quick notes for the selected cue");
-                            }
-                        } else {
-                            let mut empty_notes = String::new();
-                            ui.add_enabled_ui(false, |ui| {
-                                ui.add_sized(
-                                    notes_size,
-                                    egui::TextEdit::multiline(&mut empty_notes)
-                                        .desired_rows(3)
-                                        .font(egui::FontId::proportional(11.0))
-                                        .hint_text("Select a cue to edit notes"),
-                                );
-                            });
-                        }
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("⚙").on_hover_text("Settings").clicked() {
-                                self.settings_open = true;
-                            }
-                            if ui
-                                .small_button(if self.notes_sidebar_open {
-                                    "📝"
-                                } else {
-                                    "🗒"
+                            let selected_cue_info = self.selected.and_then(|selected_id| {
+                                self.cue_list.find(selected_id).map(|cue| {
+                                    (
+                                        cue.number.clone(),
+                                        cue.name.clone(),
+                                        cue.cue_type.label().to_string(),
+                                        cue.color.to_egui(),
+                                    )
                                 })
-                                .on_hover_text("Notes sidebar")
-                                .clicked()
-                            {
-                                self.notes_sidebar_open = !self.notes_sidebar_open;
-                            }
-                        });
-                    });
-                    ui.add(egui::Separator::default().horizontal());
+                            });
 
-                    let action = CueTable::show(
-                        ui,
-                        &mut self.cue_list.cues,
-                        &mut self.selected,
-                        &mut self.selected_ids,
-                        &mut self.selection_anchor,
-                        &mut self.editing,
-                        &mut self.editing_focus_pending,
-                        &mut self.cue_column_widths,
-                        &mut self.expanded_groups,
-                    );
-                    if ctx.input(|input| input.pointer.any_released())
-                        && self.settings.cue_column_widths != self.cue_column_widths
-                    {
-                        self.settings.cue_column_widths = self.cue_column_widths;
-                        self.save_app_settings();
-                    }
+                            // Row one: project title and the exact event currently armed
+                            // by selection. Row two: creation tools, slightly lower.
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    let title = self.project.settings.name.clone();
+                                    let mut rename_commit: Option<String> = None;
+                                    let mut rename_cancel = false;
 
-                    if let Some(action) = action {
-                        match action {
-                            CueTableAction::Deselect => {
-                                self.selected = None;
-                                self.selected_ids.clear();
-                                self.selection_anchor = None;
-                                self.editing = None;
-                                self.editing_focus_pending = false;
-                            }
-                            CueTableAction::Play(id) => {
-                                self.select_only(id);
-                                if self.is_comment_cue(id) {
-                                    if let Some(next_id) = self.next_non_comment_after(id) {
-                                        self.select_only(next_id);
-                                    }
-                                } else {
-                                    self.trigger_cue(id);
-                                }
-                            }
-                            CueTableAction::Stop(id) => {
-                                self.select_only(id);
-                                self.stop_selected();
-                            }
-                            CueTableAction::Pause(id) => {
-                                self.select_only(id);
-                                self.pause_selected();
-                            }
-                            CueTableAction::Delete(id) => {
-                                self.delete_cue(id);
-                            }
-                            CueTableAction::MoveUp(id) => {
-                                self.cue_list.move_up(id);
-                            }
-                            CueTableAction::MoveDown(id) => {
-                                self.cue_list.move_down(id);
-                            }
-                            CueTableAction::StartEdit(id, field, buf) => {
-                                self.editing = Some((id, field, buf));
-                                self.editing_focus_pending = true;
-                            }
-                            CueTableAction::EditConfirm(id, field, new_val) => {
-                                match field {
-                                    EditField::Number => {
-                                        if let Some(cue) = self.cue_list.find_mut(id) {
-                                            cue.number = new_val.trim().to_string();
+                                    if let Some(edit_name) = self.project_name_edit.as_mut() {
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(edit_name)
+                                                .desired_width(190.0)
+                                                .font(egui::FontId::proportional(14.0)),
+                                        );
+                                        if self.project_name_edit_focus_pending {
+                                            response.request_focus();
+                                            self.project_name_edit_focus_pending = false;
                                         }
-                                    }
-                                    EditField::Name => {
-                                        if let Some(cue) = self.cue_list.find_mut(id) {
-                                            cue.name = new_val;
-                                        }
-                                    }
-                                    EditField::PreWait => {
-                                        if let Some(cue) = self.cue_list.find_mut(id) {
-                                            if let Ok(v) = new_val.trim().parse::<f64>() {
-                                                cue.pre_wait_secs = v.max(0.0);
-                                            }
-                                        }
-                                    }
-                                    EditField::PostWait => {
-                                        if let Some(cue) = self.cue_list.find_mut(id) {
-                                            if let Ok(v) = new_val.trim().parse::<f64>() {
-                                                cue.post_wait_secs = v.max(0.0);
-                                            }
-                                        }
-                                    }
-                                    EditField::Duration => {
-                                        if let Ok(value) =
-                                            new_val.trim().replace(',', ".").parse::<f64>()
+
+                                        let enter_pressed =
+                                            ui.input(|input| input.key_pressed(Key::Enter));
+                                        let escape_pressed =
+                                            ui.input(|input| input.key_pressed(Key::Escape));
+                                        if response.has_focus() && escape_pressed {
+                                            rename_cancel = true;
+                                        } else if (response.has_focus() && enter_pressed)
+                                            || response.lost_focus()
                                         {
-                                            if value.is_finite() && value >= 0.0 {
+                                            rename_commit = Some(edit_name.clone());
+                                        }
+                                    } else {
+                                        let title_response = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title.clone())
+                                                    .color(Theme::text())
+                                                    .size(14.0),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        let title_response = title_response
+                                            .on_hover_text("Double-click to rename project");
+                                        if title_response.double_clicked() {
+                                            self.project_name_edit = Some(title);
+                                            self.project_name_edit_focus_pending = true;
+                                        }
+                                    }
+
+                                    if rename_cancel {
+                                        self.project_name_edit = None;
+                                        self.project_name_edit_focus_pending = false;
+                                    } else if let Some(new_name) = rename_commit {
+                                        self.project_name_edit = None;
+                                        self.project_name_edit_focus_pending = false;
+                                        self.rename_project(new_name);
+                                    }
+
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.add_space(8.0);
+                                    // Always reserve the color-marker slot and the
+                                    // same name/type widths. Selection changes must not
+                                    // shift the toolbar's horizontal layout.
+                                    let (marker_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(16.0, 20.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    if let Some((number, name, cue_type, cue_color)) =
+                                        &selected_cue_info
+                                    {
+                                        ui.painter().circle_filled(
+                                            marker_rect.center(),
+                                            5.5,
+                                            *cue_color,
+                                        );
+                                        ui.add_sized(
+                                            [270.0, 20.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "#{} · {}",
+                                                    number, name
+                                                ))
+                                                .strong()
+                                                .color(Theme::text())
+                                                .size(13.0),
+                                            ),
+                                        )
+                                        .on_hover_text(name.as_str());
+                                        ui.add_sized(
+                                            [70.0, 20.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(cue_type)
+                                                    .color(Theme::text_dim())
+                                                    .size(11.0),
+                                            ),
+                                        );
+                                    } else {
+                                        ui.add_sized(
+                                            [270.0, 20.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("No event selected")
+                                                    .color(Theme::text_dim())
+                                                    .size(12.0),
+                                            ),
+                                        );
+                                        ui.add_sized([70.0, 20.0], egui::Label::new(""));
+                                    }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if !self.bottom_panel_visible
+                                                && ui
+                                                    .add_sized(
+                                                        [52.0, 52.0],
+                                                        egui::Button::new("▴")
+                                                            .fill(Theme::button_bg()),
+                                                    )
+                                                    .on_hover_text("Show lower panel")
+                                                    .clicked()
+                                            {
+                                                self.bottom_panel_visible = true;
+                                            }
+                                        },
+                                    );
+                                });
+
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add_space(8.0);
+                                    // Keep the event creation controls distinct.
+                                    // The previous 47 px buttons visually ran together
+                                    // on narrower windows; 42 px is a 10% reduction.
+                                    let button_size = [42.0, 42.0];
+                                    let button_fill = Theme::button_bg();
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("🔊").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add audio file(s)")
+                                        .clicked()
+                                    {
+                                        self.add_files();
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("▶").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Play cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Play { target_id: None });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("⏸").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Pause cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Pause { target_id: None });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("⏹").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Stop cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Stop { target_id: None });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("↗").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Fade cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Fade {
+                                            target_id: None,
+                                            fade_in: false,
+                                            duration_secs: 3.0,
+                                            stop_on_finish: true,
+                                            target_volume: None,
+                                            fade_curve: FadeCurve::Linear,
+                                            custom_fade_points: vec![[0.0, 0.0], [1.0, 1.0]],
+                                        });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("🎹").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add MIDI cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Midi {
+                                            channel: 1,
+                                            message: MidiMessageKind::NoteOn {
+                                                note: 60,
+                                                velocity: 100,
+                                            },
+                                            raw_hex: "90 3C 64".to_string(),
+                                        });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("📡").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add OSC cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Osc {
+                                            address: "/tasq/event".to_string(),
+                                            args: Vec::new(),
+                                        });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("📁").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Group cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Group {
+                                            mode: GroupMode::Normal,
+                                            children: Vec::new(),
+                                            fade_in_secs: 0.0,
+                                            fade_out_secs: 0.0,
+                                        });
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            button_size,
+                                            egui::Button::new("💬").fill(button_fill),
+                                        )
+                                        .on_hover_text("Add Comment cue")
+                                        .clicked()
+                                    {
+                                        self.add_typed_cue(CueType::Comment {
+                                            text: String::new(),
+                                        });
+                                    }
+
+                                    ui.add_space(6.0);
+                                    let notes_width = (ui.available_width() - 120.0).max(120.0);
+                                    if let Some(selected_id) = self.selected {
+                                        if let Some(cue) = self.cue_list.find_mut(selected_id) {
+                                            ui.add_sized(
+                                                [notes_width, 47.0],
+                                                egui::TextEdit::multiline(&mut cue.notes)
+                                                    .desired_rows(2)
+                                                    .hint_text("Notes for selected event…"),
+                                            );
+                                        } else {
+                                            ui.add_sized(
+                                                [notes_width, 47.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(
+                                                        "Select an event to edit notes",
+                                                    )
+                                                    .color(Theme::text_dim()),
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        ui.add_sized(
+                                            [notes_width, 47.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(
+                                                    "Select an event to edit notes",
+                                                )
+                                                .color(Theme::text_dim()),
+                                            ),
+                                        );
+                                    }
+
+                                    if ui
+                                        .add_sized(
+                                            [42.0, 42.0],
+                                            egui::Button::new("📝").fill(button_fill),
+                                        )
+                                        .on_hover_text("Notes sidebar")
+                                        .clicked()
+                                    {
+                                        self.notes_sidebar_open = !self.notes_sidebar_open;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [42.0, 42.0],
+                                            egui::Button::new("⚙").fill(button_fill),
+                                        )
+                                        .on_hover_text("Settings")
+                                        .clicked()
+                                    {
+                                        self.settings_open = true;
+                                    }
+                                });
+                            });
+                            ui.add(egui::Separator::default().horizontal());
+
+                            // CueTable fills the remaining central work area; the
+                            // lower inspector is a separate reserved egui panel.
+                            let interactions_enabled = !self.bottom_panel_resize_active
+                                && !self.bottom_panel_resize_release_guard;
+                            let action = ui
+                                .add_enabled_ui(interactions_enabled, |ui| {
+                                    CueTable::show(
+                                        ui,
+                                        &mut self.cue_list.cues,
+                                        &mut self.selected,
+                                        &mut self.selected_ids,
+                                        &mut self.selection_anchor,
+                                        &mut self.editing,
+                                        &mut self.editing_focus_pending,
+                                        &mut self.cue_column_widths,
+                                        &mut self.expanded_groups,
+                                        self.scroll_to_cue,
+                                        interactions_enabled,
+                                    )
+                                })
+                                .inner;
+                            self.scroll_to_cue = None;
+                            if ctx.input(|input| input.pointer.any_released())
+                                && self.settings.cue_column_widths != self.cue_column_widths
+                            {
+                                self.settings.cue_column_widths = self.cue_column_widths;
+                                self.save_app_settings();
+                            }
+
+                            if let Some(action) = action {
+                                match action {
+                                    CueTableAction::Deselect => {
+                                        self.selected = None;
+                                        self.selected_ids.clear();
+                                        self.selection_anchor = None;
+                                        self.editing = None;
+                                        self.editing_focus_pending = false;
+                                    }
+                                    CueTableAction::Copy(id) => {
+                                        if !self.selected_ids.contains(&id) {
+                                            self.select_only(id);
+                                        }
+                                        self.copy_selected_cues();
+                                    }
+                                    CueTableAction::Paste(id) => {
+                                        self.select_only(id);
+                                        self.paste_cues_after(Some(id));
+                                    }
+                                    CueTableAction::Play(id) => {
+                                        self.select_only(id);
+                                        if self.is_comment_cue(id) {
+                                            if let Some(next_id) = self.next_non_comment_after(id) {
+                                                self.select_only(next_id);
+                                            }
+                                        } else {
+                                            self.trigger_cue(id);
+                                        }
+                                    }
+                                    CueTableAction::Stop(id) => {
+                                        self.select_only(id);
+                                        self.stop_selected();
+                                    }
+                                    CueTableAction::Pause(id) => {
+                                        self.select_only(id);
+                                        self.pause_selected();
+                                    }
+                                    CueTableAction::Delete(id) => {
+                                        if self.selected_ids.contains(&id) {
+                                            self.dispatch_app_action(AppAction::DeleteSelected);
+                                        } else {
+                                            self.delete_cue(id);
+                                        }
+                                    }
+                                    CueTableAction::MoveUp(id) => {
+                                        if !self.selected_ids.contains(&id) {
+                                            self.select_only(id);
+                                        }
+                                        self.move_selected_cues(true);
+                                    }
+                                    CueTableAction::MoveDown(id) => {
+                                        if !self.selected_ids.contains(&id) {
+                                            self.select_only(id);
+                                        }
+                                        self.move_selected_cues(false);
+                                    }
+                                    CueTableAction::StartEdit(id, field, buf) => {
+                                        self.editing = Some((id, field, buf));
+                                        self.editing_focus_pending = true;
+                                    }
+                                    CueTableAction::EditConfirm(id, field, new_val) => {
+                                        match field {
+                                            EditField::Number => {
                                                 if let Some(cue) = self.cue_list.find_mut(id) {
-                                                    if let CueType::Fade { duration_secs, .. } =
-                                                        &mut cue.cue_type
-                                                    {
-                                                        *duration_secs = value;
-                                                        cue.duration_secs = value;
-                                                        cue.position_secs =
-                                                            cue.position_secs.min(value);
+                                                    cue.number = new_val.trim().to_string();
+                                                }
+                                            }
+                                            EditField::Name => {
+                                                if let Some(cue) = self.cue_list.find_mut(id) {
+                                                    cue.name = new_val;
+                                                }
+                                            }
+                                            EditField::PreWait => {
+                                                if let Some(cue) = self.cue_list.find_mut(id) {
+                                                    if let Ok(v) = new_val.trim().parse::<f64>() {
+                                                        cue.pre_wait_secs = v.max(0.0);
+                                                    }
+                                                }
+                                            }
+                                            EditField::PostWait => {
+                                                if let Some(cue) = self.cue_list.find_mut(id) {
+                                                    if let Ok(v) = new_val.trim().parse::<f64>() {
+                                                        cue.post_wait_secs = v.max(0.0);
+                                                    }
+                                                }
+                                            }
+                                            EditField::Duration => {
+                                                if let Ok(value) =
+                                                    new_val.trim().replace(',', ".").parse::<f64>()
+                                                {
+                                                    if value.is_finite() && value >= 0.0 {
+                                                        if let Some(cue) =
+                                                            self.cue_list.find_mut(id)
+                                                        {
+                                                            if let CueType::Fade {
+                                                                duration_secs,
+                                                                ..
+                                                            } = &mut cue.cue_type
+                                                            {
+                                                                *duration_secs = value;
+                                                                cue.duration_secs = value;
+                                                                cue.position_secs =
+                                                                    cue.position_secs.min(value);
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                        self.editing = None;
+                                        self.editing_focus_pending = false;
                                     }
-                                }
-                                self.editing = None;
-                                self.editing_focus_pending = false;
-                            }
-                            CueTableAction::ClearNumber(id) => {
-                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                    cue.number.clear();
-                                }
-                            }
-                            CueTableAction::EditCancel => {
-                                self.editing = None;
-                                self.editing_focus_pending = false;
-                            }
-                            CueTableAction::SetColor(id, color) => {
-                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                    cue.color = color;
-                                }
-                            }
-                            CueTableAction::MoveMultipleToPosition(
-                                dragged_ids,
-                                parent_id,
-                                sibling_index,
-                            ) => {
-                                self.handle_drag_drop_position(
-                                    dragged_ids,
-                                    parent_id,
-                                    sibling_index,
-                                );
-                            }
-                            CueTableAction::AssignTarget(dragged_id, target_id) => {
-                                // Сначала (ДО взятия mutable borrow) достаём имя перетаскиваемого cue
-                                let dragged_name = self
-                                    .cue_list
-                                    .find(dragged_id)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_default();
-
-                                let mut status_msg: Option<String> = None;
-                                if let Some(target_cue) = self.cue_list.find_mut(target_id) {
-                                    match &mut target_cue.cue_type {
-                                        CueType::Play { target_id: tid }
-                                        | CueType::Pause { target_id: tid }
-                                        | CueType::Stop { target_id: tid }
-                                        | CueType::Fade { target_id: tid, .. } => {
-                                            *tid = Some(dragged_id);
-                                            let target_label =
-                                                if target_cue.number.trim().is_empty() {
-                                                    target_cue.name.clone()
-                                                } else {
-                                                    format!(
-                                                        "#{} {}",
-                                                        target_cue.number, target_cue.name
-                                                    )
-                                                };
-                                            status_msg = Some(format!(
-                                                "Target set for {} → {}",
-                                                target_label, dragged_name
-                                            ));
+                                    CueTableAction::ClearNumber(id) => {
+                                        if let Some(cue) = self.cue_list.find_mut(id) {
+                                            cue.number.clear();
                                         }
-                                        _ => {}
                                     }
-                                }
-                                if let Some(msg) = status_msg {
-                                    self.status_msg = msg;
+                                    CueTableAction::EditCancel => {
+                                        self.editing = None;
+                                        self.editing_focus_pending = false;
+                                    }
+                                    CueTableAction::SetColor(id, color) => {
+                                        if let Some(cue) = self.cue_list.find_mut(id) {
+                                            cue.color = color;
+                                        }
+                                    }
+                                    CueTableAction::MoveMultipleToPosition(
+                                        dragged_ids,
+                                        parent_id,
+                                        sibling_index,
+                                    ) => {
+                                        self.handle_drag_drop_position(
+                                            dragged_ids,
+                                            parent_id,
+                                            sibling_index,
+                                        );
+                                    }
+                                    CueTableAction::AssignTarget(dragged_id, target_id) => {
+                                        // Сначала (ДО взятия mutable borrow) достаём имя перетаскиваемого cue
+                                        let dragged_name = self
+                                            .cue_list
+                                            .find(dragged_id)
+                                            .map(|c| c.name.clone())
+                                            .unwrap_or_default();
+
+                                        let mut status_msg: Option<String> = None;
+                                        if let Some(target_cue) = self.cue_list.find_mut(target_id)
+                                        {
+                                            match &mut target_cue.cue_type {
+                                                CueType::Play { target_id: tid }
+                                                | CueType::Pause { target_id: tid }
+                                                | CueType::Stop { target_id: tid }
+                                                | CueType::Fade { target_id: tid, .. } => {
+                                                    *tid = Some(dragged_id);
+                                                    let target_label =
+                                                        if target_cue.number.trim().is_empty() {
+                                                            target_cue.name.clone()
+                                                        } else {
+                                                            format!(
+                                                                "#{} {}",
+                                                                target_cue.number, target_cue.name
+                                                            )
+                                                        };
+                                                    status_msg = Some(format!(
+                                                        "Target set for {} → {}",
+                                                        target_label, dragged_name
+                                                    ));
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        if let Some(msg) = status_msg {
+                                            self.status_msg = msg;
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
+                    },
+                );
             });
         self.show_settings_window(ctx);
         self.show_drop_overlay(ctx);
@@ -5178,7 +6715,7 @@ impl eframe::App for CueLabsApp {
 
 #[cfg(test)]
 mod normal_group_tests {
-    use super::normal_group_manual_stop_in;
+    use super::{normal_group_manual_stop_in, TheatreShowCueApp};
     use crate::cue::{ContinueMode, Cue, CueType, GroupMode};
     use std::collections::HashSet;
 
@@ -5201,6 +6738,20 @@ mod normal_group_tests {
         Cue::new_typed(CueType::Comment {
             text: "Stage direction".to_string(),
         })
+    }
+
+    #[test]
+    fn go_on_an_active_audio_cue_restarts_at_its_start_marker() {
+        let mut cue = Cue::new_typed(CueType::Audio);
+        cue.start_secs = 3.0;
+        cue.duration_secs = 40.0;
+        cue.position_secs = 18.0;
+        cue.state = crate::cue::CueState::Playing;
+
+        assert_eq!(TheatreShowCueApp::cue_play_start_position(&cue), 3.0);
+
+        cue.state = crate::cue::CueState::Stopped;
+        assert_eq!(TheatreShowCueApp::cue_play_start_position(&cue), 18.0);
     }
 
     #[test]

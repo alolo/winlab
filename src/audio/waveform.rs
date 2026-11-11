@@ -63,12 +63,16 @@ fn samples_to_waveform(samples: &[f32], buckets: usize) -> Vec<f32> {
     }
 
     let display_gain = 0.95 / peak;
-    let bucket_size = samples.len().div_ceil(buckets).max(1);
     let mut result = Vec::with_capacity(buckets * 2);
 
     for bucket in 0..buckets {
-        let start = bucket * bucket_size;
-        let end = ((bucket + 1) * bucket_size).min(samples.len());
+        // Divide the complete sample range proportionally. Using ceil(sample
+        // count / bucket count) leaves artificial empty buckets at the end of
+        // many files and slightly shifts the visible waveform.
+        let start = bucket * samples.len() / buckets;
+        let end = (((bucket + 1) * samples.len()) / buckets)
+            .max(start + 1)
+            .min(samples.len());
         if start >= samples.len() {
             result.extend([0.0, 0.0]);
             continue;

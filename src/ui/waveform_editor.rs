@@ -6,6 +6,17 @@ use egui::*;
 
 pub struct WaveformEditor;
 
+fn snap_speed_value(value: f64) -> f64 {
+    ((value * 10.0).round() / 10.0).clamp(0.1, 4.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum WaveformAutomationLane {
+    Volume,
+    Speed,
+    Pitch,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WaveformViewState {
     zoom: f32,
@@ -22,10 +33,11 @@ impl Default for WaveformViewState {
 }
 
 impl WaveformEditor {
-    pub fn show(ui: &mut Ui, cue: &mut Cue) -> (Option<f64>, bool) {
+    pub fn show(ui: &mut Ui, cue: &mut Cue) -> (Option<f64>, bool, bool) {
         let dur = cue.duration_secs.max(0.01);
         let eff_end = cue.effective_end_secs();
         let mut automation_changed = false;
+        let mut time_pitch_changed = false;
 
         // Панель управления Region & Loop над вейвформой
         ui.horizontal_wrapped(|ui| {
@@ -100,7 +112,7 @@ impl WaveformEditor {
                 );
 
                 let mut inf = cue.loop_region.count < 0;
-                if ui.checkbox(&mut inf, "в€ћ Infinite").changed() {
+                if ui.checkbox(&mut inf, "∞ Infinite").changed() {
                     cue.loop_region.count = if inf { -1 } else { 2 };
                 }
                 if !inf {
@@ -115,51 +127,167 @@ impl WaveformEditor {
             }
         });
 
+        let lane_id = Id::new(("waveform_automation_lane", cue.id));
+        let mut automation_lane = ui
+            .ctx()
+            .data(|data| data.get_temp::<WaveformAutomationLane>(lane_id))
+            .unwrap_or(WaveformAutomationLane::Volume);
+        let (
+            mut lane_enabled,
+            mut automation_points,
+            mut value_min,
+            mut value_max,
+            mut default_value,
+        ) = match automation_lane {
+            WaveformAutomationLane::Volume => (
+                cue.volume_automation_enabled,
+                cue.volume_automation.clone(),
+                0.0_f64,
+                1.0_f64,
+                1.0_f64,
+            ),
+            WaveformAutomationLane::Speed => (
+                cue.time_pitch.speed_automation_enabled,
+                cue.time_pitch.speed_automation.clone(),
+                0.1_f64,
+                4.0_f64,
+                1.0_f64,
+            ),
+            WaveformAutomationLane::Pitch => (
+                cue.time_pitch.pitch_automation_enabled,
+                cue.time_pitch.pitch_automation.clone(),
+                -2400.0_f64,
+                2400.0_f64,
+                0.0_f64,
+            ),
+        };
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .checkbox(&mut cue.volume_automation_enabled, "Volume automation")
-                .changed()
+            ui.label(RichText::new("Automation:").color(Theme::accent()).strong());
+            ComboBox::from_id_salt(("waveform_automation_select", cue.id))
+                .selected_text(match automation_lane {
+                    WaveformAutomationLane::Volume => "Volume",
+                    WaveformAutomationLane::Speed => "Playback speed (×)",
+                    WaveformAutomationLane::Pitch => "Pitch shift (cents)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut automation_lane, WaveformAutomationLane::Volume, "Volume");
+                    ui.selectable_value(&mut automation_lane, WaveformAutomationLane::Speed, "Playback speed (×)");
+                    ui.selectable_value(&mut automation_lane, WaveformAutomationLane::Pitch, "Pitch shift (cents)");
+                });
+            if automation_lane != ui
+                .ctx()
+                .data(|data| data.get_temp::<WaveformAutomationLane>(lane_id))
+                .unwrap_or(WaveformAutomationLane::Volume)
             {
-                automation_changed = true;
+                ui.ctx().data_mut(|data| data.insert_temp(lane_id, automation_lane));
+                let (enabled, points, min_value, max_value, default) = match automation_lane {
+                    WaveformAutomationLane::Volume => (cue.volume_automation_enabled, cue.volume_automation.clone(), 0.0, 1.0, 1.0),
+                    WaveformAutomationLane::Speed => (cue.time_pitch.speed_automation_enabled, cue.time_pitch.speed_automation.clone(), 0.1, 4.0, 1.0),
+                    WaveformAutomationLane::Pitch => (cue.time_pitch.pitch_automation_enabled, cue.time_pitch.pitch_automation.clone(), -2400.0, 2400.0, 0.0),
+                };
+                lane_enabled = enabled;
+                automation_points = points;
+                value_min = min_value;
+                value_max = max_value;
+                default_value = default;
             }
-            if cue.volume_automation_enabled {
-                ui.label(
-                    RichText::new(
-                        "0–100% · click envelope to add · drag points · right-click to remove",
-                    )
-                    .color(Theme::text_dim())
-                    .size(10.0),
-                );
+            if ui.checkbox(&mut lane_enabled, "Enable").changed() {
+                match automation_lane {
+                    WaveformAutomationLane::Volume => automation_changed = true,
+                    _ => time_pitch_changed = true,
+                }
+            }
+            match automation_lane {
+                WaveformAutomationLane::Speed => {
+                    if ui
+                        .checkbox(
+                            &mut cue.time_pitch.preserve_pitch_on_speed_change,
+                            "Preserve pitch (time-stretch)",
+                        )
+                        .on_hover_text(
+                            "On: speed automation changes duration but keeps pitch. Off: pitch follows speed (varispeed).",
+                        )
+                        .changed()
+                    {
+                        time_pitch_changed = true;
+                    }
+                }
+                WaveformAutomationLane::Pitch => {
+                    if ui
+                        .checkbox(
+                            &mut cue.time_pitch.pitch_shift_changes_speed,
+                            "Varispeed: pitch shift changes duration",
+                        )
+                        .on_hover_text(
+                            "On: pitch automation also changes playback speed and duration. Off: pitch changes without changing duration.",
+                        )
+                        .changed()
+                    {
+                        time_pitch_changed = true;
+                    }
+                }
+                WaveformAutomationLane::Volume => {}
+            }
+            if lane_enabled {
+                let hint = match automation_lane {
+                    WaveformAutomationLane::Volume => "0–100%",
+                    WaveformAutomationLane::Speed => {
+                        if cue.time_pitch.preserve_pitch_on_speed_change {
+                            "0.1×–4.0× · pitch preserved"
+                        } else {
+                            "0.1×–4.0× · pitch follows speed"
+                        }
+                    }
+                    WaveformAutomationLane::Pitch => {
+                        if cue.time_pitch.pitch_shift_changes_speed {
+                            "cents · speed follows pitch"
+                        } else {
+                            "cents · speed unchanged"
+                        }
+                    }
+                };
+                ui.label(RichText::new(format!("{} · click curve to add · drag points · right-click to remove", hint))
+                    .color(Theme::text_dim()).size(10.0));
                 if ui.small_button("Reset curve").clicked() {
-                    cue.volume_automation = vec![[0.0, 1.0], [dur, 1.0]];
-                    automation_changed = true;
+                    automation_points = vec![[0.0, default_value], [dur, default_value]];
+                    match automation_lane {
+                        WaveformAutomationLane::Volume => automation_changed = true,
+                        _ => time_pitch_changed = true,
+                    }
                 }
             }
         });
 
-        if cue.volume_automation_enabled {
-            let before = cue.volume_automation.clone();
-            cue.volume_automation
-                .retain(|point| point[0].is_finite() && point[1].is_finite());
-            cue.volume_automation.sort_by(|a, b| a[0].total_cmp(&b[0]));
-            for point in &mut cue.volume_automation {
+        if lane_enabled {
+            let before = automation_points.clone();
+            automation_points.retain(|point| point[0].is_finite() && point[1].is_finite());
+            automation_points.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            for point in &mut automation_points {
                 point[0] = point[0].clamp(0.0, dur);
-                point[1] = point[1].clamp(0.0, 1.0);
+                point[1] = point[1].clamp(value_min, value_max);
+                if automation_lane == WaveformAutomationLane::Speed {
+                    point[1] = snap_speed_value(point[1]);
+                }
             }
-            if cue.volume_automation.is_empty() {
-                cue.volume_automation = vec![[0.0, 1.0], [dur, 1.0]];
+            if automation_points.is_empty() {
+                automation_points = vec![[0.0, default_value], [dur, default_value]];
             } else {
-                if cue.volume_automation[0][0] > 0.0 {
-                    let gain = cue.volume_automation[0][1];
-                    cue.volume_automation.insert(0, [0.0, gain]);
+                if automation_points[0][0] > 0.0 {
+                    let value = automation_points[0][1];
+                    automation_points.insert(0, [0.0, value]);
                 }
-                let last_index = cue.volume_automation.len() - 1;
-                if cue.volume_automation[last_index][0] < dur {
-                    let gain = cue.volume_automation[last_index][1];
-                    cue.volume_automation.push([dur, gain]);
+                let last_index = automation_points.len() - 1;
+                if automation_points[last_index][0] < dur {
+                    let value = automation_points[last_index][1];
+                    automation_points.push([dur, value]);
                 }
             }
-            automation_changed |= before != cue.volume_automation;
+            if before != automation_points {
+                match automation_lane {
+                    WaveformAutomationLane::Volume => automation_changed = true,
+                    _ => time_pitch_changed = true,
+                }
+            }
         }
 
         ui.add_space(4.0);
@@ -242,7 +370,8 @@ impl WaveformEditor {
                 FontId::proportional(12.0),
                 Theme::text_dim(),
             );
-            return (None, automation_changed);
+            Self::store_automation_lane(cue, automation_lane, lane_enabled, automation_points);
+            return (None, automation_changed, time_pitch_changed);
         }
 
         let secs_to_x = |secs: f64| -> f32 {
@@ -253,13 +382,16 @@ impl WaveformEditor {
             let fraction = ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
             ((view_start + fraction * view_span) as f64 * dur).clamp(0.0, dur)
         };
-        let gain_to_y = |gain: f64| -> f32 {
+        let value_to_y = |value: f64| -> f32 {
             let usable_height = (rect.height() - 36.0).max(1.0);
-            rect.bottom() - 18.0 - gain.clamp(0.0, 1.0) as f32 * usable_height
+            let normalized = ((value - value_min) / (value_max - value_min).max(0.000_001))
+                .clamp(0.0, 1.0) as f32;
+            rect.bottom() - 18.0 - normalized * usable_height
         };
-        let y_to_gain = |y: f32| -> f64 {
+        let y_to_value = |y: f32| -> f64 {
             let usable_height = (rect.height() - 36.0).max(1.0);
-            ((rect.bottom() - 18.0 - y) / usable_height).clamp(0.0, 1.0) as f64
+            let normalized = ((rect.bottom() - 18.0 - y) / usable_height).clamp(0.0, 1.0) as f64;
+            value_min + normalized * (value_max - value_min)
         };
 
         let eff_end = cue.effective_end_secs();
@@ -331,18 +463,20 @@ impl WaveformEditor {
             };
 
             painter.line_segment(
-                [
-                    pos2(x + bucket_w * 0.5, y_top),
-                    pos2(x + bucket_w * 0.5, y_bot),
-                ],
-                Stroke::new(bucket_w.max(1.0_f32), color),
+                [pos2(x, y_top), pos2(x, y_bot)],
+                Stroke::new((bucket_w * 0.82).clamp(0.8, 1.5), color),
             );
         }
 
-        // Volume automation is drawn over the waveform as an independent envelope.
-        if cue.volume_automation_enabled && cue.volume_automation.len() >= 2 {
-            let envelope_color = Theme::volume_automation();
-            for pair in cue.volume_automation.windows(2) {
+        // The selected automation lane is drawn over the waveform. Each lane
+        // keeps its own independent point list and can be enabled simultaneously.
+        if lane_enabled && automation_points.len() >= 2 {
+            let envelope_color = match automation_lane {
+                WaveformAutomationLane::Volume => Theme::volume_automation(),
+                WaveformAutomationLane::Speed => Theme::accent(),
+                WaveformAutomationLane::Pitch => Theme::accent2(),
+            };
+            for pair in automation_points.windows(2) {
                 let x1 = secs_to_x(pair[0][0]);
                 let x2 = secs_to_x(pair[1][0]);
                 if x2 < rect.left() || x1 > rect.right() {
@@ -350,21 +484,21 @@ impl WaveformEditor {
                 }
                 painter.line_segment(
                     [
-                        pos2(x1, gain_to_y(pair[0][1])),
-                        pos2(x2, gain_to_y(pair[1][1])),
+                        pos2(x1, value_to_y(pair[0][1])),
+                        pos2(x2, value_to_y(pair[1][1])),
                     ],
                     Stroke::new(2.5_f32, envelope_color),
                 );
             }
-            for (index, point) in cue.volume_automation.iter().enumerate() {
+            for (index, point) in automation_points.iter().enumerate() {
                 let x = secs_to_x(point[0]);
                 if x < rect.left() - 8.0 || x > rect.right() + 8.0 {
                     continue;
                 }
-                let center = pos2(x, gain_to_y(point[1]));
+                let center = pos2(x, value_to_y(point[1]));
                 painter.circle_filled(center, 5.5, envelope_color);
                 painter.circle_stroke(center, 5.5, Stroke::new(1.2_f32, Color32::WHITE));
-                if index == 0 || index + 1 == cue.volume_automation.len() {
+                if index == 0 || index + 1 == automation_points.len() {
                     painter.circle_filled(center, 2.0, Color32::WHITE);
                 }
             }
@@ -394,12 +528,27 @@ impl WaveformEditor {
             Stroke::new(0.5_f32, Theme::border()),
         );
 
-        // Курсор воспроизведения
-        if cue.is_active() && cue.position_secs > 0.0 {
-            let px = secs_to_x(cue.position_secs);
+        // Playhead / stored seek position. A paused or manually positioned cue
+        // uses a yellow marker so the operator can always see the exact point.
+        if cue.position_secs.is_finite()
+            && (cue.position_secs > 0.0 || cue.is_active() || cue.state == CueState::Paused)
+        {
+            let px = secs_to_x(cue.position_secs.clamp(0.0, dur));
+            let is_paused_or_parked = matches!(&cue.state, CueState::Paused | CueState::Stopped);
+            let playhead_color = if is_paused_or_parked {
+                Color32::from_rgb(255, 205, 45)
+            } else {
+                Color32::WHITE
+            };
+            if is_paused_or_parked {
+                painter.line_segment(
+                    [pos2(px, rect.top()), pos2(px, rect.bottom())],
+                    Stroke::new(6.0_f32, Color32::from_rgba_unmultiplied(255, 205, 45, 55)),
+                );
+            }
             painter.line_segment(
                 [pos2(px, rect.top()), pos2(px, rect.bottom())],
-                Stroke::new(2.0_f32, Color32::WHITE),
+                Stroke::new(2.2_f32, playhead_color),
             );
         }
 
@@ -493,16 +642,15 @@ impl WaveformEditor {
 
         // Volume automation editing: drag a node, click the envelope to add a
         // breakpoint, and right-click an interior node to remove it.
-        let drag_id = Id::new(("waveform_volume_automation_drag", cue.id));
+        let drag_id = Id::new(("waveform_automation_drag", cue.id, automation_lane));
         let mut dragging_point = ui.ctx().data(|data| data.get_temp::<usize>(drag_id));
-        if cue.volume_automation_enabled && resp.drag_started() {
+        if lane_enabled && resp.drag_started() {
             if let Some(pointer) = resp.interact_pointer_pos() {
-                let nearest = cue
-                    .volume_automation
+                let nearest = automation_points
                     .iter()
                     .enumerate()
                     .map(|(index, point)| {
-                        let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                        let point_pos = pos2(secs_to_x(point[0]), value_to_y(point[1]));
                         (index, point_pos.distance(pointer))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1));
@@ -515,48 +663,56 @@ impl WaveformEditor {
             }
         }
 
-        if cue.volume_automation_enabled && resp.dragged() {
+        if lane_enabled && resp.dragged() {
             if let (Some(index), Some(pointer)) = (dragging_point, resp.interact_pointer_pos()) {
-                if index < cue.volume_automation.len() {
-                    let last_index = cue.volume_automation.len().saturating_sub(1);
+                if index < automation_points.len() {
+                    let last_index = automation_points.len().saturating_sub(1);
                     let mut new_time = x_to_secs(pointer.x);
                     if index == 0 {
                         new_time = 0.0;
                     } else if index == last_index {
                         new_time = dur;
                     } else {
-                        let min_time = cue.volume_automation[index - 1][0] + 0.001;
-                        let max_time = cue.volume_automation[index + 1][0] - 0.001;
+                        let min_time = automation_points[index - 1][0] + 0.001;
+                        let max_time = automation_points[index + 1][0] - 0.001;
                         new_time = new_time.clamp(min_time.min(max_time), max_time.max(min_time));
                     }
-                    let new_gain = y_to_gain(pointer.y);
-                    let point = &mut cue.volume_automation[index];
+                    let mut new_gain = y_to_value(pointer.y);
+                    if automation_lane == WaveformAutomationLane::Speed {
+                        new_gain = snap_speed_value(new_gain);
+                    }
+                    let point = &mut automation_points[index];
                     if (point[0] - new_time).abs() > 0.0001 || (point[1] - new_gain).abs() > 0.0001
                     {
                         *point = [new_time, new_gain];
-                        automation_changed = true;
+                        match automation_lane {
+                            WaveformAutomationLane::Volume => automation_changed = true,
+                            _ => time_pitch_changed = true,
+                        }
                     }
                     ui.ctx().request_repaint();
                 }
             }
         }
 
-        if cue.volume_automation_enabled && resp.secondary_clicked() {
+        if lane_enabled && resp.secondary_clicked() {
             if let Some(pointer) = resp.interact_pointer_pos() {
-                let nearest = cue
-                    .volume_automation
+                let nearest = automation_points
                     .iter()
                     .enumerate()
                     .map(|(index, point)| {
-                        let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                        let point_pos = pos2(secs_to_x(point[0]), value_to_y(point[1]));
                         (index, point_pos.distance(pointer))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1));
                 if let Some((index, distance)) = nearest {
-                    let last_index = cue.volume_automation.len().saturating_sub(1);
+                    let last_index = automation_points.len().saturating_sub(1);
                     if distance <= 13.0 && index > 0 && index < last_index {
-                        cue.volume_automation.remove(index);
-                        automation_changed = true;
+                        automation_points.remove(index);
+                        match automation_lane {
+                            WaveformAutomationLane::Volume => automation_changed = true,
+                            _ => time_pitch_changed = true,
+                        }
                     }
                 }
             }
@@ -575,13 +731,12 @@ impl WaveformEditor {
             if let Some(pointer) = resp.interact_pointer_pos() {
                 let clicked_time = x_to_secs(pointer.x);
                 let mut added_point = false;
-                if cue.volume_automation_enabled && cue.volume_automation.len() >= 2 {
-                    let nearest_point = cue
-                        .volume_automation
+                if lane_enabled && automation_points.len() >= 2 {
+                    let nearest_point = automation_points
                         .iter()
                         .enumerate()
                         .map(|(index, point)| {
-                            let point_pos = pos2(secs_to_x(point[0]), gain_to_y(point[1]));
+                            let point_pos = pos2(secs_to_x(point[0]), value_to_y(point[1]));
                             (index, point_pos.distance(pointer))
                         })
                         .min_by(|a, b| a.1.total_cmp(&b.1));
@@ -589,22 +744,33 @@ impl WaveformEditor {
                         .map(|(_, distance)| distance <= 13.0)
                         .unwrap_or(false);
                     if !near_existing {
-                        let current_gain =
-                            automation_gain_at_ui(clicked_time, &cue.volume_automation);
-                        let curve_y = gain_to_y(current_gain);
+                        let current_gain = automation_value_at_ui(
+                            clicked_time,
+                            &automation_points,
+                            value_min,
+                            value_max,
+                        );
+                        let curve_y = value_to_y(current_gain);
                         if (pointer.y - curve_y).abs() <= 12.0 {
-                            cue.volume_automation
-                                .push([clicked_time, y_to_gain(pointer.y)]);
-                            cue.volume_automation.sort_by(|a, b| a[0].total_cmp(&b[0]));
-                            automation_changed = true;
+                            let mut new_value = y_to_value(pointer.y);
+                            if automation_lane == WaveformAutomationLane::Speed {
+                                new_value = snap_speed_value(new_value);
+                            }
+                            automation_points.push([clicked_time, new_value]);
+                            automation_points.sort_by(|a, b| a[0].total_cmp(&b[0]));
+                            match automation_lane {
+                                WaveformAutomationLane::Volume => automation_changed = true,
+                                _ => time_pitch_changed = true,
+                            }
                             added_point = true;
                         }
                     }
                 }
                 if !added_point {
-                    let near_point = cue.volume_automation_enabled
-                        && cue.volume_automation.iter().any(|point| {
-                            pos2(secs_to_x(point[0]), gain_to_y(point[1])).distance(pointer) <= 13.0
+                    let near_point = lane_enabled
+                        && automation_points.iter().any(|point| {
+                            pos2(secs_to_x(point[0]), value_to_y(point[1])).distance(pointer)
+                                <= 13.0
                         });
                     if !near_point {
                         let position = clicked_time.clamp(cue.start_secs, eff_end);
@@ -693,7 +859,30 @@ impl WaveformEditor {
         }
         ui.ctx().data_mut(|data| data.insert_temp(view_id, view));
 
-        (seek_position, automation_changed)
+        Self::store_automation_lane(cue, automation_lane, lane_enabled, automation_points);
+        (seek_position, automation_changed, time_pitch_changed)
+    }
+
+    fn store_automation_lane(
+        cue: &mut Cue,
+        lane: WaveformAutomationLane,
+        enabled: bool,
+        points: Vec<[f64; 2]>,
+    ) {
+        match lane {
+            WaveformAutomationLane::Volume => {
+                cue.volume_automation_enabled = enabled;
+                cue.volume_automation = points;
+            }
+            WaveformAutomationLane::Speed => {
+                cue.time_pitch.speed_automation_enabled = enabled;
+                cue.time_pitch.speed_automation = points;
+            }
+            WaveformAutomationLane::Pitch => {
+                cue.time_pitch.pitch_automation_enabled = enabled;
+                cue.time_pitch.pitch_automation = points;
+            }
+        }
     }
 
     fn draw_marker(painter: &Painter, x: f32, rect: Rect, color: Color32, label: &str) {
@@ -711,27 +900,34 @@ impl WaveformEditor {
     }
 }
 
-fn automation_gain_at_ui(position_secs: f64, points: &[[f64; 2]]) -> f64 {
+fn automation_value_at_ui(
+    position_secs: f64,
+    points: &[[f64; 2]],
+    min_value: f64,
+    max_value: f64,
+) -> f64 {
     if points.is_empty() {
-        return 1.0;
+        return min_value;
     }
     if position_secs <= points[0][0] {
-        return points[0][1].clamp(0.0, 1.0);
+        return points[0][1].clamp(min_value, max_value);
     }
     for pair in points.windows(2) {
-        if position_secs <= pair[1][0] {
-            let span = pair[1][0] - pair[0][0];
+        let left = pair[0];
+        let right = pair[1];
+        if position_secs <= right[0] {
+            let span = right[0] - left[0];
             if span <= f64::EPSILON {
-                return pair[1][1].clamp(0.0, 1.0);
+                return right[1].clamp(min_value, max_value);
             }
-            let t = ((position_secs - pair[0][0]) / span).clamp(0.0, 1.0);
-            return (pair[0][1] + (pair[1][1] - pair[0][1]) * t).clamp(0.0, 1.0);
+            let t = ((position_secs - left[0]) / span).clamp(0.0, 1.0);
+            return (left[1] + (right[1] - left[1]) * t).clamp(min_value, max_value);
         }
     }
     points
         .last()
-        .map(|point| point[1].clamp(0.0, 1.0))
-        .unwrap_or(1.0)
+        .map(|point| point[1].clamp(min_value, max_value))
+        .unwrap_or(min_value)
 }
 
 fn format_timecode(seconds: f64) -> String {
@@ -751,5 +947,18 @@ mod timecode_tests {
     fn formats_hours_minutes_seconds_and_milliseconds() {
         assert_eq!(format_timecode(3661.234), "01:01:01.234");
         assert_eq!(format_timecode(120.0), "00:02:00.000");
+    }
+}
+
+#[cfg(test)]
+mod speed_automation_tests {
+    use super::snap_speed_value;
+
+    #[test]
+    fn speed_automation_uses_tenth_steps_and_valid_range() {
+        assert!((snap_speed_value(1.23) - 1.2).abs() < f64::EPSILON);
+        assert!((snap_speed_value(1.26) - 1.3).abs() < f64::EPSILON);
+        assert!((snap_speed_value(0.01) - 0.1).abs() < f64::EPSILON);
+        assert!((snap_speed_value(5.0) - 4.0).abs() < f64::EPSILON);
     }
 }

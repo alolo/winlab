@@ -2,7 +2,7 @@
 //!
 //! CPAL exposes ASIO stream channel counts, but not the driver's per-channel
 //! names. We query those names in a short-lived child process so a broken or
-//! non-responsive native driver cannot freeze the CueLabs UI process.
+//! non-responsive native driver cannot freeze the Theatre Show Cue UI process.
 
 use super::OutputChannelInfo;
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,12 +44,13 @@ pub(crate) fn probe_registered_drivers() -> HashMap<String, Vec<OutputChannelInf
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            warn!("Could not locate CueLabs executable for ASIO probe: {error}");
+            warn!("Could not locate TaSQ executable for ASIO probe: {error}");
             return HashMap::new();
         }
     };
 
     let mut discovered = HashMap::new();
+    let mut failed_probes = 0usize;
     let total_started = Instant::now();
     let total_timeout = Duration::from_secs(12);
     for driver_index in 0..metadata.len() {
@@ -59,10 +60,10 @@ pub(crate) fn probe_registered_drivers() -> HashMap<String, Vec<OutputChannelInf
         }
 
         let output_path =
-            std::env::temp_dir().join(format!("cuelabs-asio-probe-{}.json", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("tasq-asio-probe-{}.json", Uuid::new_v4()));
 
         let mut child = match Command::new(&executable)
-            .arg("--cuelabs-asio-probe")
+            .arg("--tasq-asio-probe")
             .arg(driver_index.to_string())
             .arg(&output_path)
             .stdin(Stdio::null())
@@ -140,16 +141,32 @@ pub(crate) fn probe_registered_drivers() -> HashMap<String, Vec<OutputChannelInf
                 }
             }
         } else if probe_exited {
-            warn!("ASIO metadata probe #{driver_index} failed");
+            failed_probes += 1;
+            let diagnostic_path = output_path.with_extension("error.txt");
+            let detail = std::fs::read_to_string(&diagnostic_path)
+                .unwrap_or_else(|_| "the helper exited without writing diagnostics".to_string());
+            debug!(
+                "ASIO metadata probe #{} failed (non-fatal; generic channel names will be used): {}",
+                driver_index,
+                detail.trim()
+            );
+            let _ = std::fs::remove_file(diagnostic_path);
         }
 
         let _ = std::fs::remove_file(&output_path);
     }
 
+    if failed_probes > 0 {
+        info!(
+            "ASIO metadata discovery completed: {} driver(s) described, {} probe(s) failed; playback can continue with generic channel labels",
+            discovered.len(),
+            failed_probes
+        );
+    }
     discovered
 }
 
-/// Entry point used only by the short-lived `--cuelabs-asio-probe` child.
+/// Entry point used only by the short-lived `--tasq-asio-probe` child.
 pub(crate) fn run_probe_child(driver_index: usize, output_path: &Path) -> Result<()> {
     use azo::driver::{Driver, Metadata, SafeHandle};
     use azo::dto::ChannelId;
