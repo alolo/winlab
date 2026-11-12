@@ -167,6 +167,22 @@ fn supported_output_channel_layouts(device: &Device) -> Vec<usize> {
 
 const COMMON_SAMPLE_RATES: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 const COMMON_BUFFER_SIZES: &[u32] = &[32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192];
+/// WASAPI Shared accepts an application-requested buffer duration independently
+/// of the Windows audio-engine callback period.
+const WASAPI_SHARED_BUFFER_SIZES: &[u32] = &[256, 512, 1_024, 2_048, 4_096, 8_192];
+/// DirectSound is fed by TaSQ's SDL queue, so these are real application queue targets.
+const DIRECTSOUND_BUFFER_SIZES: &[u32] = &[1_024, 2_048, 4_096, 8_192, 16_384];
+
+fn buffer_size_options_for_backend(
+    backend: AudioBackend,
+    driver_reported_sizes: &[u32],
+) -> Vec<u32> {
+    match backend {
+        AudioBackend::Asio => driver_reported_sizes.to_vec(),
+        AudioBackend::Wasapi => WASAPI_SHARED_BUFFER_SIZES.to_vec(),
+        AudioBackend::DirectSound => DIRECTSOUND_BUFFER_SIZES.to_vec(),
+    }
+}
 
 fn supported_output_sample_rates(device: &Device) -> Vec<u32> {
     let Ok(configs) = device.supported_output_configs() else {
@@ -202,13 +218,18 @@ fn supported_output_sample_rates(device: &Device) -> Vec<u32> {
     rates
 }
 
-fn supported_output_buffer_sizes(device: &Device) -> Vec<u32> {
+fn supported_output_buffer_sizes(device: &Device, backend: AudioBackend) -> Vec<u32> {
+    let fallback = if backend == AudioBackend::Asio {
+        Vec::new()
+    } else {
+        COMMON_BUFFER_SIZES.to_vec()
+    };
     let Ok(configs) = device.supported_output_configs() else {
-        return COMMON_BUFFER_SIZES.to_vec();
+        return fallback;
     };
     let configs: Vec<_> = configs.collect();
     let Some(max_channels) = configs.iter().map(|config| config.channels()).max() else {
-        return COMMON_BUFFER_SIZES.to_vec();
+        return fallback;
     };
 
     let mut sizes = Vec::new();
@@ -229,7 +250,7 @@ fn supported_output_buffer_sizes(device: &Device) -> Vec<u32> {
         }
     }
     if unknown_range || sizes.is_empty() {
-        sizes = COMMON_BUFFER_SIZES.to_vec();
+        return fallback;
     }
     sizes.sort_unstable();
     sizes
@@ -474,28 +495,10 @@ impl AudioEngine {
         let out_name = out_dev.to_string();
         let out_id = Self::cpal_endpoint_id(backend, &out_dev, &out_name);
 
-        // Native ASIO metadata is only needed for the selected TASCAM Computer
-        // bus profile. Do not initialize every registered ASIO driver when the
-        // active endpoint is a different vendor (e.g. Creative Sound Blaster).
-        let normalized_selected_device = Self::normalize_device_name(&out_name);
-        let needs_tascam_metadata = backend == AudioBackend::Asio
-            && (normalized_selected_device.contains("tascam")
-                || normalized_selected_device.contains("us322")
-                || normalized_selected_device.contains("us366"));
-        let probed_asio_channels = if needs_tascam_metadata {
-            #[cfg(target_os = "windows")]
-            {
-                crate::audio::asio_probe::probe_registered_drivers()
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                HashMap::new()
-            }
-        } else {
-            HashMap::new()
-        };
-        let output_driver_channel_info =
-            Self::match_asio_channel_info_to_devices(&output_devices, &probed_asio_channels);
+        // No vendor-specific ASIO probes or hardcoded Computer Bus mapping.
+        // CPAL's stream order is authoritative; generic channel labels are
+        // used until a backend exposes driver-native names directly.
+        let output_driver_channel_info: HashMap<String, Vec<OutputChannelInfo>> = HashMap::new();
         let (output_device_channels, output_device_channel_layouts) =
             Self::list_output_device_info(&host);
         for device_name in &output_devices {
@@ -548,7 +551,8 @@ impl AudioEngine {
                 }
             })?;
         let supported_sample_rates = supported_output_sample_rates(&out_dev);
-        let supported_buffer_sizes = supported_output_buffer_sizes(&out_dev);
+        let driver_buffer_sizes = supported_output_buffer_sizes(&out_dev, backend);
+        let supported_buffer_sizes = buffer_size_options_for_backend(backend, &driver_buffer_sizes);
         let preferred_output_channels = output_config.channels() as usize;
         info!(
             "Selected output configuration for '{}': {} channels @ {} Hz, {:?}",
@@ -719,7 +723,7 @@ impl AudioEngine {
                 }
                 rates
             },
-            supported_buffer_sizes: vec![1_024, 2_048, 4_096, 8_192, 16_384],
+            supported_buffer_sizes: DIRECTSOUND_BUFFER_SIZES.to_vec(),
             output_device_channels: ready.output_device_channels,
             output_device_channel_layouts: ready.output_device_channel_layouts,
             output_settings_by_device,
@@ -737,47 +741,6 @@ impl AudioEngine {
             .filter(|character| character.is_ascii_alphanumeric())
             .map(|character| character.to_ascii_lowercase())
             .collect()
-    }
-
-    fn match_asio_channel_info_to_devices(
-        output_devices: &[String],
-        probed: &HashMap<String, Vec<OutputChannelInfo>>,
-    ) -> HashMap<String, Vec<OutputChannelInfo>> {
-        let mut matched = HashMap::new();
-        for device_name in output_devices {
-            let normalized_device = Self::normalize_device_name(device_name);
-            let best_match = probed
-                .iter()
-                .filter_map(|(driver_name, channels)| {
-                    let normalized_driver = Self::normalize_device_name(driver_name);
-                    let is_match = normalized_device == normalized_driver
-                        || (normalized_device.len() >= 5
-                            && normalized_driver.len() >= 5
-                            && (normalized_device.contains(&normalized_driver)
-                                || normalized_driver.contains(&normalized_device)));
-                    is_match.then_some((normalized_driver.len(), channels))
-                })
-                .max_by_key(|(match_length, _)| *match_length);
-
-            if let Some((_, channels)) = best_match {
-                info!(
-                    "Matched {} ASIO driver channel names to CPAL device '{}': {:?}",
-                    channels.len(),
-                    device_name,
-                    channels
-                        .iter()
-                        .map(|channel| (&channel.name, channel.index))
-                        .collect::<Vec<_>>()
-                );
-                matched.insert(device_name.clone(), channels.clone());
-            } else {
-                warn!(
-                    "No ASIO channel-name metadata matched CPAL device '{}'; generic channel labels will be used",
-                    device_name
-                );
-            }
-        }
-        matched
     }
 
     fn detect_default_stereo_pair(channels: &[OutputChannelInfo]) -> Option<[usize; 2]> {
@@ -1036,7 +999,9 @@ impl AudioEngine {
         };
         let layouts = supported_output_channel_layouts(&device);
         self.supported_sample_rates = supported_output_sample_rates(&device);
-        self.supported_buffer_sizes = supported_output_buffer_sizes(&device);
+        let driver_buffer_sizes = supported_output_buffer_sizes(&device, self.backend);
+        self.supported_buffer_sizes =
+            buffer_size_options_for_backend(self.backend, &driver_buffer_sizes);
         let channels = layouts
             .last()
             .copied()
@@ -1094,42 +1059,18 @@ impl AudioEngine {
         self.output_device_config_key(device_name)
     }
 
-    /// Default logical-to-native channel order for devices whose driver exposes
-    /// channels in a different order from the device's mixer buses.
-    ///
-    /// The US-322/US-366 order below is based on the user's measured TASCAM
-    /// Mixer Panel routing: ASIO 3/4 -> Computer 1/2, ASIO 5/6 -> Computer 3/4,
-    /// ASIO 1/2 -> Computer 5/6. This is a presentation/routing profile only;
-    /// samples are still written to the native stream channels unchanged.
+    /// The driver reports native channel indices. The default TaSQ output map
+    /// is the identity permutation on every backend and every device.
     fn default_output_channel_order(&self, device_name: &str, channels: usize) -> Vec<usize> {
         Self::default_output_channel_order_for(self.backend, device_name, channels)
     }
 
     fn default_output_channel_order_for(
-        backend: AudioBackend,
-        device_name: &str,
+        _backend: AudioBackend,
+        _device_name: &str,
         channels: usize,
     ) -> Vec<usize> {
-        let normalized = Self::normalize_device_name(device_name);
-        let is_tascam_us366 = backend == AudioBackend::Asio
-            && (normalized.contains("us322") || normalized.contains("us366"));
-
-        let mut order = if is_tascam_us366 && channels >= 6 {
-            vec![2, 3, 4, 5, 0, 1]
-        } else {
-            Vec::new()
-        };
-        let mut used = order
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        for index in 0..channels {
-            if used.insert(index) {
-                order.push(index);
-            }
-        }
-        order.truncate(channels);
-        order
+        (0..channels).collect()
     }
 
     /// Display logical Theatre Show Cue outputs in their configured order. Values remain
@@ -1209,9 +1150,9 @@ impl AudioEngine {
             .filter(|name| !name.is_empty())
     }
 
-    /// Human-readable label for a zero-based stream channel index. User aliases
-    /// override device-specific logical labels, which in turn override generic
-    /// driver names. The native stream index is always retained for routing.
+    /// Human-readable label for a native output channel, using the driver's
+    /// reported name or an explicit user alias. No vendor-specific permutation
+    /// or guessed Computer Bus labels are inserted here.
     pub fn output_channel_label(&self, device_name: Option<&str>, channel_index: usize) -> String {
         let name = device_name.unwrap_or(self.current_device.as_str());
         let key = self.output_device_config_key(name);
@@ -1239,29 +1180,7 @@ impl AudioEngine {
             !generic_output
         });
 
-        let normalized_device = Self::normalize_device_name(name);
-        let tascam_bus_name = if self.backend == AudioBackend::Asio
-            && (normalized_device.contains("us322") || normalized_device.contains("us366"))
-        {
-            // Theatre Show Cue presents the TASCAM stream as six logical mono
-            // destinations: 1L, 2R, 3L, 4R, 5L, 6R. The native ASIO order
-            // remains 3, 4, 5, 6, 1, 2 on US-322/US-366.
-            match channel_index {
-                2 => Some("1L"),
-                3 => Some("2R"),
-                4 => Some("3L"),
-                5 => Some("4R"),
-                0 => Some("5L"),
-                1 => Some("6R"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let base = alias
-            .or_else(|| tascam_bus_name.map(str::to_owned))
-            .or(driver_name);
+        let base = alias.or(driver_name);
 
         match (self.backend, base) {
             (AudioBackend::Asio, Some(label)) => {
@@ -1309,20 +1228,87 @@ impl AudioEngine {
         self.output_channel_names.insert(key, names);
     }
 
+    /// The default stereo pair is a pair of stable logical TaSQ output indices.
+    /// Changing the native mapping must not alter it or existing Cue routes.
+    fn resolve_default_output_pair(
+        explicit_pair: Option<[usize; 2]>,
+        channel_count: usize,
+    ) -> [usize; 2] {
+        explicit_pair
+            .filter(|pair| pair[0] < channel_count && pair[1] < channel_count && pair[0] != pair[1])
+            .unwrap_or([0, if channel_count > 1 { 1 } else { 0 }])
+    }
+
+    pub fn native_output_channel_for_logical(
+        order: &[usize],
+        logical_channel: usize,
+    ) -> Option<usize> {
+        order.get(logical_channel).copied()
+    }
+
     pub fn default_output_pair_for_device(&self, device_name: Option<&str>) -> [usize; 2] {
         let name = device_name.unwrap_or(self.current_device.as_str());
         let key = self.output_device_config_key(name);
-        self.default_output_pairs
-            .get(&key)
-            .copied()
-            .or_else(|| self.detected_default_output_pairs.get(&key).copied())
-            .unwrap_or_else(|| {
-                let order = self.output_channel_display_order(Some(name));
-                [
-                    order.first().copied().unwrap_or(0),
-                    order.get(1).copied().unwrap_or(1),
-                ]
+        let channels = self.output_channels_for_device(Some(name));
+        Self::resolve_default_output_pair(self.default_output_pairs.get(&key).copied(), channels)
+    }
+
+    /// Convert Cue-owned logical destinations to the stream channel positions.
+    /// The Cue's saved routes are NEVER rewritten by this operation.
+    pub fn map_cue_routes_to_native(
+        logical_routes: &[ChannelRoute],
+        order: &[usize],
+    ) -> Vec<ChannelRoute> {
+        logical_routes
+            .iter()
+            .map(|route| {
+                let mut result = route.clone();
+                result.output_channel =
+                    Self::native_output_channel_for_logical(order, route.output_channel)
+                        .unwrap_or(route.output_channel);
+                result.output_channels = route
+                    .output_channels
+                    .iter()
+                    .filter_map(|logical_index| {
+                        Self::native_output_channel_for_logical(order, *logical_index)
+                    })
+                    .collect();
+                result.output_channels.sort_unstable();
+                result.output_channels.dedup();
+                result
             })
+            .collect()
+    }
+
+    pub fn map_cue_gains_to_native(logical_gains: &[f32], order: &[usize]) -> Vec<f32> {
+        let mut native_gains = vec![0.0; order.len()];
+        for (logical_index, &native_index) in order.iter().enumerate() {
+            if let (Some(&gain), Some(native_gain)) = (
+                logical_gains.get(logical_index),
+                native_gains.get_mut(native_index),
+            ) {
+                *native_gain = gain;
+            }
+        }
+        native_gains
+    }
+
+    pub fn cue_routes_for_device(
+        &self,
+        device_name: Option<&str>,
+        logical_routes: &[ChannelRoute],
+    ) -> Vec<ChannelRoute> {
+        let order = self.output_channel_display_order(device_name);
+        Self::map_cue_routes_to_native(logical_routes, &order)
+    }
+
+    pub fn cue_gains_for_device(
+        &self,
+        device_name: Option<&str>,
+        logical_gains: &[f32],
+    ) -> Vec<f32> {
+        let order = self.output_channel_display_order(device_name);
+        Self::map_cue_gains_to_native(logical_gains, &order)
     }
 
     pub fn set_default_output_pairs(&mut self, pairs: HashMap<String, [usize; 2]>) {
@@ -1334,7 +1320,7 @@ impl AudioEngine {
         self.default_output_pairs.insert(key, pair);
     }
 
-    /// Default stream indices for the first two source channels. A configured
+    /// Default logical TaSQ output indices for the first two source channels. A configured
     /// pair is used for new cues; existing per-cue routes remain untouched.
     pub fn default_route_output_channels(&self, device_name: Option<&str>) -> Vec<usize> {
         let pair = self.default_output_pair_for_device(device_name);
@@ -1346,9 +1332,8 @@ impl AudioEngine {
         }
     }
 
-    /// Default destinations for a source with the given channel count.
-    /// Mono/stereo cues use the configured stereo pair; multichannel cues map
-    /// channel-for-channel in Theatre Show Cue logical output order.
+    /// Default destinations use logical TaSQ output slots only. Changing the
+    /// hardware mapping does not rewrite any Cue's I/O Routing assignments.
     pub fn default_route_channels_for_source(
         &self,
         device_name: Option<&str>,
@@ -1357,19 +1342,26 @@ impl AudioEngine {
         if source_channels <= 2 {
             self.default_route_output_channels(device_name)
         } else {
-            self.output_channel_display_order(device_name)
-                .into_iter()
-                .take(source_channels)
+            (0..self
+                .output_channels_for_device(device_name)
+                .min(source_channels))
                 .collect()
         }
     }
 
-    pub fn test_output_channel(
-        &self,
-        device_name: &str,
-        logical_channel: usize,
-        native_channel: usize,
-    ) {
+    pub fn test_output_channel(&self, device_name: &str, logical_channel: usize) {
+        let output_order = self.output_channel_display_order(Some(device_name));
+        let Some(native_channel) =
+            Self::native_output_channel_for_logical(&output_order, logical_channel)
+        else {
+            warn!(
+                "Cannot test logical output {} for '{}': output mapping has only {} entries",
+                logical_channel + 1,
+                device_name,
+                output_order.len()
+            );
+            return;
+        };
         let endpoint_id = if device_name == self.current_device.as_str() {
             self.current_device_id.as_str()
         } else {
@@ -1379,7 +1371,7 @@ impl AudioEngine {
                 .unwrap_or("unregistered")
         };
         info!(
-            "Output test requested: backend='{}', endpoint_id='{}', device='{}', logical_output={}, native_channel={}",
+            "Output test requested: backend='{}', endpoint_id='{}', device='{}', logical_output={}, mapped_native_channel={}",
             self.backend.short_label(),
             endpoint_id,
             device_name,
@@ -2355,9 +2347,19 @@ where
                     route.output_channel = primary;
                 }
             }
+            let output_state = output_settings
+                .read()
+                .iter()
+                .map(|setting| (setting.active, setting.gain_db))
+                .collect::<Vec<_>>();
+            let cue_gains = output_gains.read().clone();
             info!(
-                "ChannelRouter configured: {} source channels -> {} hardware outputs; routes={:?}",
-                input_channels, output_channels, &*route_list
+                "ChannelRouter configured: {} source channels -> {} hardware outputs; routes={:?}; output_settings(active,gain_db)={:?}; cue_output_gains_db={:?}",
+                input_channels,
+                output_channels,
+                &*route_list,
+                output_state,
+                cue_gains
             );
         }
 
@@ -2504,6 +2506,56 @@ where
     }
 }
 
+/// Rodio's Player normally attaches its queue to the mixer while the queue is
+/// still empty (and therefore reports the Empty source's mono channel count).
+/// The queue can then expose a 6-channel source while its initial 512-sample
+/// span is still in flight. 512 is not divisible by 6, so UniformSourceIterator
+/// can resume in the middle of an interleaved frame and rotate every channel.
+///
+/// Queue the first source before attaching this wrapper to the mixer, and hide
+/// the queue's artificial span boundaries. A Cue owns one fixed output layout
+/// for its lifetime, so one continuous span is correct and keeps frame alignment.
+struct FrameAlignedPlayerQueue {
+    inner: rodio::queue::SourcesQueueOutput,
+}
+
+impl Iterator for FrameAlignedPlayerQueue {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl Source for FrameAlignedPlayerQueue {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(position)
+    }
+}
+
 fn open_sink_at(
     mixer: &rodio::mixer::Mixer,
     file_path: &PathBuf,
@@ -2520,7 +2572,6 @@ fn open_sink_at(
     position_state: Arc<RwLock<f64>>,
 ) -> Option<rodio::Player> {
     let file = std::fs::File::open(file_path).ok()?;
-    let player = rodio::Player::connect_new(mixer);
     let decoder = rodio::Decoder::try_from(file).ok()?;
     let source = decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)));
     let automated = VolumeAutomationSource::new(
@@ -2539,8 +2590,15 @@ fn open_sink_at(
         output_gains,
         output_channels,
     );
+    // Build the Player queue without connecting it yet. Its first queued
+    // source already has the final multichannel layout when Rodio creates the
+    // mixer adapter, preventing an initial mono/512-sample bootstrap.
+    let (player, queue_source) = rodio::Player::new();
     player.set_volume(initial_vol);
     player.append(routed);
+    mixer.add(FrameAlignedPlayerQueue {
+        inner: queue_source,
+    });
     player.play();
     Some(player)
 }
@@ -4213,6 +4271,103 @@ mod channel_router_tests {
     use rodio::buffer::SamplesBuffer;
 
     #[test]
+    fn player_queue_preserves_six_channel_frame_alignment_from_first_sample() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 6_u16;
+        let sample_rate = 48_000_u32;
+        let (mixer, mut mixer_source) = rodio::mixer::mixer(
+            NonZeroU16::new(channels).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+        );
+
+        // Each channel carries a distinct value. Any frame rotation is visible
+        // immediately in the interleaved output.
+        let expected = (0..(channels as usize * 1_200))
+            .map(|sample_index| ((sample_index % channels as usize) + 1) as f32)
+            .collect::<Vec<_>>();
+
+        let (player, queue_source) = rodio::Player::new();
+        player.append(SamplesBuffer::new(
+            NonZeroU16::new(channels).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+            expected.clone(),
+        ));
+
+        // The queue must report the first real source's layout before Rodio
+        // constructs its UniformSourceIterator.
+        assert_eq!(queue_source.channels().get(), channels as u16);
+
+        mixer.add(FrameAlignedPlayerQueue {
+            inner: queue_source,
+        });
+        let actual = (0..expected.len())
+            .map(|_| mixer_source.next().expect("multichannel sample"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        player.stop();
+    }
+
+    #[test]
+    fn cue_player_queue_keeps_channel_router_destinations_frame_aligned() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 6_u16;
+        let sample_rate = 48_000_u32;
+        let (mixer, mut mixer_source) = rodio::mixer::mixer(
+            NonZeroU16::new(channels).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+        );
+
+        let input = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+            vec![0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+        );
+        let routes = Arc::new(RwLock::new(vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 0,
+                output_channels: vec![0],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 1,
+                output_channels: vec![1],
+                gain_db: 0.0,
+            },
+        ]));
+        let settings = Arc::new(RwLock::new(vec![
+            OutputChannelSetting::default();
+            channels as usize
+        ]));
+        let gains = Arc::new(RwLock::new(vec![0.0; channels as usize]));
+        let routed = ChannelRouter::new(input, routes, settings, gains, channels as usize);
+
+        let expected = vec![
+            0.1_f32, 0.2, 0.0, 0.0, 0.0, 0.0, 0.3, 0.4, 0.0, 0.0, 0.0, 0.0, 0.5, 0.6, 0.0, 0.0,
+            0.0, 0.0,
+        ];
+
+        let (player, queue_source) = rodio::Player::new();
+        player.append(routed);
+        mixer.add(FrameAlignedPlayerQueue {
+            inner: queue_source,
+        });
+
+        let actual = (0..expected.len())
+            .map(|_| mixer_source.next().expect("routed multichannel sample"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        player.stop();
+    }
+
+    #[test]
     fn output_channel_settings_are_isolated_per_device() {
         let settings_by_device: OutputSettingsByDevice = Arc::new(RwLock::new(HashMap::new()));
         let first_device = shared_output_settings(&settings_by_device, "Interface A", 2);
@@ -4280,10 +4435,111 @@ mod channel_router_tests {
     }
 
     #[test]
-    fn tascam_us366_logical_outputs_follow_computer_bus_order() {
-        let order =
-            AudioEngine::default_output_channel_order_for(AudioBackend::Asio, "US-322 / US-366", 6);
-        assert_eq!(order, vec![2, 3, 4, 5, 0, 1]);
+    fn default_stereo_pair_is_logical_and_independent_of_mapping() {
+        let pair = AudioEngine::resolve_default_output_pair(None, 6);
+        assert_eq!(pair, [0, 1]);
+        let custom_pair = AudioEngine::resolve_default_output_pair(Some([2, 3]), 6);
+        assert_eq!(custom_pair, [2, 3]);
+        let order = [4, 5, 0, 1, 2, 3];
+        assert_eq!(
+            AudioEngine::native_output_channel_for_logical(&order, pair[0]),
+            Some(4)
+        );
+        assert_eq!(
+            AudioEngine::native_output_channel_for_logical(&order, pair[1]),
+            Some(5)
+        );
+        assert_eq!(
+            AudioEngine::resolve_default_output_pair(Some([9, 3]), 6),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn cue_and_test_use_identical_logical_to_native_mapping() {
+        let order = [4, 5, 0, 1, 2, 3];
+        let logical = [
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 0,
+                output_channels: vec![0],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 1,
+                output_channels: vec![1],
+                gain_db: 0.0,
+            },
+        ];
+        let native = AudioEngine::map_cue_routes_to_native(&logical, &order);
+        assert_eq!(native[0].output_channels, vec![4]);
+        assert_eq!(native[1].output_channels, vec![5]);
+        assert_eq!(
+            native[0].output_channel,
+            AudioEngine::native_output_channel_for_logical(&order, 0).unwrap()
+        );
+        assert_eq!(
+            native[1].output_channel,
+            AudioEngine::native_output_channel_for_logical(&order, 1).unwrap()
+        );
+        assert_eq!(logical[0].output_channels, vec![0]);
+        assert_eq!(logical[1].output_channels, vec![1]);
+        assert_eq!(
+            AudioEngine::map_cue_gains_to_native(&[-6.0, -3.0, 0.0, 0.0, 0.0, 0.0], &order),
+            vec![0.0, 0.0, 0.0, 0.0, -6.0, -3.0]
+        );
+    }
+
+    #[test]
+    fn changing_mapping_does_not_rewrite_logical_cue_or_default_pair() {
+        let saved_stereo_pair = [2, 3]; // TaSQ Outputs 3/4
+        let saved_logical_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: saved_stereo_pair[0],
+                output_channels: vec![saved_stereo_pair[0]],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: saved_stereo_pair[1],
+                output_channels: vec![saved_stereo_pair[1]],
+                gain_db: 0.0,
+            },
+        ];
+        let first_map = [0, 1, 2, 3, 4, 5];
+        let second_map = [4, 5, 0, 1, 2, 3];
+        let first = AudioEngine::map_cue_routes_to_native(&saved_logical_routes, &first_map);
+        let second = AudioEngine::map_cue_routes_to_native(&saved_logical_routes, &second_map);
+        assert_eq!(first[0].output_channels, vec![2]);
+        assert_eq!(first[1].output_channels, vec![3]);
+        assert_eq!(second[0].output_channels, vec![0]);
+        assert_eq!(second[1].output_channels, vec![1]);
+        assert_eq!(saved_stereo_pair, [2, 3]);
+        assert_eq!(saved_logical_routes[0].output_channels, vec![2]);
+        assert_eq!(saved_logical_routes[1].output_channels, vec![3]);
+    }
+
+    #[test]
+    fn backend_buffer_choices_match_each_backend_control_model() {
+        assert_eq!(
+            buffer_size_options_for_backend(AudioBackend::Wasapi, &[480]),
+            vec![256, 512, 1_024, 2_048, 4_096, 8_192]
+        );
+        assert_eq!(
+            buffer_size_options_for_backend(AudioBackend::DirectSound, &[480]),
+            vec![1_024, 2_048, 4_096, 8_192, 16_384]
+        );
+        assert_eq!(
+            buffer_size_options_for_backend(AudioBackend::Asio, &[128, 256, 512]),
+            vec![128, 256, 512]
+        );
+        assert!(buffer_size_options_for_backend(AudioBackend::Asio, &[]).is_empty());
     }
 
     #[test]
@@ -4433,7 +4689,7 @@ mod channel_router_tests {
     }
 
     #[test]
-    fn detects_tascam_physical_stereo_pair_from_driver_channel_names() {
+    fn detects_physical_stereo_pair_from_driver_channel_names() {
         let channels = vec![
             OutputChannelInfo {
                 index: 0,

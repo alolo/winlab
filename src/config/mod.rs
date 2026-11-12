@@ -363,13 +363,17 @@ pub struct AppSettings {
     /// Native ASIO channel names are queried separately from the driver.
     #[serde(default)]
     pub output_channel_names: HashMap<String, Vec<String>>,
-    /// Default stereo left/right stream indices for each output device.
+    /// Default stereo left/right logical TaSQ output indices for each device.
     #[serde(default)]
     pub default_output_pairs: HashMap<String, [usize; 2]>,
-    /// Logical CueLabs output order mapped to native driver stream-channel indices.
+    /// Logical TaSQ output order mapped to native driver stream-channel indices.
     /// Each vector is a permutation, keyed by backend and device name.
     #[serde(default)]
     pub output_channel_orders: HashMap<String, Vec<usize>>,
+    /// Version of saved default-pair semantics: 3 = logical TaSQ outputs.
+    /// Previous versions stored native driver channel indices.
+    #[serde(default)]
+    pub audio_routing_schema: u32,
     pub stop_all_fade_secs: f64,
     /// User-resized Cue List column widths, in logical points.
     #[serde(default = "default_cue_column_widths")]
@@ -408,6 +412,7 @@ impl Default for AppSettings {
             output_channel_names: HashMap::new(),
             default_output_pairs: HashMap::new(),
             output_channel_orders: HashMap::new(),
+            audio_routing_schema: 3,
             stop_all_fade_secs: 0.0,
             cue_column_widths: default_cue_column_widths(),
             bottom_panel_height: default_bottom_panel_height(),
@@ -556,6 +561,7 @@ mod stable_audio_settings_tests {
         assert!(settings.audio_output_device_id.is_none());
         assert!(settings.audio_sample_rate.is_none());
         assert!(settings.audio_buffer_size_frames.is_none());
+        assert_eq!(settings.audio_routing_schema, 0);
     }
 
     #[test]

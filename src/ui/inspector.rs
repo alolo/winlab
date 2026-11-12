@@ -3,7 +3,8 @@
 use crate::audio::engine::AudioEngine;
 use crate::config::AudioBackend;
 use crate::cue::{
-    ContinueMode, Cue, CueColor, CueType, FadeCurve, GroupMode, MidiMessageKind, OscCueArg,
+    shared_stereo_output_destinations, ContinueMode, Cue, CueColor, CueType, FadeCurve, GroupMode,
+    MidiMessageKind, OscCueArg,
 };
 use crate::midi::input::MidiOutputManager;
 use crate::ui::theme::Theme;
@@ -997,7 +998,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             for (logical_index, output_index) in
                                 output_order.iter().copied().enumerate()
                             {
-                                let Some(output_gain_db) = output_gains_db.get_mut(output_index)
+                                let Some(output_gain_db) = output_gains_db.get_mut(logical_index)
                                 else {
                                     continue;
                                 };
@@ -1039,7 +1040,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     ui.horizontal(|ui| {
                                         changed |= Self::gain_db_input(
                                             ui,
-                                            Id::new(("io_output_gain_db", cue_id, output_index)),
+                                            Id::new(("io_output_gain_db", cue_id, logical_index)),
                                             output_gain_db,
                                             -60.0,
                                             18.0,
@@ -1055,16 +1056,16 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                         );
                                         let route = &mut cue.io.channel_routes[source_index];
                                         let mut active = route.active
-                                            && route.output_channels.contains(&output_index);
+                                            && route.output_channels.contains(&logical_index);
                                         if ui.checkbox(&mut active, source_name).changed() {
                                             if active {
-                                                if !route.output_channels.contains(&output_index) {
-                                                    route.output_channels.push(output_index);
+                                                if !route.output_channels.contains(&logical_index) {
+                                                    route.output_channels.push(logical_index);
                                                 }
                                             } else {
                                                 route
                                                     .output_channels
-                                                    .retain(|index| *index != output_index);
+                                                    .retain(|index| *index != logical_index);
                                             }
                                             route.output_channels.sort_unstable();
                                             route.output_channels.dedup();
@@ -1089,6 +1090,40 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         if output_gains_db != cue.io.output_gains_db {
             cue.io.output_gains_db = output_gains_db;
             changed = true;
+        }
+
+        // Warn when the stereo source is summed into a shared hardware output.
+        // This is allowed (for deliberate mono folds), but it often explains an
+        // accidental mono patch after editing the routing matrix.
+        if input_channels >= 2 {
+            if let (Some(left), Some(right)) =
+                (cue.io.channel_routes.first(), cue.io.channel_routes.get(1))
+            {
+                let shared_outputs = shared_stereo_output_destinations(left, right);
+                if !shared_outputs.is_empty() {
+                    let labels = shared_outputs
+                        .iter()
+                        .map(|index| {
+                            format!(
+                                "Output {} ({})",
+                                *index + 1,
+                                audio.output_channel_label(
+                                    cue.io.output_device.as_deref(),
+                                    output_order.get(*index).copied().unwrap_or(*index),
+                                )
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "Routing warning: Left and Right are both sent to {}. Their signals are summed on the shared output.",
+                            labels
+                        ),
+                    );
+                }
+            }
         }
 
         // Keep legacy L/R fields synchronized for older project versions.

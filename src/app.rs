@@ -100,6 +100,62 @@ fn sanitize_project_name(name: &str) -> Option<String> {
     }
 }
 
+fn cue_uses_output_endpoint(
+    cue: &Cue,
+    backend: AudioBackend,
+    device_name: &str,
+    endpoint_id: &str,
+) -> bool {
+    let cue_backend = cue.io.output_backend.unwrap_or(backend);
+    if cue_backend != backend {
+        return false;
+    }
+
+    match cue.io.output_device.as_deref() {
+        None => cue
+            .io
+            .output_device_id
+            .as_deref()
+            .map_or(true, |saved_id| saved_id == endpoint_id),
+        Some(saved_name) => match cue.io.output_device_id.as_deref() {
+            Some(saved_id) => saved_id == endpoint_id || saved_name == device_name,
+            None => saved_name == device_name,
+        },
+    }
+}
+
+fn normalize_buffer_selection(
+    backend: AudioBackend,
+    selected: Option<u32>,
+    supported_sizes: &[u32],
+) -> Option<u32> {
+    match selected {
+        Some(frames) if backend != AudioBackend::Wasapi && !supported_sizes.contains(&frames) => {
+            None
+        }
+        other => other,
+    }
+}
+
+/// Upgrade saved stereo-pair selections from native ASIO indices to stable
+/// logical TaSQ outputs. This is generic for all backends, not TASCAM-specific.
+fn migrate_saved_stereo_pairs_to_logical(settings: &mut AppSettings) -> bool {
+    if settings.audio_routing_schema >= 3 {
+        return false;
+    }
+    for (device_key, pair) in settings.default_output_pairs.iter_mut() {
+        if let Some(order) = settings.output_channel_orders.get(device_key) {
+            for index in pair.iter_mut() {
+                if let Some(logical_index) = order.iter().position(|native| *native == *index) {
+                    *index = logical_index;
+                }
+            }
+        }
+    }
+    settings.audio_routing_schema = 3;
+    true
+}
+
 fn cue_owns_audio_stream(cue: &Cue) -> bool {
     matches!(&cue.cue_type, CueType::Audio)
         || (matches!(&cue.cue_type, CueType::Play { target_id: None })
@@ -341,9 +397,13 @@ impl TheatreShowCueApp {
                 audio.set_input_device(device);
             }
         }
+        let logical_pairs_migrated = migrate_saved_stereo_pairs_to_logical(&mut settings);
         audio.set_output_channel_names(settings.output_channel_names.clone());
         audio.set_default_output_pairs(settings.default_output_pairs.clone());
         audio.set_output_channel_orders(settings.output_channel_orders.clone());
+        if logical_pairs_migrated {
+            let _ = settings.save();
+        }
         settings.output_channels.resize(
             audio.output_channels.max(1),
             crate::cue::OutputChannelSetting::default(),
@@ -921,6 +981,133 @@ impl TheatreShowCueApp {
         }
     }
 
+    /// Returns a short reason when an Audio Cue currently has no usable output.
+    /// A missing `output_device` is not an error: it intentionally means the
+    /// active global output. Explicit offline/cross-backend routes and empty
+    /// output matrices are surfaced in the Cue List.
+    fn cue_output_issue_for_table(&self, cue: &Cue) -> Option<String> {
+        if !cue_owns_audio_stream(cue) {
+            return None;
+        }
+
+        let route_backend = self.cue_output_backend(cue);
+        let saved_device_name = cue.io.output_device.as_deref();
+        let has_explicit_endpoint =
+            saved_device_name.is_some() || cue.io.output_device_id.is_some();
+        let device_name = cue
+            .io
+            .output_device_id
+            .as_deref()
+            .and_then(|id| self.audio.device_registry.find_by_id(id))
+            .map(|endpoint| endpoint.device_name.as_str())
+            .or(saved_device_name)
+            .unwrap_or(self.audio.current_device.as_str());
+        let output_device = has_explicit_endpoint.then_some(device_name);
+
+        if has_explicit_endpoint {
+            let is_current_endpoint = route_backend == self.audio.backend
+                && device_name == self.audio.current_device.as_str();
+            let endpoint_unavailable = if is_current_endpoint {
+                self.audio
+                    .device_registry
+                    .find_by_id(&self.audio.current_device_id)
+                    .is_some_and(|endpoint| !endpoint.is_available())
+            } else {
+                !self.audio.registered_endpoint_available(
+                    route_backend,
+                    cue.io.output_device_id.as_deref(),
+                    device_name,
+                )
+            };
+            if endpoint_unavailable {
+                return Some(format!(
+                    "{} — '{}' is unavailable or disconnected.",
+                    route_backend.short_label(),
+                    device_name
+                ));
+            }
+
+            if route_backend != self.audio.backend {
+                return Some(format!(
+                    "{} — '{}' cannot be used while {} is the active backend. Cross-backend playback is not available yet.",
+                    route_backend.short_label(),
+                    device_name,
+                    self.audio.backend.short_label()
+                ));
+            }
+
+            if route_backend == AudioBackend::Asio
+                && device_name != self.audio.current_device.as_str()
+            {
+                return Some(format!(
+                    "ASIO — '{}' is not the active ASIO driver. Only '{}' can play until multi-ASIO workers are implemented.",
+                    device_name,
+                    self.audio.current_device
+                ));
+            }
+        } else if route_backend != self.audio.backend {
+            return Some(format!(
+                "The global output is configured for {}, but {} is active.",
+                route_backend.short_label(),
+                self.audio.backend.short_label()
+            ));
+        } else if self
+            .audio
+            .device_registry
+            .find_by_id(&self.audio.current_device_id)
+            .is_some_and(|endpoint| !endpoint.is_available())
+        {
+            return Some(format!(
+                "The global output endpoint '{}' is unavailable or disconnected.",
+                self.audio.current_device
+            ));
+        } else if self.audio.current_sample_rate == 0 || self.audio.output_channels == 0 {
+            return Some("The global audio output stream is not active.".to_string());
+        }
+
+        let output_count = self.audio.output_channels_for_device(output_device);
+        let output_settings = self.audio.output_channel_settings_for_device(output_device);
+        let output_order = self.audio.output_channel_display_order(output_device);
+        let has_active_destination = cue.io.channel_routes.iter().any(|route| {
+            if !route.active {
+                return false;
+            }
+            let destinations: Vec<usize> = if route.output_channels.is_empty() {
+                vec![route.output_channel]
+            } else {
+                route.output_channels.clone()
+            };
+            destinations.iter().any(|index| {
+                *index < output_count
+                    && output_settings
+                        .get(output_order.get(*index).copied().unwrap_or(*index))
+                        .map(|setting| setting.active)
+                        .unwrap_or(true)
+            })
+        });
+
+        if !has_active_destination
+            && (cue.audio_channels > 0
+                || !cue.io.channel_routes.is_empty()
+                || !cue.file_path.as_os_str().is_empty())
+        {
+            return Some("No active hardware output is assigned to this Cue.".to_string());
+        }
+
+        None
+    }
+
+    fn cue_output_issues_for_table(&self) -> HashMap<Uuid, String> {
+        self.cue_list
+            .cues
+            .iter()
+            .filter_map(|cue| {
+                self.cue_output_issue_for_table(cue)
+                    .map(|reason| (cue.id, reason))
+            })
+            .collect()
+    }
+
     /// Do not start a Cue if its saved endpoint is currently offline or belongs
     /// to a backend/ASIO driver that this Stage 3 process cannot service.
     fn cue_output_backend_is_active(&mut self, cue: &Cue) -> bool {
@@ -1048,6 +1235,22 @@ impl TheatreShowCueApp {
             ),
         };
 
+        let native_routes = self.audio.cue_routes_for_device(
+            snapshot.io.output_device.as_deref(),
+            &routing.channel_routes,
+        );
+        let native_gains = self.audio.cue_gains_for_device(
+            snapshot.io.output_device.as_deref(),
+            &routing.output_gains_db,
+        );
+        info!(
+            "Audio Cue routing: id={}, logical_routes={:?}, native_routes={:?}, mapping={:?}",
+            snapshot.id,
+            routing.channel_routes,
+            native_routes,
+            self.audio
+                .output_channel_display_order(snapshot.io.output_device.as_deref()),
+        );
         let generation = self.bump_audio_generation(snapshot.id);
         self.audio.send(AudioCommand::Play {
             id: snapshot.id,
@@ -1065,8 +1268,8 @@ impl TheatreShowCueApp {
             fade_out_secs: snapshot.fade_out_secs,
             fade_curve,
             custom_fade_points,
-            channel_routes: routing.channel_routes,
-            output_gains_db: routing.output_gains_db,
+            channel_routes: native_routes,
+            output_gains_db: native_gains,
             loop_enabled: snapshot.loop_region.enabled,
             loop_start: snapshot.loop_region.start_secs,
             loop_end: snapshot.loop_region.end_secs,
@@ -1165,6 +1368,21 @@ impl TheatreShowCueApp {
                         cue.io.channel_routes = io_routing.channel_routes.clone();
                         cue.io.output_gains_db = io_routing.output_gains_db.clone();
                     }
+                    let native_routes = self.audio.cue_routes_for_device(
+                        cue_snapshot.io.output_device.as_deref(),
+                        &io_routing.channel_routes,
+                    );
+                    let native_gains = self.audio.cue_gains_for_device(
+                        cue_snapshot.io.output_device.as_deref(),
+                        &io_routing.output_gains_db,
+                    );
+                    info!(
+                        "Play Cue routing: id={}, logical_routes={:?}, native_routes={:?}, mapping={:?}",
+                        cue_snapshot.id,
+                        io_routing.channel_routes,
+                        native_routes,
+                        self.audio.output_channel_display_order(cue_snapshot.io.output_device.as_deref()),
+                    );
                     let generation = self.bump_audio_generation(cue_snapshot.id);
                     self.audio.send(AudioCommand::Play {
                         id: cue_snapshot.id,
@@ -1182,8 +1400,8 @@ impl TheatreShowCueApp {
                         fade_out_secs: cue_snapshot.fade_out_secs,
                         fade_curve: cue_snapshot.fade_curve,
                         custom_fade_points: cue_snapshot.custom_fade_points.clone(),
-                        channel_routes: io_routing.channel_routes,
-                        output_gains_db: io_routing.output_gains_db,
+                        channel_routes: native_routes,
+                        output_gains_db: native_gains,
                         loop_enabled: cue_snapshot.loop_region.enabled,
                         loop_start: cue_snapshot.loop_region.start_secs,
                         loop_end: cue_snapshot.loop_region.end_secs,
@@ -3261,8 +3479,39 @@ impl TheatreShowCueApp {
 
         if let Some(path) = file {
             match Project::load(&path) {
-                Ok(proj) => {
+                Ok(mut proj) => {
                     let mut cl = proj.cue_list.clone();
+                    if proj.version < 3 {
+                        // Generic conversion of legacy native-index routing to
+                        // logical TaSQ destinations. This occurs only once when
+                        // loading an old project, never when changing Mapping.
+                        for cue in &mut cl.cues {
+                            if !cue_owns_audio_stream(cue) {
+                                continue;
+                            }
+                            let backend = cue.io.output_backend.unwrap_or(self.audio.backend);
+                            let device_name = cue
+                                .io
+                                .output_device
+                                .as_deref()
+                                .unwrap_or(self.audio.current_device.as_str());
+                            let device_key = format!("{}::{}", backend.label(), device_name);
+                            let output_count =
+                                self.audio.output_channels_for_device(Some(device_name));
+                            let order: Vec<usize> = self
+                                .settings
+                                .output_channel_orders
+                                .get(&device_key)
+                                .cloned()
+                                .unwrap_or_else(|| (0..output_count).collect());
+                            cue.io.upgrade_native_routes_to_logical(&order);
+                        }
+                        info!(
+                            "Upgraded project routing schema {} to 3 (logical Cue outputs)",
+                            proj.version
+                        );
+                        proj.version = 3;
+                    }
                     for cue in &mut cl.cues {
                         if !cue.file_path.as_os_str().is_empty() {
                             let detected_channels = get_channel_count(&cue.file_path);
@@ -3296,6 +3545,7 @@ impl TheatreShowCueApp {
                         }
                     }
 
+                    proj.cue_list = cl.clone();
                     self.cue_list = cl;
                     self.cue_clipboard.clear();
                     self.time_trigger_last_fired.clear();
@@ -4607,7 +4857,7 @@ impl TheatreShowCueApp {
                         ui.heading("Audio performance");
                         ui.label(
                             RichText::new(
-                                "Sample rate and buffer size are applied by reopening the active output. Smaller buffers reduce control latency but can cause dropouts; larger buffers improve stability.",
+                                "Sample rate and the backend-specific buffer target are applied by reopening the active output. Smaller targets can reduce queued latency but may cause dropouts; the actual callback period depends on the backend.",
                             )
                             .color(Theme::text_dim())
                             .size(10.5),
@@ -4625,9 +4875,14 @@ impl TheatreShowCueApp {
                             }
                         }
                         let mut buffer_sizes = self.audio.supported_buffer_sizes.clone();
-                        if self.audio.backend == AudioBackend::DirectSound {
-                            buffer_sizes = vec![1_024, 2_048, 4_096, 8_192, 16_384];
-                        }
+                        // DirectSound has a fixed set of TaSQ queue targets;
+                        // ASIO values must be supported by the driver. WASAPI
+                        // Shared accepts app-requested ring-buffer capacities.
+                        selected_buffer_size = normalize_buffer_selection(
+                            self.audio.backend,
+                            selected_buffer_size,
+                            &buffer_sizes,
+                        );
                         if let Some(frames) = selected_buffer_size {
                             if !buffer_sizes.contains(&frames) {
                                 buffer_sizes.push(frames);
@@ -4663,11 +4918,18 @@ impl TheatreShowCueApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Buffer size");
-                            let default_buffer_label = if self.audio.backend == AudioBackend::DirectSound {
-                                let ms = 4_096.0 * 1_000.0 / self.audio.current_sample_rate.max(1) as f64;
-                                format!("Auto (4096 frames / {:.1} ms)", ms)
-                            } else {
-                                "Automatic (recommended)".to_string()
+                            let default_buffer_label = match self.audio.backend {
+                                AudioBackend::DirectSound => {
+                                    let ms = 4_096.0 * 1_000.0
+                                        / self.audio.current_sample_rate.max(1) as f64;
+                                    format!("Auto (4096 frames / {:.1} ms)", ms)
+                                }
+                                AudioBackend::Wasapi => {
+                                    "Automatic (Windows shared-mode default)".to_string()
+                                }
+                                AudioBackend::Asio => {
+                                    "Automatic (ASIO driver default)".to_string()
+                                }
                             };
                             let buffer_label = selected_buffer_size
                                 .map(|frames| {
@@ -4699,9 +4961,9 @@ impl TheatreShowCueApp {
 
                         ui.label(
                             RichText::new(match self.audio.backend {
-                                AudioBackend::Asio => "ASIO: buffer size is requested from the driver; only driver-supported block sizes will open.",
-                                AudioBackend::Wasapi => "WASAPI Shared: buffer size is a requested callback size; Windows may negotiate a different effective period.",
-                                AudioBackend::DirectSound => "DirectSound: buffer size controls the queued audio safety window. Larger values reduce clicks but increase latency.",
+                                AudioBackend::Asio => "ASIO: the driver owns the hardware block size. TaSQ shows only sizes reported by the driver; use its control panel for other values.",
+                                AudioBackend::Wasapi => "WASAPI Shared: this requests the shared ring-buffer capacity. Windows still controls the callback period, so actual timing and latency may differ.",
+                                AudioBackend::DirectSound => "DirectSound: this controls TaSQ's queued-audio safety window. Larger queues improve stability but increase latency.",
                             })
                             .color(Theme::text_dim())
                             .size(10.0),
@@ -4761,14 +5023,15 @@ impl TheatreShowCueApp {
                             })
                             .collect();
 
-                        // Logical Theatre Show Cue outputs are a device-specific presentation map.
-                        // The stored values remain native stream indices, preserving old cue routes.
+                        // Logical Theatre Show Cue output slots map to native driver
+                        // channels only at playback; stored Cue routes are never rewritten.
                         let mut output_order = self.audio.output_channel_display_order(Some(&output));
+                        let previous_output_order = output_order.clone();
                         let mut output_order_changed = false;
                         ui.collapsing("Logical output mapping", |ui| {
                             ui.label(
                                 RichText::new(
-                                    "Map TaSQ Output 1, 2, 3... to the native driver channels. This does not reorder audio samples; it changes which driver channel each logical output represents.",
+                                    "Map TaSQ Output 1, 2, 3... to native driver channels. Test and Cue playback use this same map. Existing Cue routing and Default Stereo Pair never change when this map changes.",
                                 )
                                 .color(Theme::text_dim())
                                 .size(11.0),
@@ -4830,15 +5093,48 @@ impl TheatreShowCueApp {
                                 output_order_changed = true;
                             }
                         });
-                        if output_order_changed {
+                        if output_order_changed && output_order != previous_output_order {
+                            // Only the global logical-to-native map changes. Neither
+                            // existing Cue I/O Routing nor Default Stereo Pair changes.
                             self.audio.set_output_channel_order_for_device(
                                 &output,
                                 output_order.clone(),
                             );
                             let settings_key = self.audio.output_device_settings_key(&output);
-                            self.settings
-                                .output_channel_orders
-                                .insert(settings_key, output_order.clone());
+                            self.settings.output_channel_orders.insert(
+                                settings_key,
+                                output_order.clone(),
+                            );
+                            // Re-apply converted native routes to active streams. The
+                            // stored logical destinations themselves are unchanged.
+                            for cue in &self.cue_list.cues {
+                                if cue_owns_audio_stream(cue)
+                                    && cue.is_active()
+                                    && cue_uses_output_endpoint(
+                                        cue,
+                                        self.audio.backend,
+                                        &output,
+                                        &self.audio.current_device_id,
+                                    )
+                                {
+                                    let device = cue.io.output_device.as_deref();
+                                    self.audio.send(AudioCommand::SetRouting {
+                                        id: cue.id,
+                                        routes: self.audio.cue_routes_for_device(
+                                            device,
+                                            &cue.io.channel_routes,
+                                        ),
+                                    });
+                                    self.audio.send(AudioCommand::SetOutputGains {
+                                        id: cue.id,
+                                        gains_db: self.audio.cue_gains_for_device(
+                                            device,
+                                            &cue.io.output_gains_db,
+                                        ),
+                                    });
+                                }
+                            }
+                            info!("Logical output mapping changed for '{}': {:?} -> {:?}; existing Cue assignments and default stereo pair remain unchanged", output, previous_output_order, output_order);
                             self.save_app_settings();
                         }
 
@@ -4848,7 +5144,7 @@ impl TheatreShowCueApp {
                         );
                         ui.label(
                             RichText::new(
-                                "Rows use Theatre Show Cue logical order. Labels show the TASCAM Computer bus and native ASIO channel; Test checks the mapped native channel.",
+                                "Rows use TaSQ logical output order. Driver channel names are shown as reported (or via user aliases). Test and Cue playback resolve the same native channel.",
                             )
                             .color(Theme::text_dim())
                             .size(11.0),
@@ -4896,7 +5192,7 @@ impl TheatreShowCueApp {
                                     .clicked()
                                 {
                                     self.audio
-                                        .test_output_channel(&output, logical_index, index);
+                                        .test_output_channel(&output, logical_index);
                                 }
                                 let slider_response = ui.add_sized(
                                     [190.0, 26.0],
@@ -4920,6 +5216,10 @@ impl TheatreShowCueApp {
                                 .output_channel_label(Some(&output), detected_pair[1]);
                             let current_pair =
                                 self.audio.default_output_pair_for_device(Some(&output));
+                            let detected_logical_pair = [
+                                output_order.iter().position(|&native| native == detected_pair[0]).unwrap_or(0),
+                                output_order.iter().position(|&native| native == detected_pair[1]).unwrap_or(1),
+                            ];
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!(
@@ -4929,16 +5229,16 @@ impl TheatreShowCueApp {
                                     .color(Theme::text_dim())
                                     .size(11.0),
                                 );
-                                if current_pair != detected_pair
+                                if current_pair != detected_logical_pair
                                     && ui.small_button("Use detected pair").clicked()
                                 {
                                     self.audio
-                                        .set_default_output_pair_for_device(&output, detected_pair);
+                                        .set_default_output_pair_for_device(&output, detected_logical_pair);
                                     let settings_key =
                                         self.audio.output_device_settings_key(&output);
                                     self.settings
                                         .default_output_pairs
-                                        .insert(settings_key, detected_pair);
+                                        .insert(settings_key, detected_logical_pair);
                                     self.save_app_settings();
                                 }
                             });
@@ -4968,6 +5268,9 @@ impl TheatreShowCueApp {
                             self.save_app_settings();
                         }
 
+                        let logical_pair_options: Vec<(usize, String)> = (0..output_count)
+                            .map(|index| (index, format!("TaSQ Output {}", index + 1)))
+                            .collect();
                         let mut default_pair =
                             self.audio.default_output_pair_for_device(Some(&output));
                         default_pair[0] = default_pair[0].min(output_count - 1);
@@ -4987,7 +5290,7 @@ impl TheatreShowCueApp {
                                 .clicked()
                             {
                                 if output_order.len() >= 2 {
-                                    default_pair = [output_order[0], output_order[1]];
+                                    default_pair = [0, 1];
                                     default_pair_changed = true;
                                 }
                             }
@@ -4998,13 +5301,13 @@ impl TheatreShowCueApp {
                             ))
                             .width(180.0)
                             .selected_text(
-                                channel_options
+                                logical_pair_options
                                     .get(default_pair[0])
                                     .map(|(_, label)| label.as_str())
                                     .unwrap_or("Output 1"),
                             )
                             .show_ui(ui, |ui| {
-                                for (index, label) in &channel_options {
+                                for (index, label) in &logical_pair_options {
                                     default_pair_changed |= ui
                                         .selectable_value(&mut default_pair[0], *index, label)
                                         .changed();
@@ -5017,13 +5320,13 @@ impl TheatreShowCueApp {
                             ))
                             .width(180.0)
                             .selected_text(
-                                channel_options
+                                logical_pair_options
                                     .get(default_pair[1])
                                     .map(|(_, label)| label.as_str())
                                     .unwrap_or("Output 1"),
                             )
                             .show_ui(ui, |ui| {
-                                for (index, label) in &channel_options {
+                                for (index, label) in &logical_pair_options {
                                     default_pair_changed |= ui
                                         .selectable_value(&mut default_pair[1], *index, label)
                                         .changed();
@@ -5042,6 +5345,12 @@ impl TheatreShowCueApp {
                                 .default_output_pairs
                                 .insert(settings_key, default_pair);
                             self.save_app_settings();
+                        }
+                        if default_pair != [0, 1] {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Default Stereo Pair is applied only to newly imported Audio Cues; existing Cue routes are not modified.",
+                            );
                         }
 
                         ui.label(
@@ -6004,10 +6313,18 @@ impl TheatreShowCueApp {
                                             )
                                         };
                                     }
-                                    self.audio.send(AudioCommand::SetRouting { id, routes });
+                                    let device_name = self.cue_list.find(id)
+                                        .and_then(|cue| cue.io.output_device.as_deref());
+                                    self.audio.send(AudioCommand::SetRouting {
+                                        id,
+                                        routes: self.audio.cue_routes_for_device(device_name, &routes),
+                                    });
                                     self.audio.send(AudioCommand::SetOutputGains {
                                         id,
-                                        gains_db: output_gains_db,
+                                        gains_db: self.audio.cue_gains_for_device(
+                                            device_name,
+                                            &output_gains_db,
+                                        ),
                                     });
                                     self.audio.send(AudioCommand::SetVolume(id, volume));
                                 }
@@ -6032,7 +6349,12 @@ impl TheatreShowCueApp {
                                 if let Some((routes, volume)) = self.cue_list.find(id).map(|cue| {
                                     (cue.io.channel_routes.clone(), cue.volume * self.master_vol)
                                 }) {
-                                    self.audio.send(AudioCommand::SetRouting { id, routes });
+                                    let device_name = self.cue_list.find(id)
+                                        .and_then(|cue| cue.io.output_device.as_deref());
+                                    self.audio.send(AudioCommand::SetRouting {
+                                        id,
+                                        routes: self.audio.cue_routes_for_device(device_name, &routes),
+                                    });
                                     // The Trim tab's master strip controls the cue's
                                     // actual playback level, so propagate it live just
                                     // like the Playback and I/O Routing master faders.
@@ -6711,11 +7033,13 @@ impl eframe::App for TheatreShowCueApp {
                             // lower inspector is a separate reserved egui panel.
                             let interactions_enabled = !self.bottom_panel_resize_active
                                 && !self.bottom_panel_resize_release_guard;
+                            let output_issues = self.cue_output_issues_for_table();
                             let action = ui
                                 .add_enabled_ui(interactions_enabled, |ui| {
                                     CueTable::show(
                                         ui,
                                         &mut self.cue_list.cues,
+                                        &output_issues,
                                         &mut self.selected,
                                         &mut self.selected_ids,
                                         &mut self.selection_anchor,
@@ -7051,5 +7375,85 @@ mod normal_group_tests {
             normal_group_manual_stop_in(&cues, outer.id, &mut HashSet::new()),
             Some((vec![outer.id, nested.id], boundary_id))
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_output_mapping_tests {
+    use super::{cue_uses_output_endpoint, normalize_buffer_selection};
+    use crate::config::AudioBackend;
+    use crate::cue::{Cue, CueType};
+
+    #[test]
+    fn generic_default_pair_migration_converts_native_to_logical_only_once() {
+        let mut settings = crate::config::AppSettings::default();
+        settings.audio_routing_schema = 0;
+        let device = "ASIO::Six Channel Interface".to_string();
+        settings
+            .output_channel_orders
+            .insert(device.clone(), vec![2, 3, 4, 5, 0, 1]);
+        settings.default_output_pairs.insert(device.clone(), [0, 1]);
+
+        assert!(super::migrate_saved_stereo_pairs_to_logical(&mut settings));
+        assert_eq!(settings.default_output_pairs[&device], [4, 5]);
+        assert_eq!(settings.audio_routing_schema, 3);
+        assert!(!super::migrate_saved_stereo_pairs_to_logical(&mut settings));
+        assert_eq!(settings.default_output_pairs[&device], [4, 5]);
+    }
+
+    #[test]
+    fn buffer_selection_respects_backend_control_model() {
+        let wasapi_options = [256, 512, 1_024, 2_048, 4_096, 8_192];
+        let directsound_options = [1_024, 2_048, 4_096, 8_192, 16_384];
+        let asio_options = [128, 256, 512];
+
+        assert_eq!(
+            normalize_buffer_selection(AudioBackend::Wasapi, Some(480), &wasapi_options),
+            Some(480)
+        );
+        assert_eq!(
+            normalize_buffer_selection(AudioBackend::DirectSound, Some(480), &directsound_options),
+            None
+        );
+        assert_eq!(
+            normalize_buffer_selection(AudioBackend::Asio, Some(1_024), &asio_options),
+            None
+        );
+        assert_eq!(
+            normalize_buffer_selection(AudioBackend::Asio, Some(512), &asio_options),
+            Some(512)
+        );
+    }
+
+    #[test]
+    fn global_cue_route_follows_the_active_output_endpoint() {
+        let cue = Cue::new_typed(CueType::Audio);
+        assert!(cue_uses_output_endpoint(
+            &cue,
+            AudioBackend::Asio,
+            "US-322 / US-366",
+            "asio:tascam"
+        ));
+    }
+
+    #[test]
+    fn explicit_cue_route_matches_stable_endpoint_identity() {
+        let mut cue = Cue::new_typed(CueType::Audio);
+        cue.io.output_backend = Some(AudioBackend::Asio);
+        cue.io.output_device = Some("TASCAM US-366".to_string());
+        cue.io.output_device_id = Some("asio:tascam".to_string());
+
+        assert!(cue_uses_output_endpoint(
+            &cue,
+            AudioBackend::Asio,
+            "US-322 / US-366",
+            "asio:tascam"
+        ));
+        assert!(!cue_uses_output_endpoint(
+            &cue,
+            AudioBackend::Wasapi,
+            "US-322 / US-366",
+            "asio:tascam"
+        ));
     }
 }

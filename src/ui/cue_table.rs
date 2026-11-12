@@ -214,6 +214,7 @@ impl CueTable {
     pub fn show(
         ui: &mut Ui,
         cues: &mut Vec<Cue>,
+        output_issues: &HashMap<Uuid, String>,
         selected: &mut Option<Uuid>,
         selected_ids: &mut HashSet<Uuid>,
         selection_anchor: &mut Option<Uuid>,
@@ -422,6 +423,8 @@ impl CueTable {
                     let is_selected = selected_ids.contains(&cue.id) || *selected == Some(cue.id);
                     let missing_file = matches!(&cue.cue_type, CueType::Audio)
                         && (cue.file_path.as_os_str().is_empty() || !cue.file_path.is_file());
+                    let output_issue = output_issues.get(&cue.id);
+                    let row_has_audio_issue = missing_file || output_issue.is_some();
                     let row_start = ui.cursor().min;
                     let row_rect = Rect::from_min_size(row_start, vec2(table_width, row_h));
                     row_rects.push(row_rect);
@@ -571,9 +574,9 @@ impl CueTable {
                         );
                     }
 
-                    if missing_file {
-                        // Thin red outline makes unavailable media visible without
-                        // changing the cue's normal background or selection state.
+                    if row_has_audio_issue {
+                        // Use the same thin red outline for missing media and an
+                        // unusable audio output, without changing cue tint/selection.
                         ui.painter().rect_stroke(
                             row_rect.shrink(0.5),
                             0.0_f32,
@@ -589,6 +592,19 @@ impl CueTable {
                         Id::new(("cue_row_click", cue.id)),
                         Sense::click_and_drag(),
                     );
+                    let row_resp = if row_has_audio_issue {
+                        let mut reasons = Vec::new();
+                        if missing_file {
+                            reasons
+                                .push("Audio file is missing or cannot be accessed.".to_string());
+                        }
+                        if let Some(reason) = output_issue {
+                            reasons.push(reason.clone());
+                        }
+                        row_resp.on_hover_text(reasons.join("\n"))
+                    } else {
+                        row_resp
+                    };
                     let mut target_cell_rect = Rect::NOTHING;
                     let mut cue_number_rect = Rect::NOTHING;
                     let mut name_cell_rect = Rect::NOTHING;

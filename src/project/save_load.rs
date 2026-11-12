@@ -41,7 +41,9 @@ pub struct Project {
 impl Default for Project {
     fn default() -> Self {
         Self {
-            version: 1,
+            // Version 3 stores per-Cue routing in logical TaSQ output slots;
+            // the native driver channel is resolved at audio playback time.
+            version: 3,
             settings: ProjectSettings::default(),
             cue_list: CueList::new("Main"),
         }
@@ -213,5 +215,35 @@ fn project_directory(path: &Path) -> PathBuf {
         std::env::current_dir()
             .map(|current_dir| current_dir.join(parent))
             .unwrap_or_else(|_| parent.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod project_version_tests {
+    use super::Project;
+
+    #[test]
+    fn new_projects_use_version_three_for_logical_audio_routes() {
+        assert_eq!(Project::default().version, 3);
+    }
+
+    #[test]
+    fn version_one_project_files_remain_deserializable_for_migration() {
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "name": "Legacy",
+                "author": "",
+                "osc_listen_port": 8000,
+                "osc_send_addr": "127.0.0.1:9000",
+                "audio_device": "Default",
+                "auto_crossfade": false,
+                "crossfade_secs": 2.0
+            },
+            "cue_list": {"name": "Main", "cues": []}
+        }"#;
+        let project: Project =
+            serde_json::from_str(json).expect("version-one projects should still load");
+        assert_eq!(project.version, 1);
     }
 }

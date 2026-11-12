@@ -288,9 +288,9 @@ pub struct ChannelRoute {
     /// Legacy primary destination. Kept for compatibility with older projects.
     /// The UI displays it as 1-based.
     pub output_channel: usize,
-    /// Zero-based destinations for this source channel. A source may be sent
-    /// to several hardware outputs at once; an output may receive several
-    /// source channels (downmixing to mono).
+    /// Zero-based logical TaSQ output destinations for this source channel.
+    /// Hardware channel indices are resolved only while sending audio to the
+    /// selected backend; changing Logical Output Mapping never mutates a Cue.
     #[serde(default)]
     pub output_channels: Vec<usize>,
     /// Per-source-channel gain applied before the signal is copied to outputs.
@@ -324,6 +324,30 @@ impl Default for OutputChannelSetting {
     }
 }
 
+/// Hardware outputs that receive both stereo source channels. Routing both
+/// sides to a shared output intentionally folds/sums the stereo signal there.
+pub fn shared_stereo_output_destinations(left: &ChannelRoute, right: &ChannelRoute) -> Vec<usize> {
+    let active_destinations = |route: &ChannelRoute| -> Vec<usize> {
+        if !route.active || !route.master_enabled {
+            return Vec::new();
+        }
+        if route.output_channels.is_empty() {
+            vec![route.output_channel]
+        } else {
+            route.output_channels.clone()
+        }
+    };
+
+    let right_destinations = active_destinations(right);
+    let mut shared: Vec<usize> = active_destinations(left)
+        .into_iter()
+        .filter(|output| right_destinations.contains(output))
+        .collect();
+    shared.sort_unstable();
+    shared.dedup();
+    shared
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IoRouting {
     pub output_device: Option<String>,
@@ -343,7 +367,7 @@ pub struct IoRouting {
     pub right_enabled: bool,
     #[serde(default)]
     pub channel_routes: Vec<ChannelRoute>,
-    /// Per-cue gain trim for each native hardware output channel, in dB.
+    /// Per-cue gain trim for each logical TaSQ output, in dB.
     #[serde(default)]
     pub output_gains_db: Vec<f32>,
 }
@@ -367,6 +391,38 @@ impl Default for IoRouting {
 }
 
 impl IoRouting {
+    /// One-time conversion for project files written before logical routing
+    /// schema v3. NOT called when the operator changes Logical Output Mapping.
+    pub fn upgrade_native_routes_to_logical(&mut self, order: &[usize]) {
+        let to_logical = |native: usize| {
+            order
+                .iter()
+                .position(|&slot| slot == native)
+                .unwrap_or(native)
+        };
+        self.output_channel =
+            to_logical(self.output_channel as usize).min(u16::MAX as usize) as u16;
+        for route in &mut self.channel_routes {
+            route.output_channel = to_logical(route.output_channel);
+            for output in &mut route.output_channels {
+                *output = to_logical(*output);
+            }
+            route.output_channels.sort_unstable();
+            route.output_channels.dedup();
+            if let Some(primary) = route.output_channels.first() {
+                route.output_channel = *primary;
+            }
+        }
+        let old_gains = self.output_gains_db.clone();
+        for (logical, &native) in order.iter().enumerate() {
+            if let (Some(dest), Some(&value)) =
+                (self.output_gains_db.get_mut(logical), old_gains.get(native))
+            {
+                *dest = value;
+            }
+        }
+    }
+
     pub fn ensure_channel_routes(&mut self, input_channels: usize, output_channels: usize) {
         let input_channels = input_channels.max(1);
         let output_channels = output_channels.max(1);
@@ -427,7 +483,7 @@ impl IoRouting {
         }
     }
 
-    /// Create missing routes using device-specific default stream indices.
+    /// Create missing routes using logical TaSQ output indices.
     /// Existing user-configured routes are deliberately left untouched.
     pub fn ensure_channel_routes_with_defaults(
         &mut self,
@@ -875,6 +931,69 @@ mod fade_status_tests {
 
         assert!((cue.progress() - 0.375).abs() < 0.001);
         assert!((cue.remaining_secs() - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn logical_cue_routes_remain_unchanged_by_other_output_settings() {
+        let mut routing = IoRouting::default();
+        routing.ensure_channel_routes_with_defaults(2, 6, &[2, 3]);
+        assert_eq!(routing.channel_routes[0].output_channels, vec![2]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![3]);
+        let original = routing.clone();
+        // Logical Output Mapping is an engine setting; the Cue must never
+        // receive or apply a native-channel permutation itself.
+        let _new_hardware_order = [4, 5, 0, 1, 2, 3];
+        assert_eq!(routing, original);
+    }
+
+    #[test]
+    fn old_native_route_is_upgraded_once_to_logical_slots() {
+        let mut routing = IoRouting::default();
+        routing.ensure_channel_routes_with_defaults(2, 6, &[4, 5]);
+        routing.output_gains_db = vec![0.0, 0.0, 0.0, 0.0, -6.0, -3.0];
+        routing.upgrade_native_routes_to_logical(&[4, 5, 0, 1, 2, 3]);
+        assert_eq!(routing.channel_routes[0].output_channels, vec![0]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![1]);
+        assert_eq!(routing.output_gains_db[0], -6.0);
+        assert_eq!(routing.output_gains_db[1], -3.0);
+    }
+
+    #[test]
+    fn stereo_shared_output_detection_finds_only_common_active_destinations() {
+        let left = ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0, 2],
+            gain_db: 0.0,
+        };
+        let right = ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 1,
+            output_channels: vec![1, 2],
+            gain_db: 0.0,
+        };
+        assert_eq!(shared_stereo_output_destinations(&left, &right), vec![2]);
+    }
+
+    #[test]
+    fn stereo_shared_output_detection_ignores_inactive_source_routes() {
+        let left = ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0],
+            gain_db: 0.0,
+        };
+        let right = ChannelRoute {
+            active: false,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0],
+            gain_db: 0.0,
+        };
+        assert!(shared_stereo_output_destinations(&left, &right).is_empty());
     }
 
     #[test]
