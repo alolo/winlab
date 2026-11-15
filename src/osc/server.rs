@@ -226,6 +226,13 @@ impl OscServer {
                                     let worker_elapsed_us = worker_completed_at
                                         .saturating_duration_since(worker_started_at)
                                         .as_micros();
+                                    crate::performance::record_osc_batch(
+                                        results.len(),
+                                        sent,
+                                        failed,
+                                        queue_wait_us,
+                                        worker_elapsed_us,
+                                    );
                                     let first_to_last_send_span_us = match (
                                         first_send_started_at,
                                         last_send_completed_at,

@@ -431,6 +431,14 @@ fn run_midi_output_worker(
                 let worker_elapsed_us = worker_completed_at
                     .saturating_duration_since(worker_started_at)
                     .as_micros();
+                crate::performance::record_midi_batch(
+                    results.len(),
+                    sent,
+                    failed,
+                    skipped,
+                    queue_wait_us,
+                    worker_elapsed_us,
+                );
                 let first_to_last_send_span_us =
                     match (first_send_started_at, last_send_completed_at) {
                         (Some(first), Some(last)) => {

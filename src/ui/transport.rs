@@ -1,6 +1,7 @@
 // src/ui/transport.rs — панель транспорта: GO, STOP, PAUSE и мастер-громкость
 
 use crate::config::AppearanceSettings;
+use crate::performance::PerformanceSnapshot;
 use crate::ui::icons::IconManager;
 use crate::ui::theme::Theme;
 use egui::*;
@@ -112,9 +113,15 @@ fn paint_output_meter(ui: &mut Ui, peak: f32) {
     );
 }
 
-fn paint_cpu_indicator(ui: &mut Ui, cpu_usage: Option<f32>) {
-    let value = cpu_usage.map(|value| value.clamp(0.0, 100.0));
-    let color = match value {
+fn paint_cpu_indicator(ui: &mut Ui, performance: &PerformanceSnapshot) {
+    let system_cpu = performance
+        .system_cpu
+        .current
+        .map(|value| value.clamp(0.0, 100.0));
+    let app_cpu = performance.app_cpu.current;
+    let app_memory = performance.app_memory_mb.current;
+    let worker_cpu = performance.audio_worker_cpu.current;
+    let color = match system_cpu {
         Some(value) if value >= 90.0 => Color32::from_rgb(235, 75, 65),
         Some(value) if value >= 70.0 => Color32::from_rgb(230, 180, 65),
         Some(_) => Theme::text_active(),
@@ -131,7 +138,7 @@ fn paint_cpu_indicator(ui: &mut Ui, cpu_usage: Option<f32>) {
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new(value.map_or_else(|| "--%".to_string(), |v| format!("{v:.0}%")))
+                RichText::new(system_cpu.map_or_else(|| "--%".to_string(), |v| format!("{v:.0}%")))
                     .color(color)
                     .size(Theme::scaled_font_size(11.0)),
             );
@@ -139,17 +146,36 @@ fn paint_cpu_indicator(ui: &mut Ui, cpu_usage: Option<f32>) {
 
         let (bar_rect, response) = ui.allocate_exact_size(vec2(64.0, 7.0), Sense::hover());
         ui.painter().rect_filled(bar_rect, 2_u8, Theme::bg_dark());
-        if let Some(value) = value {
+        if let Some(value) = system_cpu {
             let fill_rect = Rect::from_min_max(
                 bar_rect.left_top(),
                 Pos2::new(
-                    bar_rect.left() + bar_rect.width() * (value / 100.0),
+                    bar_rect.left() + bar_rect.width() * (value as f32 / 100.0_f32),
                     bar_rect.bottom(),
                 ),
             );
             ui.painter().rect_filled(fill_rect, 2_u8, color);
         }
-        response.on_hover_text("System-wide CPU load, updated once per second");
+        response.on_hover_text("System-wide CPU load, sampled once per second");
+
+        ui.label(
+            RichText::new(format!(
+                "APP {}% · {} MB",
+                app_cpu.map_or_else(|| "--".to_string(), |value| format!("{value:.0}")),
+                app_memory.map_or_else(|| "--".to_string(), |value| format!("{value:.0}"))
+            ))
+            .color(Theme::text_dim())
+            .size(Theme::scaled_font_size(9.0)),
+        );
+        ui.label(
+            RichText::new(format!(
+                "AUDIO {} · {}%",
+                performance.active_audio_workers,
+                worker_cpu.map_or_else(|| "--".to_string(), |value| format!("{value:.0}"))
+            ))
+            .color(Theme::text_dim())
+            .size(Theme::scaled_font_size(9.0)),
+        );
     });
 }
 
@@ -161,7 +187,7 @@ impl TransportBar {
         active_count: usize,
         total_count: usize,
         output_peak: f32,
-        cpu_usage: Option<f32>,
+        performance: &PerformanceSnapshot,
         master_vol: &mut f32,
         bottom_panel_visible: &mut bool,
     ) -> Option<TransportAction> {
@@ -396,7 +422,7 @@ impl TransportBar {
             ui.add_space(12.0);
             ui.add(Separator::default().vertical());
             ui.add_space(8.0);
-            paint_cpu_indicator(ui, cpu_usage);
+            paint_cpu_indicator(ui, performance);
 
             // Keep the lower-panel visibility control in one stable location:
             // at the far right of the complete transport bar, after the monitors.

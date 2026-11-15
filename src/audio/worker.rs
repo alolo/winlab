@@ -620,6 +620,11 @@ pub(crate) enum AudioWorkerManagerEvent {
         error: String,
         retry_scheduled: bool,
     },
+    /// Lightweight process/heartbeat snapshot, emitted once per second.
+    PerformanceSnapshot {
+        worker_pids: Vec<u32>,
+        heartbeat_max_age_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2168,6 +2173,7 @@ pub(crate) fn run_audio_worker_manager(
     let mut global_key = global_key;
     let mut next_health_check = Instant::now();
     let mut next_output_meter_event = Instant::now() + Duration::from_millis(100);
+    let mut next_performance_snapshot = Instant::now() + Duration::from_secs(1);
     let (recovery_tx, recovery_rx) = unbounded::<EndpointRecoveryResult>();
     let mut recovery_profiles: HashMap<String, EndpointRecoveryProfile> = HashMap::new();
     let mut recovering_endpoints: HashSet<String> = HashSet::new();
@@ -2191,6 +2197,33 @@ pub(crate) fn run_audio_worker_manager(
             &position_tx,
         );
         drain_worker_output_meters(&mut workers, &event_tx, &mut next_output_meter_event);
+        let performance_now = Instant::now();
+        if performance_now >= next_performance_snapshot {
+            let mut worker_pids = Vec::with_capacity(workers.len());
+            let mut heartbeat_max_age_ms: Option<u64> = None;
+            for worker in workers.values() {
+                if worker.pid > 0 {
+                    worker_pids.push(worker.pid);
+                }
+                let heartbeat_age_ms = {
+                    let health = worker.health.lock();
+                    performance_now
+                        .saturating_duration_since(health.last_heartbeat)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64
+                };
+                heartbeat_max_age_ms = Some(
+                    heartbeat_max_age_ms
+                        .map_or(heartbeat_age_ms, |current| current.max(heartbeat_age_ms)),
+                );
+            }
+            worker_pids.sort_unstable();
+            let _ = event_tx.send(AudioWorkerManagerEvent::PerformanceSnapshot {
+                worker_pids,
+                heartbeat_max_age_ms,
+            });
+            next_performance_snapshot = performance_now + Duration::from_secs(1);
+        }
         if Instant::now() >= next_health_check {
             let health_failures = monitor_worker_health(&mut workers);
             next_health_check = Instant::now() + WORKER_HEALTH_CHECK_INTERVAL;

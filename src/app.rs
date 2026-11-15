@@ -19,7 +19,7 @@ use crate::dispatch::DispatchTiming;
 use crate::export::session_report::SessionReport;
 use crate::midi::input::{MidiDispatch, MidiInputManager, MidiOutputManager};
 use crate::osc::server::{OscDispatch, OscServer};
-use crate::performance::SystemCpuMonitor;
+use crate::performance::PerformanceMonitor;
 use crate::project::{
     asset_manager::AssetManager,
     save_load::{Project, ProjectAudioRouting},
@@ -310,6 +310,7 @@ enum Panel {
     Trim,
     Midi,
     Report,
+    Performance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,8 +568,8 @@ pub struct TheatreShowCueApp {
     master_vol: f32,
     /// Latest output peak across all active endpoint workers (linear amplitude).
     output_meter_peak: f32,
-    /// System-wide CPU usage sampled once per second outside the audio thread.
-    cpu_monitor: SystemCpuMonitor,
+    /// Session performance telemetry; native metrics are sampled on a background thread.
+    performance_monitor: PerformanceMonitor,
     status_msg: String,
     cue_column_widths: [f32; 9],
     bottom_panel_height: f32,
@@ -871,7 +872,7 @@ impl TheatreShowCueApp {
             active_panel: Panel::Inspector,
             master_vol: 1.0,
             output_meter_peak: 0.0,
-            cpu_monitor: SystemCpuMonitor::new(),
+            performance_monitor: PerformanceMonitor::new(),
             status_msg: "Ready — drag audio files here or add events from the toolbar".to_string(),
             pending_triggers: Vec::new(),
             time_trigger_last_fired: HashMap::new(),
@@ -7750,6 +7751,11 @@ impl TheatreShowCueApp {
                                     .set_file_name("TheatreShowCue_diagnostics.zip")
                                     .save_file()
                                 {
+                                    if let Err(error) = crate::diagnostics::write_performance_report(
+                                        &self.performance_monitor.session_summary(),
+                                    ) {
+                                        warn!("Could not write performance report before export: {error}");
+                                    }
                                     match crate::diagnostics::create_diagnostic_archive(
                                         &current_log_directory,
                                         &destination,
@@ -7773,10 +7779,17 @@ impl TheatreShowCueApp {
                         });
 
                         match crate::diagnostics::diagnostic_file_counts(&current_log_directory) {
-                            Ok((audio_count, midi_count, osc_count, application_count, report_count)) => {
+                            Ok((
+                                audio_count,
+                                midi_count,
+                                osc_count,
+                                application_count,
+                                report_count,
+                                performance_count,
+                            )) => {
                                 ui.label(
                                     RichText::new(format!(
-                                        "Current folder: {audio_count}/30 audio · {midi_count}/30 MIDI · {osc_count}/30 OSC · {application_count}/30 application logs · {report_count}/30 reports"
+                                        "Current folder: {audio_count}/30 audio · {midi_count}/30 MIDI · {osc_count}/30 OSC · {application_count}/30 application · {report_count}/30 reports · {performance_count}/30 performance"
                                     ))
                                     .color(Theme::text_dim())
                                     .size(Theme::scaled_font_size(11.0)),
@@ -7793,7 +7806,7 @@ impl TheatreShowCueApp {
 
                         ui.label(
                             RichText::new(
-                                "Automatic cleanup keeps the newest 30 files of each type. Only Theatre Show Cue diagnostic files are removed; unrelated files are never deleted. The export contains logs and the diagnostic report, not audio media or project files.",
+                                "Automatic cleanup keeps the newest 30 files of each type. Only Theatre Show Cue diagnostic files are removed; unrelated files are never deleted. The export contains logs, the diagnostic report and the performance summary, not audio media or project files.",
                             )
                             .color(Theme::text_dim())
                             .size(Theme::scaled_font_size(11.0)),
@@ -8070,6 +8083,10 @@ impl TheatreShowCueApp {
                     self.active_panel = Panel::Report;
                     ui.close_menu();
                 }
+                if ui.button("Performance Monitor").clicked() {
+                    self.active_panel = Panel::Performance;
+                    ui.close_menu();
+                }
                 ui.separator();
                 if ui
                     .checkbox(&mut self.notes_sidebar_open, "Notes Sidebar")
@@ -8229,6 +8246,12 @@ impl TheatreShowCueApp {
             .clicked()
             {
                 self.active_panel = Panel::Report;
+            }
+            if ui
+                .selectable_label(self.active_panel == Panel::Performance, "Performance")
+                .clicked()
+            {
+                self.active_panel = Panel::Performance;
             }
         });
         ui.separator();
@@ -8596,6 +8619,11 @@ impl TheatreShowCueApp {
                     Panel::Report => {
                         self.audio_log_viewer.show(ui);
                     }
+
+                    Panel::Performance => {
+                        let snapshot = self.performance_monitor.snapshot();
+                        crate::ui::performance::show(ui, &snapshot);
+                    }
                 }
             });
     }
@@ -8603,6 +8631,11 @@ impl TheatreShowCueApp {
 
 impl Drop for TheatreShowCueApp {
     fn drop(&mut self) {
+        if let Err(error) = crate::diagnostics::write_performance_report(
+            &self.performance_monitor.session_summary(),
+        ) {
+            eprintln!("Could not write performance report while closing TaSQ: {error}");
+        }
         if let Err(error) = crate::diagnostics::flush_logging() {
             eprintln!("Could not flush diagnostic logs while closing TaSQ: {error:#}");
         }
@@ -8612,7 +8645,6 @@ impl Drop for TheatreShowCueApp {
 impl eframe::App for TheatreShowCueApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let gui_update_started = Instant::now();
-        self.cpu_monitor.update();
         // Re-apply our palette during update as well as at startup. This keeps
         // egui's native-window defaults from overriding custom text colors on Windows.
         Theme::apply(ctx, &self.settings.appearance);
@@ -8701,6 +8733,13 @@ impl eframe::App for TheatreShowCueApp {
                     // Fast attack, gradual release keeps the meter readable between 10 Hz updates.
                     self.output_meter_peak = peak.max(self.output_meter_peak * 0.82);
                 }
+                AudioWorkerManagerEvent::PerformanceSnapshot {
+                    worker_pids,
+                    heartbeat_max_age_ms,
+                } => {
+                    self.performance_monitor
+                        .set_audio_workers(worker_pids, heartbeat_max_age_ms);
+                }
                 AudioWorkerManagerEvent::EndpointLost {
                     backend,
                     endpoint_id,
@@ -8708,6 +8747,7 @@ impl eframe::App for TheatreShowCueApp {
                     is_global,
                     affected_cues,
                 } => {
+                    self.performance_monitor.record_audio_worker_lost();
                     if is_global
                         && backend == self.audio.backend
                         && endpoint_id == self.audio.current_device_id
@@ -8738,6 +8778,7 @@ impl eframe::App for TheatreShowCueApp {
                     metadata,
                     is_global,
                 } => {
+                    self.performance_monitor.record_audio_worker_recovered();
                     if is_global
                         && metadata.backend == self.audio.backend
                         && metadata.current_device_id == self.audio.current_device_id
@@ -8763,6 +8804,8 @@ impl eframe::App for TheatreShowCueApp {
                     error,
                     retry_scheduled,
                 } => {
+                    self.performance_monitor
+                        .record_audio_worker_recovery_failed();
                     if is_global
                         && backend == self.audio.backend
                         && endpoint_id == self.audio.current_device_id
@@ -8904,7 +8947,7 @@ impl eframe::App for TheatreShowCueApp {
                     let active = self.cue_list.active_count();
                     let total = self.cue_list.cues.len();
                     let output_peak = self.output_meter_peak;
-                    let cpu_usage = self.cpu_monitor.usage_percent();
+                    let performance_snapshot = self.performance_monitor.snapshot();
                     let prev_master = self.master_vol;
                     let transport_appearance = self.settings.appearance.clone();
                     let action = TransportBar::show(
@@ -8914,7 +8957,7 @@ impl eframe::App for TheatreShowCueApp {
                         active,
                         total,
                         output_peak,
-                        cpu_usage,
+                        &performance_snapshot,
                         &mut self.master_vol,
                         &mut self.bottom_panel_visible,
                     );
@@ -9696,6 +9739,8 @@ impl eframe::App for TheatreShowCueApp {
         self.show_close_confirmation(ctx);
 
         let gui_update_elapsed = gui_update_started.elapsed();
+        self.performance_monitor
+            .record_gui_update(gui_update_elapsed);
         if gui_update_elapsed >= Duration::from_millis(33)
             && SLOW_GUI_UPDATE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % 30 == 0
         {

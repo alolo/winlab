@@ -27,6 +27,7 @@ struct LogPaths {
     osc: PathBuf,
     application: PathBuf,
     report: PathBuf,
+    performance: PathBuf,
     latest: PathBuf,
 }
 
@@ -273,6 +274,7 @@ fn session_log_paths(directory: &Path) -> LogPaths {
         osc: directory.join(format!("osc_{stamp}.log")),
         application: directory.join(format!("application_{stamp}.log")),
         report: directory.join(format!("diagnostic_report_{stamp}.txt")),
+        performance: directory.join(format!("performance_{stamp}.txt")),
         latest: directory.join("LATEST.txt"),
     }
 }
@@ -296,7 +298,13 @@ pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
     };
 
     let paths = session_log_paths(&directory);
-    for path in [&paths.audio, &paths.midi, &paths.osc, &paths.application] {
+    for path in [
+        &paths.audio,
+        &paths.midi,
+        &paths.osc,
+        &paths.application,
+        &paths.performance,
+    ] {
         OpenOptions::new().create(true).append(true).open(path)?;
     }
     write_basic_report(&paths.report, &directory)?;
@@ -508,6 +516,11 @@ fn set_log_directory_inner(directory: &Path) -> anyhow::Result<()> {
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_else(|| "diagnostic_report.txt".into());
+    let performance_name = current
+        .performance
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "performance.txt".into());
 
     let next = LogPaths {
         directory: directory.to_path_buf(),
@@ -516,6 +529,7 @@ fn set_log_directory_inner(directory: &Path) -> anyhow::Result<()> {
         osc: directory.join(osc_name),
         application: directory.join(application_name),
         report: directory.join(report_name),
+        performance: directory.join(performance_name),
         latest: directory.join("LATEST.txt"),
     };
 
@@ -525,7 +539,7 @@ fn set_log_directory_inner(directory: &Path) -> anyhow::Result<()> {
         .create(true)
         .append(true)
         .open(&next.audio)?;
-    for path in [&next.midi, &next.osc, &next.application] {
+    for path in [&next.midi, &next.osc, &next.application, &next.performance] {
         OpenOptions::new().create(true).append(true).open(path)?;
     }
     write_basic_report(&next.report, directory)?;
@@ -592,6 +606,27 @@ pub fn write_runtime_report(
     fs::write(paths.report, report)
 }
 
+/// Replace the current session's performance report with the latest aggregate.
+/// Called before diagnostic export and during orderly application shutdown.
+pub fn write_performance_report(summary: &str) -> io::Result<()> {
+    let Some(shared_paths) = LOG_PATHS.get() else {
+        return Ok(());
+    };
+    let path = shared_paths
+        .read()
+        .map_err(|_| io::Error::other("Diagnostic log path lock is poisoned"))?
+        .performance
+        .clone();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "Generated: {}", Local::now().to_rfc3339())?;
+    writeln!(file, "{summary}")?;
+    file.flush()
+}
+
 fn write_basic_report(path: &Path, directory: &Path) -> io::Result<()> {
     let report = format!(
         "Theatre Show Cue diagnostic report\nGenerated: {}\nApplication version: {}\nOperating system: {}\nArchitecture: {}\nBuild profile: {}\nLogical CPU cores: {}\nAudio backend and device details are added after the audio engine initializes.\nLog directory: {}\n",
@@ -610,12 +645,13 @@ fn write_basic_report(path: &Path, directory: &Path) -> io::Result<()> {
 
 fn write_latest_file(paths: &LogPaths) -> io::Result<()> {
     let content = format!(
-        "Latest Theatre Show Cue diagnostic session\nAudio: {}\nMIDI: {}\nOSC: {}\nApplication: {}\nReport: {}\n",
+        "Latest Theatre Show Cue diagnostic session\nAudio: {}\nMIDI: {}\nOSC: {}\nApplication: {}\nReport: {}\nPerformance: {}\n",
         paths.audio.file_name().and_then(|name| name.to_str()).unwrap_or("audio.log"),
         paths.midi.file_name().and_then(|name| name.to_str()).unwrap_or("midi.log"),
         paths.osc.file_name().and_then(|name| name.to_str()).unwrap_or("osc.log"),
         paths.application.file_name().and_then(|name| name.to_str()).unwrap_or("application.log"),
-        paths.report.file_name().and_then(|name| name.to_str()).unwrap_or("diagnostic_report.txt")
+        paths.report.file_name().and_then(|name| name.to_str()).unwrap_or("diagnostic_report.txt"),
+        paths.performance.file_name().and_then(|name| name.to_str()).unwrap_or("performance.txt")
     );
     fs::write(&paths.latest, content)
 }
@@ -629,6 +665,7 @@ fn prune_log_files(directory: &Path) -> io::Result<()> {
         ("osc_", "log"),
         ("application_", "log"),
         ("diagnostic_report_", "txt"),
+        ("performance_", "txt"),
     ] {
         let mut files = Vec::new();
         for entry in fs::read_dir(directory)? {
@@ -673,12 +710,15 @@ fn prune_log_files(directory: &Path) -> io::Result<()> {
 
 /// Count retained diagnostic files in a folder:
 /// audio, MIDI, OSC, application logs and diagnostic reports.
-pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usize, usize, usize)> {
+pub fn diagnostic_file_counts(
+    directory: &Path,
+) -> io::Result<(usize, usize, usize, usize, usize, usize)> {
     let mut audio = 0usize;
     let mut midi = 0usize;
     let mut osc = 0usize;
     let mut application = 0usize;
     let mut reports = 0usize;
+    let mut performance = 0usize;
 
     for entry in fs::read_dir(directory)? {
         let entry = match entry {
@@ -707,10 +747,14 @@ pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usi
             && entry.path().extension().and_then(|value| value.to_str()) == Some("txt")
         {
             reports += 1;
+        } else if name.starts_with("performance_")
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("txt")
+        {
+            performance += 1;
         }
     }
 
-    Ok((audio, midi, osc, application, reports))
+    Ok((audio, midi, osc, application, reports, performance))
 }
 
 #[derive(Debug)]
@@ -751,6 +795,7 @@ fn is_diagnostic_archive_member(name: &str) -> bool {
         || (name.starts_with("osc_") && name.ends_with(".log"))
         || (name.starts_with("application_") && name.ends_with(".log"))
         || (name.starts_with("diagnostic_report_") && name.ends_with(".txt"))
+        || (name.starts_with("performance_") && name.ends_with(".txt"))
 }
 
 /// Export Theatre Show Cue's own log files and LATEST.txt into a standard
@@ -948,6 +993,7 @@ mod tests {
         fs::write(directory.join("osc_test.log"), "osc").unwrap();
         fs::write(directory.join("application_test.log"), "application").unwrap();
         fs::write(directory.join("diagnostic_report_test.txt"), "report").unwrap();
+        fs::write(directory.join("performance_test.txt"), "performance").unwrap();
         fs::write(directory.join("LATEST.txt"), "latest").unwrap();
         fs::write(directory.join("unrelated.txt"), "do not include").unwrap();
 
@@ -955,7 +1001,7 @@ mod tests {
         let count = super::create_diagnostic_archive(&directory, &archive_path).unwrap();
         let archive = fs::read(&archive_path).unwrap();
 
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
         assert_eq!(&archive[..4], b"PK\x03\x04");
         assert!(archive.windows(4).any(|window| window == b"PK\x01\x02"));
         assert!(archive.windows(4).any(|window| window == b"PK\x05\x06"));
@@ -1025,6 +1071,11 @@ mod tests {
                 "report",
             )
             .unwrap();
+            fs::write(
+                directory.join(format!("performance_{index:03}.txt")),
+                "performance",
+            )
+            .unwrap();
         }
         fs::write(directory.join("LATEST.txt"), "latest").unwrap();
         fs::write(directory.join("keep_me.txt"), "keep").unwrap();
@@ -1037,6 +1088,7 @@ mod tests {
             "osc_",
             "application_",
             "diagnostic_report_",
+            "performance_",
         ] {
             let count = fs::read_dir(&directory)
                 .unwrap()
