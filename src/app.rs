@@ -15,6 +15,7 @@ use crate::cue::{
     ContinueMode, Cue, CueList, CueState, CueType, FadeCurve, GroupMode, MidiMessageKind,
     OscCueArg, WaitPhase,
 };
+use crate::dispatch::DispatchTiming;
 use crate::export::session_report::SessionReport;
 use crate::midi::input::{MidiDispatch, MidiInputManager, MidiOutputManager};
 use crate::osc::server::{OscDispatch, OscServer};
@@ -42,7 +43,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const INTERNAL_CUE_CLIPBOARD_MARKER: &str = "TheatreShowCue::InternalCueClipboard::v1";
@@ -341,6 +342,9 @@ struct PendingTrigger {
     source_cue_id: Option<Uuid>,
     fire_at: Instant,
     action: PendingAction,
+    /// Original GO timestamp, retained across Pre/Post-Wait and group segments
+    /// so end-to-end GO latency remains measurable after scheduled delays.
+    go_received_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,13 +413,61 @@ fn build_all_cues_segments(cue_list: &CueList, children: &[Uuid]) -> Vec<AllCues
     segments
 }
 
-/// Analyse a Normal group's automatic chain without changing runtime state.
-/// The first child is started by the group. Each child whose Continue mode is
-/// Auto-Continue / Auto-Follow automatically reaches the next child. A Nothing
-/// before the last child is the manual boundary: open the group and select that
-/// terminal automatically reached cue. A Nothing on the last child is simply
-/// the end of the group, so keep it collapsed and let the caller select after it.
-fn normal_group_manual_stop_in(
+/// Returns whether Cue completion itself owns the post-wait countdown.
+///
+/// Auto-Continue schedules its post-wait from the Cue's trigger time, so an
+/// audio completion arriving after that timer has elapsed must not start the
+/// same post-wait a second time. Playlist and All Cues children retain their
+/// existing group-owned completion path; their sequencing rules are separate
+/// from the normal Auto-Continue chain.
+fn completion_owns_post_wait(
+    continue_mode: &ContinueMode,
+    is_playlist_child: bool,
+    is_all_cues_child: bool,
+    is_managed_group_cue: bool,
+) -> bool {
+    if is_playlist_child || is_all_cues_child || is_managed_group_cue {
+        true
+    } else {
+        *continue_mode != ContinueMode::AutoContinue
+    }
+}
+/// Calculates how long Cue completion must still wait.
+///
+/// When another scheduler owns the post-wait, completion may wait for its
+/// remaining time, but must never recreate an already elapsed countdown.
+fn completion_post_wait_delay(
+    extra_delay: f64,
+    post_wait: f64,
+    existing_post_wait_remaining: Option<f64>,
+    completion_owns_wait: bool,
+) -> f64 {
+    let extra_delay = extra_delay.max(0.0);
+    if let Some(remaining) = existing_post_wait_remaining {
+        let remaining = remaining.max(0.0);
+        if completion_owns_wait {
+            remaining
+        } else {
+            extra_delay.max(remaining)
+        }
+    } else if completion_owns_wait {
+        extra_delay + post_wait.max(0.0)
+    } else {
+        extra_delay
+    }
+}
+
+/// Find the next Cue that requires manual GO after a Normal group's initial
+/// child and all reachable Auto-Continue / Auto-Follow transitions.
+///
+/// ContinueMode belongs to the Cue whose field is set: it controls how the
+/// successor is triggered, not how this Cue itself was triggered. The child with
+/// ContinueMode::Nothing has already been started: either it was the first child
+/// launched by GO on the group, or it was reached automatically from its
+/// predecessor. Therefore, when another playable child follows, that *next*
+/// child is the one that must be selected for manual GO. A Nothing on the final
+/// child means the automatic chain has consumed the whole group.
+fn normal_group_next_manual_cue_in(
     cues: &[Cue],
     group_id: Uuid,
     visited: &mut HashSet<Uuid>,
@@ -449,17 +501,17 @@ fn normal_group_manual_stop_in(
                 ..
             }
         ) {
-            if let Some((mut path, terminal_id)) =
-                normal_group_manual_stop_in(cues, child.id, visited)
+            if let Some((mut path, next_manual_id)) =
+                normal_group_next_manual_cue_in(cues, child.id, visited)
             {
                 path.insert(0, group_id);
-                return Some((path, terminal_id));
+                return Some((path, next_manual_id));
             }
         }
 
         if child.continue_mode == ContinueMode::Nothing {
-            if index + 1 < valid_children.len() {
-                return Some((vec![group_id], child.id));
+            if let Some(next_child) = valid_children.get(index + 1) {
+                return Some((vec![group_id], next_child.id));
             }
             return None;
         }
@@ -500,7 +552,8 @@ pub struct TheatreShowCueApp {
     midi_cc_pressed: HashSet<(u8, u8)>,
 
     selected: Option<Uuid>,
-    /// One-shot Cue List scroll target used by Select Next/Previous navigation.
+    /// One-shot Cue List scroll target used by navigation and the next-manual-Cue
+    /// selection performed after GO starts an automatic sequence.
     scroll_to_cue: Option<Uuid>,
     selected_ids: HashSet<Uuid>,
     selection_anchor: Option<Uuid>,
@@ -538,6 +591,13 @@ pub struct TheatreShowCueApp {
     launch_transaction_depth: usize,
     launch_transaction_id: Option<Uuid>,
     launch_transaction_started_at: Option<Instant>,
+    /// GO timestamp captured at the operator/control entry point. It is moved
+    /// into the outermost transaction when that transaction begins.
+    pending_go_received_at: Option<Instant>,
+    launch_transaction_go_received_at: Option<Instant>,
+    /// Original GO origin for active Cues whose completion may happen later
+    /// (for example, an Audio Cue in Playlist or an Auto-Follow chain).
+    cue_go_origins: HashMap<Uuid, Instant>,
     pending_midi_dispatches: Vec<MidiDispatch>,
     pending_osc_dispatches: Vec<OscDispatch>,
     immediate_playlist_advances: VecDeque<Uuid>,
@@ -832,6 +892,9 @@ impl TheatreShowCueApp {
             launch_transaction_depth: 0,
             launch_transaction_id: None,
             launch_transaction_started_at: None,
+            pending_go_received_at: None,
+            launch_transaction_go_received_at: None,
+            cue_go_origins: HashMap::new(),
             pending_midi_dispatches: Vec::new(),
             pending_osc_dispatches: Vec::new(),
             immediate_playlist_advances: VecDeque::new(),
@@ -847,6 +910,8 @@ impl TheatreShowCueApp {
     // ── Запуск и диспетчеризация всех типов событий ──────────────────────────
 
     fn go(&mut self) {
+        let go_received_at = Instant::now();
+
         // A Comment is a passive marker. GO on a mouse-selected comment only
         // advances the operator cursor; it must never execute the following cue.
         if let Some(selected_id) = self.selected {
@@ -874,21 +939,61 @@ impl TheatreShowCueApp {
             self.select_only(id);
         }
         let next_manual = self.selection_after_auto_chain(id);
+        let is_normal_group = self.cue_list.find(id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Normal,
+                    ..
+                }
+            )
+        });
+
+        self.record_go_received_at(go_received_at);
         self.trigger_cue(id);
-        // A group may select its own manual boundary while executing. Preserve
-        // that selection; otherwise advance past the entire automatic chain.
-        // If there is no next cue for a manual GO, clear the operator cursor:
-        // the playing cue remains visibly marked by its playback outline.
-        if self.selected == Some(id) {
-            if let Some(next_id) = next_manual {
-                self.select_only(next_id);
-            } else {
-                self.selected = None;
-                self.selected_ids.clear();
-                self.selection_anchor = None;
-                self.editing = None;
-                self.editing_focus_pending = false;
+        // Defer this log write until after the dispatch batches have been queued;
+        // the monotonic timestamp itself was captured at the very entry to GO.
+        info!(
+            "GO received timestamp captured: cue_id={}, capture_to_log_us={}",
+            id,
+            go_received_at.elapsed().as_micros()
+        );
+
+        // Normal Groups may select an internal manual boundary and expand the
+        // required nested groups while starting. Preserve that specialized
+        // selection, but make the Cue List follow it.
+        if is_normal_group && self.selected != Some(id) {
+            if let Some(selected_id) = self.selected {
+                self.scroll_to_cue = Some(selected_id);
+                if let Some(cue) = self.cue_list.find(selected_id) {
+                    info!(
+                        "GO selected Normal Group manual boundary: cue_id={}, number='{}', name='{}'",
+                        cue.id, cue.number, cue.name
+                    );
+                }
             }
+            return;
+        }
+
+        // Playlist and All Cues select the next manual Cue after the whole group,
+        // not whichever child happens to be starting or completing right now.
+        // The same target is used for scrolling so delayed automatic events do
+        // not pull the viewport through the queue one Cue at a time.
+        if let Some(next_id) = next_manual {
+            self.select_only(next_id);
+            self.scroll_to_cue = Some(next_id);
+            if let Some(cue) = self.cue_list.find(next_id) {
+                info!(
+                    "GO selected next manual Cue after automatic sequence: cue_id={}, number='{}', name='{}'",
+                    cue.id, cue.number, cue.name
+                );
+            }
+        } else {
+            self.selected = None;
+            self.selected_ids.clear();
+            self.selection_anchor = None;
+            self.editing = None;
+            self.editing_focus_pending = false;
         }
     }
 
@@ -938,16 +1043,36 @@ impl TheatreShowCueApp {
         None
     }
 
+    fn record_go_received_at(&mut self, go_received_at: Instant) {
+        if self.launch_transaction_depth > 0 {
+            // A GO can arrive inside an already-open transaction (for example,
+            // from a MIDI control binding processed in the same input poll).
+            self.launch_transaction_go_received_at
+                .get_or_insert(go_received_at);
+        } else {
+            self.pending_go_received_at = Some(go_received_at);
+        }
+    }
+
     fn begin_launch_transaction(&mut self) {
         if self.launch_transaction_depth == 0 {
             let transaction_id = Uuid::new_v4();
+            let transaction_started_at = Instant::now();
+            let go_received_at = self.pending_go_received_at.take();
             self.launch_transaction_id = Some(transaction_id);
-            self.launch_transaction_started_at = Some(Instant::now());
+            self.launch_transaction_started_at = Some(transaction_started_at);
+            self.launch_transaction_go_received_at = go_received_at;
             self.audio
                 .send(AudioCommand::BeginLaunchTransaction { transaction_id });
             info!(
-                "Launch transaction started: transaction_id={}",
-                transaction_id
+                "Launch transaction stage: transaction_id={} stage=TRANSACTION_STARTED go_to_transaction_started_us={:?} transaction_started_to_go_received_us={:?}",
+                transaction_id,
+                go_received_at.and_then(|go_at| transaction_started_at
+                    .checked_duration_since(go_at)
+                    .map(|elapsed| elapsed.as_micros())),
+                go_received_at.and_then(|go_at| go_at
+                    .checked_duration_since(transaction_started_at)
+                    .map(|elapsed| elapsed.as_micros()))
             );
         }
         self.launch_transaction_depth = self.launch_transaction_depth.saturating_add(1);
@@ -967,7 +1092,14 @@ impl TheatreShowCueApp {
 
         self.launch_transaction_depth -= 1;
         if self.launch_transaction_depth == 0 {
-            self.launch_transaction_started_at = None;
+            let transaction_started_at = self
+                .launch_transaction_started_at
+                .take()
+                .unwrap_or_else(Instant::now);
+            let dispatch_timing = DispatchTiming {
+                go_received_at: self.launch_transaction_go_received_at.take(),
+                transaction_started_at,
+            };
             if let Some(transaction_id) = self.launch_transaction_id.take() {
                 self.audio
                     .send(AudioCommand::EndLaunchTransaction { transaction_id });
@@ -975,7 +1107,10 @@ impl TheatreShowCueApp {
                 let midi_events = std::mem::take(&mut self.pending_midi_dispatches);
                 let midi_count = midi_events.len();
                 if !midi_events.is_empty() {
-                    if let Err(error) = self.midi_out.send_batch(transaction_id, midi_events) {
+                    if let Err(error) =
+                        self.midi_out
+                            .send_batch(transaction_id, dispatch_timing, midi_events)
+                    {
                         tracing::error!(
                             target: "TaSQ::midi::input",
                             "Could not submit MIDI dispatch batch: transaction_id={}, error={}",
@@ -989,7 +1124,9 @@ impl TheatreShowCueApp {
                 let osc_count = osc_events.len();
                 if !osc_events.is_empty() {
                     if let Some(server) = &self.osc {
-                        if let Err(error) = server.send_batch(transaction_id, osc_events) {
+                        if let Err(error) =
+                            server.send_batch(transaction_id, dispatch_timing, osc_events)
+                        {
                             tracing::error!(
                                 target: "TaSQ::osc::server",
                                 "Could not submit OSC dispatch batch: transaction_id={}, error={}",
@@ -1033,6 +1170,7 @@ impl TheatreShowCueApp {
                     source_cue_id: None,
                     fire_at: Instant::now(),
                     action: PendingAction::TriggerCue,
+                    go_received_at: self.launch_transaction_go_received_at,
                 });
                 while let Some(next_id) = self.immediate_playlist_advances.pop_front() {
                     self.pending_triggers.push(PendingTrigger {
@@ -1040,6 +1178,7 @@ impl TheatreShowCueApp {
                         source_cue_id: None,
                         fire_at: Instant::now(),
                         action: PendingAction::TriggerCue,
+                        go_received_at: self.launch_transaction_go_received_at,
                     });
                 }
                 break;
@@ -1079,6 +1218,12 @@ impl TheatreShowCueApp {
                 self.trigger_cue(next_id);
             }
             return;
+        }
+
+        if let Some(go_origin) = self.launch_transaction_go_received_at {
+            self.cue_go_origins.insert(id, go_origin);
+        } else {
+            self.cue_go_origins.remove(&id);
         }
 
         // GO on an already-running cue is a fresh trigger. Remove stale waits,
@@ -1135,6 +1280,7 @@ impl TheatreShowCueApp {
                 source_cue_id: Some(id),
                 fire_at: wait_started_at + std::time::Duration::from_secs_f64(pre_wait),
                 action: PendingAction::ExecuteCue,
+                go_received_at: self.launch_transaction_go_received_at,
             });
             self.status_msg = format!("⏳ Pre-wait ({:.1}s): {}", pre_wait, cue_name);
         } else {
@@ -1160,12 +1306,14 @@ impl TheatreShowCueApp {
                         source_cue_id: Some(id),
                         fire_at: now + std::time::Duration::from_secs_f64(pre_wait),
                         action: PendingAction::BeginPostWait,
+                        go_received_at: self.launch_transaction_go_received_at,
                     });
                     self.pending_triggers.push(PendingTrigger {
                         cue_id: id,
                         source_cue_id: Some(id),
                         fire_at: now + std::time::Duration::from_secs_f64(delay),
                         action: PendingAction::ClearWait,
+                        go_received_at: self.launch_transaction_go_received_at,
                     });
                 }
                 if delay > 0.0 {
@@ -1174,6 +1322,7 @@ impl TheatreShowCueApp {
                         source_cue_id: Some(id),
                         fire_at: now + std::time::Duration::from_secs_f64(delay),
                         action: PendingAction::TriggerCue,
+                        go_received_at: self.launch_transaction_go_received_at,
                     });
                 } else {
                     self.trigger_cue(next_id);
@@ -1192,14 +1341,47 @@ impl TheatreShowCueApp {
                 .any(|run| run.remaining.contains(&cue_id))
     }
 
-    /// Schedule the completion of a cue after its own post-wait. `extra_delay`
-    /// is used by timed actions such as Fade, which must finish before post-wait.
+    /// Schedule Cue completion after any post-wait owned by completion.
+    /// `extra_delay` is used by timed actions such as Fade. Normal Auto-Continue
+    /// owns its post-wait from trigger time and must not restart it here.
     fn schedule_cue_completion(&mut self, cue_id: Uuid, extra_delay: f64) {
-        let post_wait = self
+        let cue_go_origin = self.cue_go_origins.get(&cue_id).copied();
+        if self.launch_transaction_depth > 0 && self.launch_transaction_go_received_at.is_none() {
+            self.launch_transaction_go_received_at = cue_go_origin;
+        }
+        let dispatch_go_origin = self.launch_transaction_go_received_at.or(cue_go_origin);
+
+        let (post_wait, continue_mode, is_managed_group_cue) = self
             .cue_list
             .find(cue_id)
-            .map(|cue| cue.post_wait_secs.max(0.0))
-            .unwrap_or(0.0);
+            .map(|cue| {
+                (
+                    cue.post_wait_secs.max(0.0),
+                    cue.continue_mode.clone(),
+                    matches!(
+                        &cue.cue_type,
+                        CueType::Group {
+                            mode: GroupMode::Playlist | GroupMode::AllCues,
+                            ..
+                        }
+                    ),
+                )
+            })
+            .unwrap_or((0.0, ContinueMode::Nothing, false));
+        let is_playlist_child = self
+            .active_playlists
+            .iter()
+            .any(|run| run.children.contains(&cue_id));
+        let is_all_cues_child = self
+            .active_all_cues
+            .iter()
+            .any(|run| run.remaining.contains(&cue_id));
+        let completion_owns_wait = completion_owns_post_wait(
+            &continue_mode,
+            is_playlist_child,
+            is_all_cues_child,
+            is_managed_group_cue,
+        );
         let now = Instant::now();
         let extra_delay = extra_delay.max(0.0);
 
@@ -1217,31 +1399,43 @@ impl TheatreShowCueApp {
             Some((cue.wait_duration_secs - now.duration_since(started_at).as_secs_f64()).max(0.0))
         });
 
-        let delay = if let Some(remaining) = existing_post_wait_remaining {
-            remaining
-        } else {
-            if post_wait > 0.0 {
-                if let Some(cue) = self.cue_list.find_mut(cue_id) {
-                    cue.wait_phase = WaitPhase::Post;
-                    cue.wait_started_at =
-                        Some(now + std::time::Duration::from_secs_f64(extra_delay));
-                    cue.wait_duration_secs = post_wait;
-                    if extra_delay <= 0.0 {
-                        cue.position_secs = 0.0;
-                        if !matches!(
-                            &cue.state,
-                            CueState::Playing
-                                | CueState::FadingIn
-                                | CueState::FadingOut
-                                | CueState::Paused
-                        ) {
-                            cue.state = CueState::Waiting;
-                        }
+        if completion_owns_wait && existing_post_wait_remaining.is_none() && post_wait > 0.0 {
+            if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                cue.wait_phase = WaitPhase::Post;
+                cue.wait_started_at = Some(now + std::time::Duration::from_secs_f64(extra_delay));
+                cue.wait_duration_secs = post_wait;
+                if extra_delay <= 0.0 {
+                    cue.position_secs = 0.0;
+                    if !matches!(
+                        &cue.state,
+                        CueState::Playing
+                            | CueState::FadingIn
+                            | CueState::FadingOut
+                            | CueState::Paused
+                    ) {
+                        cue.state = CueState::Waiting;
                     }
                 }
             }
-            extra_delay + post_wait
-        };
+        }
+
+        let delay = completion_post_wait_delay(
+            extra_delay,
+            post_wait,
+            existing_post_wait_remaining,
+            completion_owns_wait,
+        );
+
+        if !completion_owns_wait && post_wait > 0.0 {
+            debug!(
+                "Cue completion will not restart externally managed post-wait: cue_id={}, continue_mode={:?}, playlist_child={}, all_cues_child={}, remaining_wait={:?}",
+                cue_id,
+                continue_mode,
+                is_playlist_child,
+                is_all_cues_child,
+                existing_post_wait_remaining
+            );
+        }
 
         if delay > 0.0 {
             self.pending_triggers.push(PendingTrigger {
@@ -1249,10 +1443,12 @@ impl TheatreShowCueApp {
                 source_cue_id: Some(cue_id),
                 fire_at: now + std::time::Duration::from_secs_f64(delay),
                 action: PendingAction::CompleteCue,
+                go_received_at: dispatch_go_origin,
             });
         } else {
             let owns_transaction = self.launch_transaction_depth == 0;
             if owns_transaction {
+                self.pending_go_received_at = dispatch_go_origin;
                 self.begin_launch_transaction();
             }
             self.complete_cue(cue_id);
@@ -1266,6 +1462,14 @@ impl TheatreShowCueApp {
     /// Playlist advances one child; All Cues waits for every child; Normal
     /// follows the cue's Auto-Follow setting.
     fn complete_cue(&mut self, cue_id: Uuid) {
+        if let Some(go_origin) = self.cue_go_origins.remove(&cue_id) {
+            if self.launch_transaction_depth > 0 {
+                self.launch_transaction_go_received_at
+                    .get_or_insert(go_origin);
+            } else {
+                self.pending_go_received_at.get_or_insert(go_origin);
+            }
+        }
         let suppress_target_continue = self.fade_managed_targets.remove(&cue_id);
         let fade_target_id = self.cue_list.find(cue_id).and_then(|cue| {
             if let CueType::Fade { target_id, .. } = &cue.cue_type {
@@ -1306,7 +1510,6 @@ impl TheatreShowCueApp {
                 // launch-transaction boundary. Instant Cue runs therefore do
                 // not wait for another GUI frame or recurse through the stack.
                 self.apply_group_fades(next_child_id, fade_in, fade_out);
-                self.select_only(next_child_id);
                 self.status_msg = format!("📁 Playlist: event {}/{}", next_idx + 1, children.len());
                 let already_started_as_fade_target = fade_target_id == Some(next_child_id)
                     && self
@@ -1642,8 +1845,6 @@ impl TheatreShowCueApp {
         id: Uuid,
         fade_override: Option<(f64, FadeCurve, Vec<[f32; 2]>, f32)>,
     ) -> bool {
-        // Fade In can start its target directly, so center that playing audio cue too.
-        self.scroll_to_cue = Some(id);
         let Some(mut snapshot) = self.cue_list.find(id).cloned() else {
             return false;
         };
@@ -1753,9 +1954,8 @@ impl TheatreShowCueApp {
     }
 
     fn execute_cue_now(&mut self, id: Uuid) {
-        // Keep the cue that actually starts execution centered in the Cue List.
-        // This also covers Auto-Continue/Auto-Follow and delayed pre-wait cues.
-        self.scroll_to_cue = Some(id);
+        // Automatic Cue execution must not move the Cue List viewport. GO
+        // chooses and scrolls to the next manual Cue after the whole chain.
         if let Some(cue) = self.cue_list.find_mut(id) {
             cue.clear_wait_runtime();
             if cue.state == CueState::Waiting {
@@ -1778,6 +1978,7 @@ impl TheatreShowCueApp {
         ) && (matches!(&cue_snapshot.cue_type, CueType::Audio)
             || !cue_snapshot.file_path.as_os_str().is_empty());
         if cue_starts_audio_directly && !self.cue_output_backend_is_active(&cue_snapshot) {
+            self.cue_go_origins.remove(&id);
             if let Some(cue) = self.cue_list.find_mut(id) {
                 cue.state = CueState::Stopped;
             }
@@ -1809,6 +2010,7 @@ impl TheatreShowCueApp {
         match cue_snapshot.cue_type {
             CueType::Audio => {
                 if !self.start_audio_cue(id, None) {
+                    self.cue_go_origins.remove(&id);
                     return;
                 }
                 self.report
@@ -2208,15 +2410,16 @@ impl TheatreShowCueApp {
                             self.cue_list.find(*child_id).is_some()
                                 && !self.is_comment_cue(*child_id)
                         }) {
-                            if let Some((groups_to_expand, terminal_id)) =
-                                self.normal_group_manual_stop(id, &mut HashSet::new())
+                            if let Some((groups_to_expand, next_manual_id)) =
+                                self.normal_group_next_manual_cue(id, &mut HashSet::new())
                             {
                                 for group_id in groups_to_expand {
                                     self.expanded_groups.insert(group_id);
                                 }
-                                // Keep the selection on the final automatically reached cue
-                                // when there are still manual cues after it inside the group.
-                                self.select_only(terminal_id);
+                                // Select the next Cue that requires manual GO. The Cue
+                                // with Continue=Nothing has already been started by the
+                                // group or reached automatically from its predecessor.
+                                self.select_only(next_manual_id);
                                 self.status_msg = "📁 Group: automatic chain stops here; remaining cues need manual GO".to_string();
                             } else {
                                 // The automatic chain reaches the end of this group. Do not
@@ -2368,6 +2571,7 @@ impl TheatreShowCueApp {
                 source_cue_id: Some(group_id),
                 fire_at: wait_started_at + Duration::from_secs_f64(segment.pre_wait_secs),
                 action: PendingAction::StartAllCuesSegment,
+                go_received_at: self.launch_transaction_go_received_at,
             });
             info!(
                 "All Cues segment waiting for pre-wait: group_id={}, segment={}/{}, first_cue_id={}, cue_count={}, pre_wait={:.3}s",
@@ -2448,6 +2652,7 @@ impl TheatreShowCueApp {
                     source_cue_id: Some(group_id),
                     fire_at: wait_started_at + Duration::from_secs_f64(segment.post_wait_secs),
                     action: PendingAction::AdvanceAllCues,
+                    go_received_at: self.launch_transaction_go_received_at,
                 });
                 info!(
                     "All Cues segment waiting for post-wait: group_id={}, segment={}/{}, last_cue_id={}, next_segment={}, post_wait={:.3}s",
@@ -2536,7 +2741,6 @@ impl TheatreShowCueApp {
         }
 
         self.apply_group_fades(child_id, fade_in, fade_out);
-        self.select_only(child_id);
         self.trigger_cue(child_id);
         self.status_msg = format!("📁 Playlist: event {}/{}", idx + 1, children.len());
     }
@@ -2552,15 +2756,14 @@ impl TheatreShowCueApp {
         }
     }
 
-    /// Returns the expanded group path and the final automatically reached cue
-    /// when a Normal group's chain stops before its last child. A Nothing on the
-    /// final child means the group is fully consumed and must remain collapsed.
-    fn normal_group_manual_stop(
+    /// Returns the expanded group path and the next Cue that requires manual GO
+    /// after the Normal group's automatic chain reaches a Continue=Nothing Cue.
+    fn normal_group_next_manual_cue(
         &self,
         group_id: Uuid,
         visited: &mut HashSet<Uuid>,
     ) -> Option<(Vec<Uuid>, Uuid)> {
-        normal_group_manual_stop_in(&self.cue_list.cues, group_id, visited)
+        normal_group_next_manual_cue_in(&self.cue_list.cues, group_id, visited)
     }
 
     fn parent_group_of(&self, cue_id: Uuid) -> Option<Uuid> {
@@ -2662,6 +2865,7 @@ impl TheatreShowCueApp {
             self.bump_audio_generation(*id);
             self.fade_started_at.remove(id);
             self.fade_managed_targets.remove(id);
+            self.cue_go_origins.remove(id);
         }
         for id in affected {
             if let Some(cue) = self.cue_list.find_mut(id) {
@@ -3023,16 +3227,28 @@ impl TheatreShowCueApp {
         let mut ready = ready.into_iter().peekable();
         while let Some(first) = ready.next() {
             let group_deadline = first.fire_at;
-            self.begin_launch_transaction();
-            self.process_pending_trigger(first);
+            let mut same_deadline = vec![first];
 
             while ready
                 .peek()
                 .is_some_and(|next| next.fire_at == group_deadline)
             {
                 if let Some(trigger) = ready.next() {
-                    self.process_pending_trigger(trigger);
+                    same_deadline.push(trigger);
                 }
+            }
+
+            // A single worker batch may contain actions from multiple chains
+            // released at the exact same deadline. Use the earliest inherited
+            // GO as the transaction's end-to-end origin; each Cue still keeps
+            // its own ID and ordering in the dispatch payload.
+            self.pending_go_received_at = same_deadline
+                .iter()
+                .filter_map(|trigger| trigger.go_received_at)
+                .min();
+            self.begin_launch_transaction();
+            for trigger in same_deadline {
+                self.process_pending_trigger(trigger);
             }
             self.end_launch_transaction();
         }
@@ -3142,6 +3358,8 @@ impl TheatreShowCueApp {
         self.audio.send(AudioCommand::Stop(id));
         if self.is_managed_group_child(id) {
             self.schedule_cue_completion(id, 0.0);
+        } else {
+            self.cue_go_origins.remove(&id);
         }
         self.status_msg = "⏹ Stopped".to_string();
     }
@@ -3158,6 +3376,7 @@ impl TheatreShowCueApp {
         self.active_all_cues.clear();
         self.fade_started_at.clear();
         self.fade_managed_targets.clear();
+        self.cue_go_origins.clear();
         let fade_secs = self.settings.stop_all_fade_secs.max(0.0);
         if fade_secs > 0.0 {
             let immediate_stop_ids: Vec<Uuid> = self
@@ -3548,6 +3767,7 @@ impl TheatreShowCueApp {
     fn delete_cue(&mut self, id: Uuid) {
         self.fade_started_at.remove(&id);
         self.fade_managed_targets.remove(&id);
+        self.cue_go_origins.remove(&id);
         self.pending_triggers
             .retain(|trigger| trigger.cue_id != id && trigger.source_cue_id != Some(id));
         self.bump_audio_generation(id);
@@ -9420,7 +9640,7 @@ impl eframe::App for TheatreShowCueApp {
 
 #[cfg(test)]
 mod normal_group_tests {
-    use super::{normal_group_manual_stop_in, TheatreShowCueApp};
+    use super::{normal_group_next_manual_cue_in, TheatreShowCueApp};
     use crate::cue::{ContinueMode, Cue, CueType, GroupMode};
     use std::collections::HashSet;
 
@@ -9460,19 +9680,61 @@ mod normal_group_tests {
     }
 
     #[test]
-    fn comment_rows_do_not_create_a_manual_boundary_in_normal_groups() {
+    fn comment_rows_are_skipped_when_selecting_the_next_manual_cue() {
         let first = audio_cue(ContinueMode::AutoFollow);
         let comment = comment_cue();
         let manual = audio_cue(ContinueMode::Nothing);
         let after = audio_cue(ContinueMode::Nothing);
+        let after_id = after.id;
         let children = vec![first, comment, manual.clone(), after];
         let group = normal_group(&children);
         let mut cues = children;
         cues.push(group.clone());
 
         assert_eq!(
-            normal_group_manual_stop_in(&cues, group.id, &mut HashSet::new()),
-            Some((vec![group.id], manual.id))
+            normal_group_next_manual_cue_in(&cues, group.id, &mut HashSet::new()),
+            Some((vec![group.id], after_id))
+        );
+    }
+
+    #[test]
+    fn first_nothing_is_started_by_group_go_and_selects_the_second_child() {
+        let first = audio_cue(ContinueMode::Nothing);
+        let second = audio_cue(ContinueMode::Nothing);
+        // This Cue is still manual; its Auto-Continue applies only after it starts.
+        let third = audio_cue(ContinueMode::AutoContinue);
+        let fourth = audio_cue(ContinueMode::Nothing);
+        let children = vec![first, second.clone(), third, fourth];
+        let group = normal_group(&children);
+        let mut cues = children;
+        cues.push(group.clone());
+
+        assert_eq!(
+            normal_group_next_manual_cue_in(&cues, group.id, &mut HashSet::new()),
+            Some((vec![group.id], second.id))
+        );
+    }
+
+    #[test]
+    fn auto_continue_on_next_cue_does_not_make_that_cue_automatic() {
+        let first = audio_cue(ContinueMode::AutoContinue);
+        let reached_automatically = audio_cue(ContinueMode::Nothing);
+        // This Cue requires manual GO; its Auto-Continue starts the following Cue.
+        let next_manual = audio_cue(ContinueMode::AutoContinue);
+        let after_auto_continue = audio_cue(ContinueMode::Nothing);
+        let children = vec![
+            first,
+            reached_automatically,
+            next_manual.clone(),
+            after_auto_continue,
+        ];
+        let group = normal_group(&children);
+        let mut cues = children;
+        cues.push(group.clone());
+
+        assert_eq!(
+            normal_group_next_manual_cue_in(&cues, group.id, &mut HashSet::new()),
+            Some((vec![group.id], next_manual.id))
         );
     }
 
@@ -9491,13 +9753,13 @@ mod normal_group_tests {
         cues.push(group.clone());
 
         assert_eq!(
-            normal_group_manual_stop_in(&cues, group.id, &mut HashSet::new()),
+            normal_group_next_manual_cue_in(&cues, group.id, &mut HashSet::new()),
             None
         );
     }
 
     #[test]
-    fn nothing_before_later_children_selects_the_manual_boundary() {
+    fn nothing_before_later_children_selects_the_following_manual_cue() {
         let children = vec![
             audio_cue(ContinueMode::AutoContinue),
             audio_cue(ContinueMode::AutoFollow),
@@ -9507,13 +9769,13 @@ mod normal_group_tests {
             audio_cue(ContinueMode::Nothing),
         ];
         let group = normal_group(&children);
-        let boundary_id = children[3].id;
+        let next_manual_id = children[4].id;
         let mut cues = children;
         cues.push(group.clone());
 
         assert_eq!(
-            normal_group_manual_stop_in(&cues, group.id, &mut HashSet::new()),
-            Some((vec![group.id], boundary_id))
+            normal_group_next_manual_cue_in(&cues, group.id, &mut HashSet::new()),
+            Some((vec![group.id], next_manual_id))
         );
     }
 
@@ -9537,16 +9799,101 @@ mod normal_group_tests {
             fade_in_secs: 0.0,
             fade_out_secs: 0.0,
         });
-        let boundary_id = nested_children[1].id;
+        let next_manual_id = nested_children[2].id;
         let mut cues = nested_children;
         cues.push(nested.clone());
         cues.push(after_nested);
         cues.push(outer.clone());
 
         assert_eq!(
-            normal_group_manual_stop_in(&cues, outer.id, &mut HashSet::new()),
-            Some((vec![outer.id, nested.id], boundary_id))
+            normal_group_next_manual_cue_in(&cues, outer.id, &mut HashSet::new()),
+            Some((vec![outer.id, nested.id], next_manual_id))
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_post_wait_tests {
+    use super::{completion_owns_post_wait, completion_post_wait_delay};
+    use crate::cue::ContinueMode;
+
+    #[test]
+    fn auto_continue_owns_post_wait_outside_managed_groups() {
+        assert!(!completion_owns_post_wait(
+            &ContinueMode::AutoContinue,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn playlist_child_completion_owns_post_wait() {
+        assert!(completion_owns_post_wait(
+            &ContinueMode::AutoContinue,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn all_cues_child_keeps_its_existing_group_completion_path() {
+        assert!(completion_owns_post_wait(
+            &ContinueMode::AutoContinue,
+            false,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn managed_playlist_or_all_cues_group_owns_its_final_post_wait() {
+        assert!(completion_owns_post_wait(
+            &ContinueMode::AutoContinue,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn auto_follow_and_nothing_keep_completion_owned_post_wait() {
+        assert!(completion_owns_post_wait(
+            &ContinueMode::AutoFollow,
+            false,
+            false,
+            false,
+        ));
+        assert!(completion_owns_post_wait(
+            &ContinueMode::Nothing,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn auto_continue_audio_finishing_after_post_wait_does_not_restart_it() {
+        assert_eq!(completion_post_wait_delay(0.0, 2.0, None, false), 0.0);
+    }
+
+    #[test]
+    fn auto_continue_audio_finishing_during_post_wait_uses_only_remaining_time() {
+        assert_eq!(
+            completion_post_wait_delay(0.0, 2.0, Some(0.75), false),
+            0.75
+        );
+    }
+
+    #[test]
+    fn playlist_still_waits_after_audio_completion() {
+        assert_eq!(completion_post_wait_delay(0.0, 2.0, None, true), 2.0);
+    }
+
+    #[test]
+    fn external_wait_and_fade_completion_wait_for_the_later_deadline() {
+        assert_eq!(completion_post_wait_delay(3.0, 2.0, Some(1.0), false), 3.0);
     }
 }
 

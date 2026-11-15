@@ -247,6 +247,28 @@ struct CueDragState {
     active: bool,
 }
 
+/// Keep the wait indicator visible only while its countdown is pending.
+/// A future start time is still visible as a static duration label; once the
+/// deadline has elapsed, the cell falls back to its normal configured value.
+fn wait_countdown_is_visible(
+    phase: WaitPhase,
+    active_phase: WaitPhase,
+    wait_started_at: Option<Instant>,
+    wait_duration_secs: f64,
+    now: Instant,
+) -> bool {
+    if active_phase != phase || wait_duration_secs <= 0.0 {
+        return false;
+    }
+
+    match wait_started_at {
+        Some(started_at) if now >= started_at => {
+            now.duration_since(started_at).as_secs_f64() < wait_duration_secs
+        }
+        Some(_) | None => true,
+    }
+}
+
 impl CueTable {
     pub fn show(
         ui: &mut Ui,
@@ -1586,6 +1608,7 @@ impl CueTable {
         _indent: u8,
     ) -> Rect {
         let is_editing = matches!(editing, Some((id, f, _)) if *id == cue_id && *f == field);
+        let now = Instant::now();
         if is_editing {
             if let Some((_, _, ref mut buf)) = editing {
                 let response = Theme::input_scope(ui, |ui| {
@@ -1609,11 +1632,14 @@ impl CueTable {
             } else {
                 Rect::NOTHING
             }
-        } else if active_phase == phase && wait_duration_secs > 0.0 {
-            if let Some(started_at) =
-                wait_started_at.filter(|started_at| Instant::now() >= *started_at)
-            {
-                let now = Instant::now();
+        } else if wait_countdown_is_visible(
+            phase,
+            active_phase,
+            wait_started_at,
+            wait_duration_secs,
+            now,
+        ) {
+            if let Some(started_at) = wait_started_at.filter(|started_at| now >= *started_at) {
                 let elapsed = now
                     .duration_since(started_at)
                     .as_secs_f64()
@@ -1788,10 +1814,64 @@ pub fn format_duration(secs: f64) -> String {
 mod tests {
     use super::{
         build_sibling_locations, resize_adjacent_column_widths, responsive_column_widths,
-        visible_cue_ids, visible_navigation_cue_ids,
+        visible_cue_ids, visible_navigation_cue_ids, wait_countdown_is_visible,
     };
-    use crate::cue::{Cue, CueType, GroupMode};
+    use crate::cue::{Cue, CueType, GroupMode, WaitPhase};
     use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn wait_countdown_hides_after_deadline_even_if_runtime_phase_is_not_cleared() {
+        let started_at = Instant::now() - Duration::from_secs(5);
+        let now = Instant::now();
+
+        assert!(!wait_countdown_is_visible(
+            WaitPhase::Post,
+            WaitPhase::Post,
+            Some(started_at),
+            4.0,
+            now,
+        ));
+    }
+
+    #[test]
+    fn wait_countdown_remains_visible_before_deadline() {
+        let started_at = Instant::now() - Duration::from_secs(2);
+        let now = Instant::now();
+
+        assert!(wait_countdown_is_visible(
+            WaitPhase::Post,
+            WaitPhase::Post,
+            Some(started_at),
+            4.0,
+            now,
+        ));
+    }
+
+    #[test]
+    fn future_wait_start_shows_static_countdown_label() {
+        let started_at = Instant::now() + Duration::from_secs(2);
+        let now = Instant::now();
+
+        assert!(wait_countdown_is_visible(
+            WaitPhase::Post,
+            WaitPhase::Post,
+            Some(started_at),
+            4.0,
+            now,
+        ));
+    }
+
+    #[test]
+    fn inactive_wait_phase_does_not_show_countdown() {
+        assert!(!wait_countdown_is_visible(
+            WaitPhase::Post,
+            WaitPhase::None,
+            Some(Instant::now()),
+            4.0,
+            Instant::now(),
+        ));
+    }
 
     #[test]
     fn display_order_handles_500_flat_cues_without_dropping_or_reordering_rows() {

@@ -1,5 +1,6 @@
 // src/midi/input.rs — MIDI вход и MIDI выход для отправки управляющих команд и Raw Hex
 
+use crate::dispatch::DispatchTiming;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,7 @@ enum MidiOutputCommand {
     Send(Vec<u8>),
     SendBatch {
         transaction_id: Uuid,
+        timing: DispatchTiming,
         queued_at: Instant,
         events: Vec<MidiDispatch>,
     },
@@ -315,26 +317,43 @@ fn run_midi_output_worker(
             }
             MidiOutputCommand::SendBatch {
                 transaction_id,
+                timing,
                 queued_at,
                 events,
             } => {
-                let queue_wait_us = queued_at.elapsed().as_micros();
+                let worker_started_at = Instant::now();
+                let queue_wait_us = worker_started_at
+                    .saturating_duration_since(queued_at)
+                    .as_micros();
                 let port_name = connected_port_name.as_deref().unwrap_or("unconnected");
-                let batch_started_at = Instant::now();
                 let mut sent = 0usize;
                 let mut failed = 0usize;
                 let mut skipped = 0usize;
                 let mut results = Vec::with_capacity(events.len());
+                let mut first_send_started_at: Option<Instant> = None;
+                let mut first_send_completed_at: Option<Instant> = None;
+                let mut last_send_completed_at: Option<Instant> = None;
+                let mut first_send_call_us: Option<u128> = None;
+                let mut last_send_call_us: Option<u128> = None;
+                let mut first_send_cue_id: Option<Uuid> = None;
+                let mut last_send_cue_id: Option<Uuid> = None;
 
                 for event in events {
-                    let batch_offset_us = batch_started_at.elapsed().as_micros();
-                    if event.bytes.is_empty() {
+                    let batch_offset_us = worker_started_at.elapsed().as_micros();
+                    let MidiDispatch {
+                        cue_id,
+                        cue_number,
+                        cue_name,
+                        bytes,
+                    } = event;
+
+                    if bytes.is_empty() {
                         skipped += 1;
                         results.push(MidiSendResult {
-                            cue_id: event.cue_id,
-                            cue_number: event.cue_number,
-                            cue_name: event.cue_name,
-                            bytes: event.bytes,
+                            cue_id,
+                            cue_number,
+                            cue_name,
+                            bytes,
                             status: "skipped_empty_payload".to_string(),
                             batch_offset_us,
                             send_call_us: 0,
@@ -342,41 +361,64 @@ fn run_midi_output_worker(
                         continue;
                     }
 
-                    let send_started_at = Instant::now();
                     match connection.as_mut() {
-                        Some(connection) => match connection.send(&event.bytes) {
-                            Ok(()) => {
-                                sent += 1;
-                                results.push(MidiSendResult {
-                                    cue_id: event.cue_id,
-                                    cue_number: event.cue_number,
-                                    cue_name: event.cue_name,
-                                    bytes: event.bytes,
-                                    status: "backend_accepted".to_string(),
-                                    batch_offset_us,
-                                    send_call_us: send_started_at.elapsed().as_micros(),
-                                });
+                        Some(connection) => {
+                            // Capture timestamps immediately around the native API call.
+                            // Diagnostic logging is deliberately deferred until the batch
+                            // has finished so file I/O cannot delay the first MIDI send.
+                            let send_started_at = Instant::now();
+                            if first_send_started_at.is_none() {
+                                first_send_started_at = Some(send_started_at);
+                                first_send_cue_id = Some(cue_id);
                             }
-                            Err(error) => {
-                                failed += 1;
-                                results.push(MidiSendResult {
-                                    cue_id: event.cue_id,
-                                    cue_number: event.cue_number,
-                                    cue_name: event.cue_name,
-                                    bytes: event.bytes,
-                                    status: format!("send_failed: {error}"),
-                                    batch_offset_us,
-                                    send_call_us: send_started_at.elapsed().as_micros(),
-                                });
+
+                            let send_result = connection.send(&bytes);
+                            let send_completed_at = Instant::now();
+                            let send_call_us = send_completed_at
+                                .saturating_duration_since(send_started_at)
+                                .as_micros();
+                            if first_send_completed_at.is_none() {
+                                first_send_completed_at = Some(send_completed_at);
+                                first_send_call_us = Some(send_call_us);
                             }
-                        },
+                            last_send_completed_at = Some(send_completed_at);
+                            last_send_call_us = Some(send_call_us);
+                            last_send_cue_id = Some(cue_id);
+
+                            match send_result {
+                                Ok(()) => {
+                                    sent += 1;
+                                    results.push(MidiSendResult {
+                                        cue_id,
+                                        cue_number,
+                                        cue_name,
+                                        bytes,
+                                        status: "backend_accepted".to_string(),
+                                        batch_offset_us,
+                                        send_call_us,
+                                    });
+                                }
+                                Err(error) => {
+                                    failed += 1;
+                                    results.push(MidiSendResult {
+                                        cue_id,
+                                        cue_number,
+                                        cue_name,
+                                        bytes,
+                                        status: format!("send_failed: {error}"),
+                                        batch_offset_us,
+                                        send_call_us,
+                                    });
+                                }
+                            }
+                        }
                         None => {
                             failed += 1;
                             results.push(MidiSendResult {
-                                cue_id: event.cue_id,
-                                cue_number: event.cue_number,
-                                cue_name: event.cue_name,
-                                bytes: event.bytes,
+                                cue_id,
+                                cue_number,
+                                cue_name,
+                                bytes,
                                 status: "no_output_connected".to_string(),
                                 batch_offset_us,
                                 send_call_us: 0,
@@ -385,11 +427,21 @@ fn run_midi_output_worker(
                     }
                 }
 
-                let worker_elapsed_us = batch_started_at.elapsed().as_micros();
+                let worker_completed_at = Instant::now();
+                let worker_elapsed_us = worker_completed_at
+                    .saturating_duration_since(worker_started_at)
+                    .as_micros();
+                let first_to_last_send_span_us =
+                    match (first_send_started_at, last_send_completed_at) {
+                        (Some(first), Some(last)) => {
+                            Some(last.saturating_duration_since(first).as_micros())
+                        }
+                        _ => None,
+                    };
 
-                // Emit one structured diagnostic per Cue. A successful backend
-                // call means the MIDI API accepted the message; it is not an
-                // acknowledgement from the receiving hardware.
+                // Emit per-Cue results only after all native calls have completed.
+                // A successful midir call means the backend accepted the message;
+                // it is not an acknowledgement from the receiving hardware.
                 for result in &results {
                     if result.status == "backend_accepted" {
                         info!(
@@ -419,6 +471,62 @@ fn run_midi_output_worker(
                         );
                     }
                 }
+
+                let go_to_worker_started_us = timing.go_elapsed_us(worker_started_at);
+                let go_to_first_send_started_us =
+                    first_send_started_at.and_then(|at| timing.go_elapsed_us(at));
+                let go_to_first_send_completed_us =
+                    first_send_completed_at.and_then(|at| timing.go_elapsed_us(at));
+                let go_to_last_send_completed_us =
+                    last_send_completed_at.and_then(|at| timing.go_elapsed_us(at));
+                let transaction_to_worker_started_us =
+                    timing.transaction_elapsed_us(worker_started_at);
+                let transaction_to_first_send_started_us =
+                    first_send_started_at.map(|at| timing.transaction_elapsed_us(at));
+                let transaction_to_first_send_completed_us =
+                    first_send_completed_at.map(|at| timing.transaction_elapsed_us(at));
+                let transaction_to_last_send_completed_us =
+                    last_send_completed_at.map(|at| timing.transaction_elapsed_us(at));
+                let worker_to_first_send_started_us = first_send_started_at
+                    .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+                let worker_to_first_send_completed_us = first_send_completed_at
+                    .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+                let worker_to_last_send_completed_us = last_send_completed_at
+                    .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+
+                info!(
+                    target: "TaSQ::midi::input",
+                    "MIDI dispatch latency: transaction_id={}, stage=LATENCY_SUMMARY, events={}, sent={}, failed={}, skipped={}, go_to_transaction_started_us={:?}, transaction_started_to_go_received_us={:?}, go_to_batch_queued_us={:?}, go_to_worker_started_us={:?}, go_to_first_send_started_us={:?}, go_to_first_send_completed_us={:?}, go_to_last_send_completed_us={:?}, transaction_to_batch_queued_us={}, batch_queued_to_worker_started_us={}, transaction_to_worker_started_us={}, transaction_to_first_send_started_us={:?}, transaction_to_first_send_completed_us={:?}, transaction_to_last_send_completed_us={:?}, queue_wait_us={}, worker_to_first_send_started_us={:?}, worker_to_first_send_completed_us={:?}, worker_to_last_send_completed_us={:?}, worker_elapsed_us={}, first_send_call_us={:?}, last_send_call_us={:?}, first_to_last_send_span_us={:?}, first_send_cue_id={:?}, last_send_cue_id={:?}, go_origin_present={}",
+                    transaction_id,
+                    results.len(),
+                    sent,
+                    failed,
+                    skipped,
+                    timing.go_elapsed_us(timing.transaction_started_at),
+                    timing.transaction_to_go_received_us(),
+                    timing.go_elapsed_us(queued_at),
+                    go_to_worker_started_us,
+                    go_to_first_send_started_us,
+                    go_to_first_send_completed_us,
+                    go_to_last_send_completed_us,
+                    timing.transaction_elapsed_us(queued_at),
+                    queue_wait_us,
+                    transaction_to_worker_started_us,
+                    transaction_to_first_send_started_us,
+                    transaction_to_first_send_completed_us,
+                    transaction_to_last_send_completed_us,
+                    queue_wait_us,
+                    worker_to_first_send_started_us,
+                    worker_to_first_send_completed_us,
+                    worker_to_last_send_completed_us,
+                    worker_elapsed_us,
+                    first_send_call_us,
+                    last_send_call_us,
+                    first_to_last_send_span_us,
+                    first_send_cue_id,
+                    last_send_cue_id,
+                    timing.go_received_at.is_some()
+                );
 
                 if failed > 0 {
                     warn!(
@@ -609,18 +717,33 @@ impl MidiOutputManager {
     pub fn send_batch(
         &mut self,
         transaction_id: Uuid,
+        timing: DispatchTiming,
         events: Vec<MidiDispatch>,
     ) -> anyhow::Result<()> {
         if events.is_empty() {
             return Ok(());
         }
+        let event_count = events.len();
+        // Timestamp immediately before enqueue. The worker uses this same
+        // monotonic instant to calculate queue wait without wall-clock drift.
+        let queued_at = Instant::now();
         self.command_tx
             .send(MidiOutputCommand::SendBatch {
                 transaction_id,
-                queued_at: Instant::now(),
+                timing,
+                queued_at,
                 events,
             })
             .map_err(|error| anyhow::anyhow!("Could not queue MIDI dispatch batch: {error}"))?;
+        info!(
+            target: "TaSQ::midi::input",
+            "MIDI dispatch stage: transaction_id={} stage=BATCH_QUEUED events={} go_to_batch_queued_us={:?} transaction_to_batch_queued_us={} enqueue_call_us={}",
+            transaction_id,
+            event_count,
+            timing.go_elapsed_us(queued_at),
+            timing.transaction_elapsed_us(queued_at),
+            queued_at.elapsed().as_micros()
+        );
         Ok(())
     }
 
@@ -677,6 +800,7 @@ fn parse_midi(raw: &[u8]) -> Option<MidiMessage> {
 #[cfg(test)]
 mod midi_worker_serialization_tests {
     use super::{MidiInputCommand, MidiOutputCommand};
+    use crate::dispatch::DispatchTiming;
     use crossbeam_channel::unbounded;
 
     #[test]
@@ -751,8 +875,13 @@ mod midi_worker_serialization_tests {
             },
         ];
 
+        let transaction_started_at = Instant::now();
         tx.send(MidiOutputCommand::SendBatch {
             transaction_id,
+            timing: DispatchTiming {
+                go_received_at: Some(transaction_started_at),
+                transaction_started_at,
+            },
             queued_at: Instant::now(),
             events,
         })

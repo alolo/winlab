@@ -1,5 +1,6 @@
 // src/osc/server.rs — OSC server and batched OSC output dispatch.
 
+use crate::dispatch::DispatchTiming;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rosc::{OscMessage, OscPacket, OscType};
@@ -45,6 +46,7 @@ struct OscSendResult {
 enum OscCommand {
     SendBatch {
         transaction_id: Uuid,
+        timing: DispatchTiming,
         queued_at: Instant,
         events: Vec<OscDispatch>,
     },
@@ -120,17 +122,29 @@ impl OscServer {
                             match send_rx.recv_timeout(Duration::from_millis(50)) {
                                 Ok(OscCommand::SendBatch {
                                     transaction_id,
+                                    timing,
                                     queued_at,
                                     events,
                                 }) => {
-                                    let queue_wait_us = queued_at.elapsed().as_micros();
-                                    let batch_started_at = Instant::now();
+                                    let worker_started_at = Instant::now();
+                                    let queue_wait_us = worker_started_at
+                                        .saturating_duration_since(queued_at)
+                                        .as_micros();
                                     let mut sent = 0usize;
                                     let mut failed = 0usize;
                                     let mut results = Vec::with_capacity(events.len());
+                                    let mut first_send_started_at: Option<Instant> = None;
+                                    let mut first_send_completed_at: Option<Instant> = None;
+                                    let mut last_send_completed_at: Option<Instant> = None;
+                                    let mut first_send_call_us: Option<u128> = None;
+                                    let mut last_send_call_us: Option<u128> = None;
+                                    let mut first_send_cue_id: Option<Uuid> = None;
+                                    let mut last_send_cue_id: Option<Uuid> = None;
 
                                     for event in events {
-                                        let batch_offset_us = batch_started_at.elapsed().as_micros();
+                                        let batch_offset_us = worker_started_at
+                                            .elapsed()
+                                            .as_micros();
                                         let message = OscPacket::Message(OscMessage {
                                             addr: event.addr.clone(),
                                             args: event.args.clone(),
@@ -154,8 +168,29 @@ impl OscServer {
                                             }
                                         };
 
+                                        // Timestamp the actual UDP API call. Logging is
+                                        // deferred until the batch is complete so disk I/O
+                                        // cannot delay the first OSC send.
                                         let send_started_at = Instant::now();
-                                        match send_socket.send_to(&encoded, &send_addr_clone) {
+                                        if first_send_started_at.is_none() {
+                                            first_send_started_at = Some(send_started_at);
+                                            first_send_cue_id = Some(event.cue_id);
+                                        }
+                                        let send_result =
+                                            send_socket.send_to(&encoded, &send_addr_clone);
+                                        let send_completed_at = Instant::now();
+                                        let send_call_us = send_completed_at
+                                            .saturating_duration_since(send_started_at)
+                                            .as_micros();
+                                        if first_send_completed_at.is_none() {
+                                            first_send_completed_at = Some(send_completed_at);
+                                            first_send_call_us = Some(send_call_us);
+                                        }
+                                        last_send_completed_at = Some(send_completed_at);
+                                        last_send_call_us = Some(send_call_us);
+                                        last_send_cue_id = Some(event.cue_id);
+
+                                        match send_result {
                                             Ok(bytes_sent) => {
                                                 sent += 1;
                                                 results.push(OscSendResult {
@@ -167,7 +202,7 @@ impl OscServer {
                                                     status: "udp_send_accepted".to_string(),
                                                     bytes_sent,
                                                     batch_offset_us,
-                                                    send_call_us: send_started_at.elapsed().as_micros(),
+                                                    send_call_us,
                                                 });
                                             }
                                             Err(error) => {
@@ -181,13 +216,25 @@ impl OscServer {
                                                     status: format!("udp_send_failed: {error}"),
                                                     bytes_sent: 0,
                                                     batch_offset_us,
-                                                    send_call_us: send_started_at.elapsed().as_micros(),
+                                                    send_call_us,
                                                 });
                                             }
                                         }
                                     }
 
-                                    let worker_elapsed_us = batch_started_at.elapsed().as_micros();
+                                    let worker_completed_at = Instant::now();
+                                    let worker_elapsed_us = worker_completed_at
+                                        .saturating_duration_since(worker_started_at)
+                                        .as_micros();
+                                    let first_to_last_send_span_us = match (
+                                        first_send_started_at,
+                                        last_send_completed_at,
+                                    ) {
+                                        (Some(first), Some(last)) => Some(
+                                            last.saturating_duration_since(first).as_micros(),
+                                        ),
+                                        _ => None,
+                                    };
 
                                     // Record each OSC Cue separately so the log shows
                                     // the exact address, arguments and UDP send result.
@@ -225,6 +272,65 @@ impl OscServer {
                                             );
                                         }
                                     }
+
+                                    let go_to_worker_started_us =
+                                        timing.go_elapsed_us(worker_started_at);
+                                    let go_to_first_send_started_us = first_send_started_at
+                                        .and_then(|at| timing.go_elapsed_us(at));
+                                    let go_to_first_send_completed_us = first_send_completed_at
+                                        .and_then(|at| timing.go_elapsed_us(at));
+                                    let go_to_last_send_completed_us = last_send_completed_at
+                                        .and_then(|at| timing.go_elapsed_us(at));
+                                    let transaction_to_worker_started_us =
+                                        timing.transaction_elapsed_us(worker_started_at);
+                                    let transaction_to_first_send_started_us =
+                                        first_send_started_at
+                                            .map(|at| timing.transaction_elapsed_us(at));
+                                    let transaction_to_first_send_completed_us =
+                                        first_send_completed_at
+                                            .map(|at| timing.transaction_elapsed_us(at));
+                                    let transaction_to_last_send_completed_us =
+                                        last_send_completed_at
+                                            .map(|at| timing.transaction_elapsed_us(at));
+                                    let worker_to_first_send_started_us = first_send_started_at
+                                        .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+                                    let worker_to_first_send_completed_us = first_send_completed_at
+                                        .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+                                    let worker_to_last_send_completed_us = last_send_completed_at
+                                        .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
+
+                                    info!(
+                                        target: "TaSQ::osc::server",
+                                        "OSC dispatch latency: transaction_id={}, stage=LATENCY_SUMMARY, events={}, sent={}, failed={}, go_to_transaction_started_us={:?}, transaction_started_to_go_received_us={:?}, go_to_batch_queued_us={:?}, go_to_worker_started_us={:?}, go_to_first_send_started_us={:?}, go_to_first_send_completed_us={:?}, go_to_last_send_completed_us={:?}, transaction_to_batch_queued_us={}, batch_queued_to_worker_started_us={}, transaction_to_worker_started_us={}, transaction_to_first_send_started_us={:?}, transaction_to_first_send_completed_us={:?}, transaction_to_last_send_completed_us={:?}, queue_wait_us={}, worker_to_first_send_started_us={:?}, worker_to_first_send_completed_us={:?}, worker_to_last_send_completed_us={:?}, worker_elapsed_us={}, first_send_call_us={:?}, last_send_call_us={:?}, first_to_last_send_span_us={:?}, first_send_cue_id={:?}, last_send_cue_id={:?}, go_origin_present={}",
+                                        transaction_id,
+                                        results.len(),
+                                        sent,
+                                        failed,
+                                        timing.go_elapsed_us(timing.transaction_started_at),
+                                        timing.transaction_to_go_received_us(),
+                                        timing.go_elapsed_us(queued_at),
+                                        go_to_worker_started_us,
+                                        go_to_first_send_started_us,
+                                        go_to_first_send_completed_us,
+                                        go_to_last_send_completed_us,
+                                        timing.transaction_elapsed_us(queued_at),
+                                        queue_wait_us,
+                                        transaction_to_worker_started_us,
+                                        transaction_to_first_send_started_us,
+                                        transaction_to_first_send_completed_us,
+                                        transaction_to_last_send_completed_us,
+                                        queue_wait_us,
+                                        worker_to_first_send_started_us,
+                                        worker_to_first_send_completed_us,
+                                        worker_to_last_send_completed_us,
+                                        worker_elapsed_us,
+                                        first_send_call_us,
+                                        last_send_call_us,
+                                        first_to_last_send_span_us,
+                                        first_send_cue_id,
+                                        last_send_cue_id,
+                                        timing.go_received_at.is_some()
+                                    );
 
                                     if failed > 0 {
                                         warn!(
@@ -276,18 +382,36 @@ impl OscServer {
         out
     }
 
-    pub fn send_batch(&self, transaction_id: Uuid, events: Vec<OscDispatch>) -> Result<()> {
+    pub fn send_batch(
+        &self,
+        transaction_id: Uuid,
+        timing: DispatchTiming,
+        events: Vec<OscDispatch>,
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
+        let event_count = events.len();
+        // Timestamp immediately before enqueue; the worker uses the same
+        // monotonic clock to measure time spent waiting in its command queue.
         let queued_at = Instant::now();
         self.command_tx
             .try_send(OscCommand::SendBatch {
                 transaction_id,
+                timing,
                 queued_at,
                 events,
             })
             .map_err(|error| anyhow::anyhow!("Could not queue OSC dispatch batch: {error}"))?;
+        info!(
+            target: "TaSQ::osc::server",
+            "OSC dispatch stage: transaction_id={} stage=BATCH_QUEUED events={} go_to_batch_queued_us={:?} transaction_to_batch_queued_us={} enqueue_call_us={}",
+            transaction_id,
+            event_count,
+            timing.go_elapsed_us(queued_at),
+            timing.transaction_elapsed_us(queued_at),
+            queued_at.elapsed().as_micros()
+        );
         Ok(())
     }
 
@@ -300,7 +424,12 @@ impl OscServer {
             addr: addr.to_string(),
             args,
         };
-        if let Err(error) = self.send_batch(Uuid::new_v4(), vec![event]) {
+        let transaction_started_at = Instant::now();
+        let timing = DispatchTiming {
+            go_received_at: None,
+            transaction_started_at,
+        };
+        if let Err(error) = self.send_batch(Uuid::new_v4(), timing, vec![event]) {
             warn!("Could not queue OSC message: {error}");
         }
     }

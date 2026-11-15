@@ -11,6 +11,7 @@ mod audio;
 mod config;
 mod cue;
 mod diagnostics;
+mod dispatch;
 mod export;
 mod midi;
 mod osc;
