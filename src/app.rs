@@ -950,14 +950,11 @@ impl TheatreShowCueApp {
         });
 
         self.record_go_received_at(go_received_at);
+        // The timestamp is captured at the GO entry and the diagnostic event is
+        // queued immediately. File I/O is handled by the background log writer,
+        // so this record does not delay Cue preparation or MIDI/OSC dispatch.
+        info!("GO_RECEIVED: cue_id={}, captured_at_go_entry=true", id);
         self.trigger_cue(id);
-        // Defer this log write until after the dispatch batches have been queued;
-        // the monotonic timestamp itself was captured at the very entry to GO.
-        info!(
-            "GO received timestamp captured: cue_id={}, capture_to_log_us={}",
-            id,
-            go_received_at.elapsed().as_micros()
-        );
 
         // Normal Groups may select an internal manual boundary and expand the
         // required nested groups while starting. Preserve that specialized
@@ -1963,6 +1960,126 @@ impl TheatreShowCueApp {
                 cue.position_secs = 0.0;
             }
         }
+
+        // MIDI and OSC do not need an audio endpoint normalization or a full
+        // Cue clone. Prepare their small dispatch payload directly from the
+        // stored Cue, avoiding copies of unrelated audio/routing/automation
+        // vectors for every event in a large transaction.
+        enum ImmediateDispatch {
+            Midi {
+                cue_number: String,
+                cue_name: String,
+                bytes: Vec<u8>,
+            },
+            Osc {
+                cue_number: String,
+                cue_name: String,
+                address: String,
+                args: Vec<rosc::OscType>,
+            },
+        }
+
+        let immediate_dispatch = self.cue_list.find(id).and_then(|cue| match &cue.cue_type {
+            CueType::Midi {
+                channel,
+                message,
+                raw_hex,
+            } => {
+                let bytes =
+                    if !raw_hex.trim().is_empty() && matches!(message, &MidiMessageKind::Raw(_)) {
+                        MidiMessageKind::parse_hex(raw_hex)
+                    } else {
+                        message.to_bytes(*channel)
+                    };
+                Some(ImmediateDispatch::Midi {
+                    cue_number: cue.number.clone(),
+                    cue_name: cue.name.clone(),
+                    bytes,
+                })
+            }
+            CueType::Osc { address, args } => {
+                let args: Vec<rosc::OscType> = args
+                    .iter()
+                    .map(|arg| match arg {
+                        OscCueArg::Int(value) => rosc::OscType::Int(*value),
+                        OscCueArg::Float(value) => rosc::OscType::Float(*value),
+                        OscCueArg::String(value) => rosc::OscType::String(value.clone()),
+                        OscCueArg::Bool(value) => rosc::OscType::Bool(*value),
+                    })
+                    .collect();
+                Some(ImmediateDispatch::Osc {
+                    cue_number: cue.number.clone(),
+                    cue_name: cue.name.clone(),
+                    address: address.clone(),
+                    args,
+                })
+            }
+            _ => None,
+        });
+
+        if let Some(dispatch) = immediate_dispatch {
+            let cue_name_for_log = match &dispatch {
+                ImmediateDispatch::Midi { cue_name, .. }
+                | ImmediateDispatch::Osc { cue_name, .. } => cue_name.as_str(),
+            };
+            let cue_number_for_log = match &dispatch {
+                ImmediateDispatch::Midi { cue_number, .. }
+                | ImmediateDispatch::Osc { cue_number, .. } => cue_number.as_str(),
+            };
+            info!(
+                "Cue execution started: id={}, number='{}', name='{}'",
+                id, cue_number_for_log, cue_name_for_log
+            );
+
+            match dispatch {
+                ImmediateDispatch::Midi {
+                    cue_number,
+                    cue_name,
+                    bytes,
+                } => {
+                    self.report.record(&cue_number, &cue_name, 0.0, "MIDI");
+                    let status_msg = format!("🎹 MIDI queued: {:02X?}", bytes);
+                    self.pending_midi_dispatches.push(MidiDispatch {
+                        cue_id: id,
+                        cue_number,
+                        cue_name,
+                        bytes,
+                    });
+                    self.status_msg = status_msg;
+                }
+                ImmediateDispatch::Osc {
+                    cue_number,
+                    cue_name,
+                    address,
+                    args,
+                } => {
+                    if self.osc.is_some() {
+                        self.report.record(&cue_number, &cue_name, 0.0, "OSC");
+                        let status_msg = format!("📡 OSC queued: {address}");
+                        self.pending_osc_dispatches.push(OscDispatch {
+                            cue_id: id,
+                            cue_number,
+                            cue_name,
+                            addr: address,
+                            args,
+                        });
+                        self.status_msg = status_msg;
+                    } else {
+                        tracing::warn!(
+                            target: "TaSQ::osc::server",
+                            "OSC Cue could not be queued because OSC server is unavailable: cue_id={}, cue_number='{}', address='{}'",
+                            id,
+                            cue_number,
+                            address
+                        );
+                        self.status_msg = "OSC is not available; check Settings → OSC".to_string();
+                    }
+                }
+            }
+
+            self.schedule_cue_completion(id, 0.0);
+            return;
+        }
         let Some(mut cue_snapshot) = self.cue_list.find(id).cloned() else {
             return;
         };
@@ -2008,6 +2125,10 @@ impl TheatreShowCueApp {
         }
 
         match cue_snapshot.cue_type {
+            CueType::Midi { .. } | CueType::Osc { .. } => {
+                unreachable!("MIDI and OSC Cue types are handled by the dispatch fast path");
+            }
+
             CueType::Audio => {
                 if !self.start_audio_cue(id, None) {
                     self.cue_go_origins.remove(&id);
@@ -2336,66 +2457,9 @@ impl TheatreShowCueApp {
                 }
             }
 
-            CueType::Midi {
-                channel,
-                message,
-                raw_hex,
-            } => {
-                let bytes =
-                    if !raw_hex.trim().is_empty() && matches!(message, MidiMessageKind::Raw(_)) {
-                        MidiMessageKind::parse_hex(&raw_hex)
-                    } else {
-                        message.to_bytes(channel)
-                    };
-                self.pending_midi_dispatches.push(MidiDispatch {
-                    cue_id: cue_snapshot.id,
-                    cue_number: cue_snapshot.number.clone(),
-                    cue_name: cue_snapshot.name.clone(),
-                    bytes: bytes.clone(),
-                });
-                self.report
-                    .record(&cue_snapshot.number, &cue_snapshot.name, 0.0, "MIDI");
-                self.status_msg = format!("🎹 MIDI queued: {:02X?}", bytes);
-                self.schedule_cue_completion(id, 0.0);
-            }
-
             CueType::Comment { .. } => {
                 // Comment cues are intentionally non-executable. The trigger_cue
                 // guard treats them as transparent markers in automatic chains.
-            }
-
-            CueType::Osc { address, args } => {
-                let osc_args = args
-                    .into_iter()
-                    .map(|arg| match arg {
-                        OscCueArg::Int(value) => rosc::OscType::Int(value),
-                        OscCueArg::Float(value) => rosc::OscType::Float(value),
-                        OscCueArg::String(value) => rosc::OscType::String(value),
-                        OscCueArg::Bool(value) => rosc::OscType::Bool(value),
-                    })
-                    .collect();
-                if self.osc.is_some() {
-                    self.pending_osc_dispatches.push(OscDispatch {
-                        cue_id: cue_snapshot.id,
-                        cue_number: cue_snapshot.number.clone(),
-                        cue_name: cue_snapshot.name.clone(),
-                        addr: address.clone(),
-                        args: osc_args,
-                    });
-                    self.status_msg = format!("📡 OSC queued: {address}");
-                    self.report
-                        .record(&cue_snapshot.number, &cue_snapshot.name, 0.0, "OSC");
-                } else {
-                    tracing::warn!(
-                        target: "TaSQ::osc::server",
-                        "OSC Cue could not be queued because OSC server is unavailable: cue_id={}, cue_number='{}', address='{}'",
-                        cue_snapshot.id,
-                        cue_snapshot.number,
-                        address
-                    );
-                    self.status_msg = "OSC is not available; check Settings → OSC".to_string();
-                }
-                self.schedule_cue_completion(id, 0.0);
             }
 
             CueType::Group {
@@ -8534,6 +8598,14 @@ impl TheatreShowCueApp {
                     }
                 }
             });
+    }
+}
+
+impl Drop for TheatreShowCueApp {
+    fn drop(&mut self) {
+        if let Err(error) = crate::diagnostics::flush_logging() {
+            eprintln!("Could not flush diagnostic logs while closing TaSQ: {error:#}");
+        }
     }
 }
 

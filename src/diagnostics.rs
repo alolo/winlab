@@ -3,11 +3,15 @@
 
 use crate::config::AppSettings;
 use chrono::Local;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::backtrace::Backtrace;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::thread;
+use std::time::Duration;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -28,6 +32,206 @@ struct LogPaths {
 
 type SharedLogPaths = Arc<RwLock<LogPaths>>;
 static LOG_PATHS: OnceLock<SharedLogPaths> = OnceLock::new();
+static LOG_WRITER: OnceLock<Sender<LogMessage>> = OnceLock::new();
+
+#[derive(Debug)]
+enum LogMessage {
+    Write { path: PathBuf, bytes: Vec<u8> },
+    Flush(Sender<()>),
+}
+
+/// `tracing` formats each event into a small in-memory buffer on the calling
+/// thread. Dropping this writer enqueues the complete line for a dedicated
+/// disk-writer thread; no file open/write/close occurs on the GO or audio path.
+#[derive(Clone)]
+struct QueuedMakeWriter {
+    sender: Sender<LogMessage>,
+    paths: SharedLogPaths,
+    stream: LogStream,
+}
+
+impl QueuedMakeWriter {
+    fn new(sender: Sender<LogMessage>, paths: SharedLogPaths, stream: LogStream) -> Self {
+        Self {
+            sender,
+            paths,
+            stream,
+        }
+    }
+}
+
+struct QueuedLogWriter {
+    sender: Sender<LogMessage>,
+    path: PathBuf,
+    buffer: Vec<u8>,
+}
+
+impl Write for QueuedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // The whole formatted event is submitted atomically from Drop.
+        Ok(())
+    }
+}
+
+impl Drop for QueuedLogWriter {
+    fn drop(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.buffer);
+        let _ = self.sender.send(LogMessage::Write {
+            path: self.path.clone(),
+            bytes,
+        });
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for QueuedMakeWriter {
+    type Writer = QueuedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let path = self
+            .paths
+            .read()
+            .map(|paths| log_path_for_stream(&paths, self.stream))
+            .unwrap_or_else(|_| {
+                std::env::temp_dir().join("TheatreShowCue_diagnostics_fallback.log")
+            });
+        QueuedLogWriter {
+            sender: self.sender.clone(),
+            path,
+            buffer: Vec::with_capacity(256),
+        }
+    }
+}
+
+fn log_path_for_stream(paths: &LogPaths, stream: LogStream) -> PathBuf {
+    match stream {
+        LogStream::Audio => paths.audio.clone(),
+        LogStream::Midi => paths.midi.clone(),
+        LogStream::Osc => paths.osc.clone(),
+        LogStream::Application => paths.application.clone(),
+    }
+}
+
+/// Keep file handles on the diagnostics thread and flush each complete event.
+/// The application thread only formats and enqueues a line; disk latency is
+/// isolated from GO processing and Worker dispatch.
+fn run_queued_log_writer(receiver: Receiver<LogMessage>) {
+    let mut writers: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
+
+    while let Ok(message) = receiver.recv() {
+        match message {
+            LogMessage::Write { path, bytes } => {
+                let writer_path = if writers.contains_key(&path) {
+                    path.clone()
+                } else {
+                    match OpenOptions::new().create(true).append(true).open(&path) {
+                        Ok(file) => {
+                            writers.insert(path.clone(), BufWriter::new(file));
+                            path.clone()
+                        }
+                        Err(error) => {
+                            let fallback_directory = default_log_directory();
+                            let fallback_path = path
+                                .file_name()
+                                .map(|name| fallback_directory.join(name))
+                                .unwrap_or_else(|| {
+                                    fallback_directory.join("application_fallback.log")
+                                });
+
+                            if fs::create_dir_all(&fallback_directory).is_err() {
+                                eprintln!(
+                                    "Could not open diagnostic log '{}' or create fallback '{}': {}",
+                                    path.display(),
+                                    fallback_directory.display(),
+                                    error
+                                );
+                                continue;
+                            }
+
+                            match OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&fallback_path)
+                            {
+                                Ok(file) => {
+                                    let mut writer = BufWriter::new(file);
+                                    let _ = writeln!(
+                                        writer,
+                                        "[WARN] Diagnostic logging redirected from '{}' to '{}': {}",
+                                        path.display(),
+                                        fallback_path.display(),
+                                        error
+                                    );
+                                    writers.insert(fallback_path.clone(), writer);
+                                    let _ = set_log_directory_inner(&fallback_directory);
+                                    fallback_path
+                                }
+                                Err(fallback_error) => {
+                                    eprintln!(
+                                        "Could not open diagnostic log '{}' or fallback '{}': {}",
+                                        path.display(),
+                                        fallback_path.display(),
+                                        fallback_error
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let write_result = writers
+                    .get_mut(&writer_path)
+                    .map(|writer| writer.write_all(&bytes).and_then(|_| writer.flush()));
+                if let Some(Err(error)) = write_result {
+                    eprintln!(
+                        "Could not write diagnostic log '{}': {}",
+                        writer_path.display(),
+                        error
+                    );
+                    writers.remove(&writer_path);
+                }
+            }
+            LogMessage::Flush(reply) => {
+                for writer in writers.values_mut() {
+                    let _ = writer.flush();
+                }
+                // Close cached handles as well as flushing them. Diagnostic
+                // archives and user-selected log-folder changes must be able
+                // to read, move or replace the files on Windows.
+                writers.clear();
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    for writer in writers.values_mut() {
+        let _ = writer.flush();
+    }
+}
+
+/// Wait until all log events queued before this call have reached their files.
+/// Used when exporting diagnostics and when the GUI event loop exits.
+pub fn flush_logging() -> anyhow::Result<()> {
+    let Some(sender) = LOG_WRITER.get() else {
+        return Ok(());
+    };
+    let (reply_tx, reply_rx) = bounded(1);
+    sender
+        .send(LogMessage::Flush(reply_tx))
+        .map_err(|error| anyhow::anyhow!("Could not request diagnostic log flush: {error}"))?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| anyhow::anyhow!("Timed out waiting for diagnostic log flush: {error}"))?;
+    Ok(())
+}
 
 /// The default per-user location. It is writable without administrator rights.
 pub fn default_log_directory() -> PathBuf {
@@ -104,33 +308,54 @@ pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
         .set(shared_paths.clone())
         .map_err(|_| anyhow::anyhow!("Diagnostic logging was already initialized"))?;
 
-    let audio_paths = shared_paths.clone();
+    let (log_tx, log_rx) = unbounded::<LogMessage>();
+    thread::Builder::new()
+        .name("tasq-diagnostic-writer".to_string())
+        .spawn(move || run_queued_log_writer(log_rx))
+        .map_err(|error| anyhow::anyhow!("Could not start diagnostic writer thread: {error}"))?;
+    LOG_WRITER
+        .set(log_tx.clone())
+        .map_err(|_| anyhow::anyhow!("Diagnostic writer was already initialized"))?;
+
     let audio_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&audio_paths, LogStream::Audio))
+        .with_writer(QueuedMakeWriter::new(
+            log_tx.clone(),
+            shared_paths.clone(),
+            LogStream::Audio,
+        ))
         .with_filter(filter_fn(|metadata| is_audio_target(metadata.target())));
 
-    let midi_paths = shared_paths.clone();
     let midi_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&midi_paths, LogStream::Midi))
+        .with_writer(QueuedMakeWriter::new(
+            log_tx.clone(),
+            shared_paths.clone(),
+            LogStream::Midi,
+        ))
         .with_filter(filter_fn(|metadata| is_midi_target(metadata.target())));
 
-    let osc_paths = shared_paths.clone();
     let osc_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&osc_paths, LogStream::Osc))
+        .with_writer(QueuedMakeWriter::new(
+            log_tx.clone(),
+            shared_paths.clone(),
+            LogStream::Osc,
+        ))
         .with_filter(filter_fn(|metadata| is_osc_target(metadata.target())));
 
     let panic_paths = shared_paths.clone();
-    let application_paths = shared_paths.clone();
     let application_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&application_paths, LogStream::Application))
+        .with_writer(QueuedMakeWriter::new(
+            log_tx,
+            shared_paths.clone(),
+            LogStream::Application,
+        ))
         .with_filter(filter_fn(|metadata| {
             !is_audio_target(metadata.target())
                 && !is_midi_target(metadata.target())
@@ -240,7 +465,14 @@ fn open_writer(paths: &SharedLogPaths, stream: LogStream) -> Box<dyn Write + Sen
 
 /// Change the destination for the remainder of the current session. The
 /// existing files are not moved; new events are written to the new folder.
+/// Pending diagnostic events are flushed before switching so no old-session
+/// messages are redirected into the new directory.
 pub fn set_log_directory(directory: &Path) -> anyhow::Result<()> {
+    flush_logging()?;
+    set_log_directory_inner(directory)
+}
+
+fn set_log_directory_inner(directory: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(directory)?;
     let Some(shared_paths) = LOG_PATHS.get() else {
         anyhow::bail!("Diagnostic logging has not been initialized");
@@ -525,6 +757,9 @@ fn is_diagnostic_archive_member(name: &str) -> bool {
 /// ZIP archive. Uses ZIP's Store method so no additional compression crate is
 /// required and the text logs remain directly inspectable.
 pub fn create_diagnostic_archive(directory: &Path, destination: &Path) -> anyhow::Result<usize> {
+    // Ensure the archive includes every diagnostic event already emitted by
+    // the application, even though file writes happen on a background thread.
+    flush_logging()?;
     let mut source_files = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -728,6 +963,46 @@ mod tests {
             .windows(14)
             .any(|window| window == b"do not include"));
 
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn queued_diagnostic_writer_flushes_complete_events_to_their_files() {
+        use super::{run_queued_log_writer, LogMessage};
+        use crossbeam_channel::{bounded, unbounded};
+        use std::thread;
+        use std::time::Duration;
+
+        let directory = std::env::temp_dir().join(format!("tasq-queued-log-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("application_test.log");
+        let (sender, receiver) = unbounded();
+
+        let worker = thread::spawn(move || run_queued_log_writer(receiver));
+        sender
+            .send(LogMessage::Write {
+                path: path.clone(),
+                bytes: b"first event\n".to_vec(),
+            })
+            .unwrap();
+        sender
+            .send(LogMessage::Write {
+                path: path.clone(),
+                bytes: b"second event\n".to_vec(),
+            })
+            .unwrap();
+
+        let (flush_tx, flush_rx) = bounded(1);
+        sender.send(LogMessage::Flush(flush_tx)).unwrap();
+        flush_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        drop(sender);
+        worker.join().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "first event\nsecond event\n"
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 

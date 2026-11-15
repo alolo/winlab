@@ -79,5 +79,8 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(app::TheatreShowCueApp::new(cc)))),
     );
     tracing::info!("Theatre Show Cue native event loop returned");
+    if let Err(error) = diagnostics::flush_logging() {
+        eprintln!("Could not flush diagnostic logs before exit: {error:#}");
+    }
     result.map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }
