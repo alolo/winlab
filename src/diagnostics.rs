@@ -1,4 +1,4 @@
-//! Session diagnostics: separate audio/application logs, bounded retention and
+//! Session diagnostics: separate audio/MIDI/OSC/application logs, bounded retention and
 //! a user-selectable destination directory.
 
 use crate::config::AppSettings;
@@ -19,6 +19,8 @@ const MAX_LOGS_PER_TYPE: usize = 30;
 struct LogPaths {
     directory: PathBuf,
     audio: PathBuf,
+    midi: PathBuf,
+    osc: PathBuf,
     application: PathBuf,
     report: PathBuf,
     latest: PathBuf,
@@ -51,19 +53,27 @@ pub fn active_log_directory() -> Option<PathBuf> {
         .and_then(|paths| paths.read().ok().map(|paths| paths.directory.clone()))
 }
 
+/// Return the file currently receiving audio-target diagnostic events.
+pub fn active_audio_log_path() -> Option<PathBuf> {
+    LOG_PATHS
+        .get()
+        .and_then(|paths| paths.read().ok().map(|paths| paths.audio.clone()))
+}
+
 fn session_log_paths(directory: &Path) -> LogPaths {
     let stamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     LogPaths {
         directory: directory.to_path_buf(),
         audio: directory.join(format!("audio_{stamp}.log")),
+        midi: directory.join(format!("midi_{stamp}.log")),
+        osc: directory.join(format!("osc_{stamp}.log")),
         application: directory.join(format!("application_{stamp}.log")),
         report: directory.join(format!("diagnostic_report_{stamp}.txt")),
         latest: directory.join("LATEST.txt"),
     }
 }
 
-/// Initialize two independent file sinks. Audio-module events go to audio.log;
-/// all other application events go to application.log.
+/// Initialize independent file sinks for audio, MIDI, OSC and application events.
 pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
     let requested_directory =
         configured_log_directory(settings.diagnostic_log_directory.as_deref());
@@ -82,14 +92,9 @@ pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
     };
 
     let paths = session_log_paths(&directory);
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.audio)?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.application)?;
+    for path in [&paths.audio, &paths.midi, &paths.osc, &paths.application] {
+        OpenOptions::new().create(true).append(true).open(path)?;
+    }
     write_basic_report(&paths.report, &directory)?;
     prune_log_files(&directory)?;
     write_latest_file(&paths)?;
@@ -103,19 +108,39 @@ pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
     let audio_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&audio_paths, true))
+        .with_writer(move || open_writer(&audio_paths, LogStream::Audio))
         .with_filter(filter_fn(|metadata| is_audio_target(metadata.target())));
+
+    let midi_paths = shared_paths.clone();
+    let midi_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(move || open_writer(&midi_paths, LogStream::Midi))
+        .with_filter(filter_fn(|metadata| is_midi_target(metadata.target())));
+
+    let osc_paths = shared_paths.clone();
+    let osc_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(move || open_writer(&osc_paths, LogStream::Osc))
+        .with_filter(filter_fn(|metadata| is_osc_target(metadata.target())));
 
     let panic_paths = shared_paths.clone();
     let application_paths = shared_paths.clone();
     let application_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(move || open_writer(&application_paths, false))
-        .with_filter(filter_fn(|metadata| !is_audio_target(metadata.target())));
+        .with_writer(move || open_writer(&application_paths, LogStream::Application))
+        .with_filter(filter_fn(|metadata| {
+            !is_audio_target(metadata.target())
+                && !is_midi_target(metadata.target())
+                && !is_osc_target(metadata.target())
+        }));
 
     tracing_subscriber::registry()
         .with(audio_layer)
+        .with(midi_layer)
+        .with(osc_layer)
         .with(application_layer)
         .with(tracing_subscriber::EnvFilter::new(
             "TaSQ=debug,TheatreShowCue=debug,warn",
@@ -127,7 +152,7 @@ pub fn init_logging(settings: &AppSettings) -> anyhow::Result<()> {
     // application log, including a backtrace for tester reports.
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let mut writer = open_writer(&panic_paths, false);
+        let mut writer = open_writer(&panic_paths, LogStream::Application);
         let backtrace = Backtrace::force_capture();
         let _ = writeln!(
             writer,
@@ -144,15 +169,32 @@ fn is_audio_target(target: &str) -> bool {
     target == "audio" || target.contains("::audio::") || target.ends_with("::audio")
 }
 
-fn open_writer(paths: &SharedLogPaths, audio: bool) -> Box<dyn Write + Send> {
+fn is_midi_target(target: &str) -> bool {
+    let target = target.to_ascii_lowercase();
+    target == "midi" || target.contains("::midi::") || target.ends_with("::midi")
+}
+
+fn is_osc_target(target: &str) -> bool {
+    let target = target.to_ascii_lowercase();
+    target == "osc" || target.contains("::osc::") || target.ends_with("::osc")
+}
+
+#[derive(Clone, Copy)]
+enum LogStream {
+    Audio,
+    Midi,
+    Osc,
+    Application,
+}
+
+fn open_writer(paths: &SharedLogPaths, stream: LogStream) -> Box<dyn Write + Send> {
     let path = paths
         .read()
-        .map(|paths| {
-            if audio {
-                paths.audio.clone()
-            } else {
-                paths.application.clone()
-            }
+        .map(|paths| match stream {
+            LogStream::Audio => paths.audio.clone(),
+            LogStream::Midi => paths.midi.clone(),
+            LogStream::Osc => paths.osc.clone(),
+            LogStream::Application => paths.application.clone(),
         })
         .unwrap_or_else(|_| std::env::temp_dir().join("TheatreShowCue_diagnostics_fallback.log"));
 
@@ -164,19 +206,16 @@ fn open_writer(paths: &SharedLogPaths, audio: bool) -> Box<dyn Write + Send> {
                 path.display()
             );
 
-            // If a removable/network folder disappears during a test session,
-            // redirect both log streams to the standard writable location.
             let fallback = default_log_directory();
             if path.parent() != Some(fallback.as_path())
                 && fs::create_dir_all(&fallback).is_ok()
                 && set_log_directory(&fallback).is_ok()
             {
-                let fallback_path = paths.read().ok().map(|paths| {
-                    if audio {
-                        paths.audio.clone()
-                    } else {
-                        paths.application.clone()
-                    }
+                let fallback_path = paths.read().ok().map(|paths| match stream {
+                    LogStream::Audio => paths.audio.clone(),
+                    LogStream::Midi => paths.midi.clone(),
+                    LogStream::Osc => paths.osc.clone(),
+                    LogStream::Application => paths.application.clone(),
                 });
                 if let Some(fallback_path) = fallback_path {
                     if let Ok(mut file) = OpenOptions::new()
@@ -217,6 +256,16 @@ pub fn set_log_directory(directory: &Path) -> anyhow::Result<()> {
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_else(|| "audio.log".into());
+    let midi_name = current
+        .midi
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "midi.log".into());
+    let osc_name = current
+        .osc
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "osc.log".into());
     let application_name = current
         .application
         .file_name()
@@ -231,6 +280,8 @@ pub fn set_log_directory(directory: &Path) -> anyhow::Result<()> {
     let next = LogPaths {
         directory: directory.to_path_buf(),
         audio: directory.join(audio_name),
+        midi: directory.join(midi_name),
+        osc: directory.join(osc_name),
         application: directory.join(application_name),
         report: directory.join(report_name),
         latest: directory.join("LATEST.txt"),
@@ -242,10 +293,9 @@ pub fn set_log_directory(directory: &Path) -> anyhow::Result<()> {
         .create(true)
         .append(true)
         .open(&next.audio)?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&next.application)?;
+    for path in [&next.midi, &next.osc, &next.application] {
+        OpenOptions::new().create(true).append(true).open(path)?;
+    }
     write_basic_report(&next.report, directory)?;
     prune_log_files(directory)?;
     write_latest_file(&next)?;
@@ -328,22 +378,12 @@ fn write_basic_report(path: &Path, directory: &Path) -> io::Result<()> {
 
 fn write_latest_file(paths: &LogPaths) -> io::Result<()> {
     let content = format!(
-        "Latest Theatre Show Cue diagnostic session\nAudio: {}\nApplication: {}\nReport: {}\n",
-        paths
-            .audio
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("audio.log"),
-        paths
-            .application
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("application.log"),
-        paths
-            .report
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("diagnostic_report.txt")
+        "Latest Theatre Show Cue diagnostic session\nAudio: {}\nMIDI: {}\nOSC: {}\nApplication: {}\nReport: {}\n",
+        paths.audio.file_name().and_then(|name| name.to_str()).unwrap_or("audio.log"),
+        paths.midi.file_name().and_then(|name| name.to_str()).unwrap_or("midi.log"),
+        paths.osc.file_name().and_then(|name| name.to_str()).unwrap_or("osc.log"),
+        paths.application.file_name().and_then(|name| name.to_str()).unwrap_or("application.log"),
+        paths.report.file_name().and_then(|name| name.to_str()).unwrap_or("diagnostic_report.txt")
     );
     fs::write(&paths.latest, content)
 }
@@ -353,6 +393,8 @@ fn write_latest_file(paths: &LogPaths) -> io::Result<()> {
 fn prune_log_files(directory: &Path) -> io::Result<()> {
     for (prefix, extension) in [
         ("audio_", "log"),
+        ("midi_", "log"),
+        ("osc_", "log"),
         ("application_", "log"),
         ("diagnostic_report_", "txt"),
     ] {
@@ -397,9 +439,12 @@ fn prune_log_files(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Count the retained diagnostic files in a folder: audio, application and reports.
-pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usize)> {
+/// Count retained diagnostic files in a folder:
+/// audio, MIDI, OSC, application logs and diagnostic reports.
+pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usize, usize, usize)> {
     let mut audio = 0usize;
+    let mut midi = 0usize;
+    let mut osc = 0usize;
     let mut application = 0usize;
     let mut reports = 0usize;
 
@@ -417,13 +462,14 @@ pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usi
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("audio_")
-            && entry.path().extension().and_then(|value| value.to_str()) == Some("log")
-        {
+        let is_log = entry.path().extension().and_then(|value| value.to_str()) == Some("log");
+        if is_log && name.starts_with("audio_") {
             audio += 1;
-        } else if name.starts_with("application_")
-            && entry.path().extension().and_then(|value| value.to_str()) == Some("log")
-        {
+        } else if is_log && name.starts_with("midi_") {
+            midi += 1;
+        } else if is_log && name.starts_with("osc_") {
+            osc += 1;
+        } else if is_log && name.starts_with("application_") {
             application += 1;
         } else if name.starts_with("diagnostic_report_")
             && entry.path().extension().and_then(|value| value.to_str()) == Some("txt")
@@ -432,7 +478,7 @@ pub fn diagnostic_file_counts(directory: &Path) -> io::Result<(usize, usize, usi
         }
     }
 
-    Ok((audio, application, reports))
+    Ok((audio, midi, osc, application, reports))
 }
 
 #[derive(Debug)]
@@ -469,11 +515,13 @@ fn write_zip_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
 fn is_diagnostic_archive_member(name: &str) -> bool {
     name == "LATEST.txt"
         || (name.starts_with("audio_") && name.ends_with(".log"))
+        || (name.starts_with("midi_") && name.ends_with(".log"))
+        || (name.starts_with("osc_") && name.ends_with(".log"))
         || (name.starts_with("application_") && name.ends_with(".log"))
         || (name.starts_with("diagnostic_report_") && name.ends_with(".txt"))
 }
 
-/// Export only Theatre Show Cue's own log files and LATEST.txt into a standard
+/// Export Theatre Show Cue's own log files and LATEST.txt into a standard
 /// ZIP archive. Uses ZIP's Store method so no additional compression crate is
 /// required and the text logs remain directly inspectable.
 pub fn create_diagnostic_archive(directory: &Path, destination: &Path) -> anyhow::Result<usize> {
@@ -648,10 +696,21 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_targets_are_routed_to_their_own_streams() {
+        assert!(super::is_audio_target("TaSQ::audio::engine"));
+        assert!(super::is_midi_target("TaSQ::midi::input"));
+        assert!(super::is_osc_target("TaSQ::osc::server"));
+        assert!(!super::is_midi_target("TaSQ::app"));
+        assert!(!super::is_osc_target("TaSQ::app"));
+    }
+
+    #[test]
     fn diagnostic_archive_contains_only_owned_files() {
         let directory = std::env::temp_dir().join(format!("tasq-log-archive-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("audio_test.log"), "audio").unwrap();
+        fs::write(directory.join("midi_test.log"), "midi").unwrap();
+        fs::write(directory.join("osc_test.log"), "osc").unwrap();
         fs::write(directory.join("application_test.log"), "application").unwrap();
         fs::write(directory.join("diagnostic_report_test.txt"), "report").unwrap();
         fs::write(directory.join("LATEST.txt"), "latest").unwrap();
@@ -661,7 +720,7 @@ mod tests {
         let count = super::create_diagnostic_archive(&directory, &archive_path).unwrap();
         let archive = fs::read(&archive_path).unwrap();
 
-        assert_eq!(count, 4);
+        assert_eq!(count, 6);
         assert_eq!(&archive[..4], b"PK\x03\x04");
         assert!(archive.windows(4).any(|window| window == b"PK\x01\x02"));
         assert!(archive.windows(4).any(|window| window == b"PK\x05\x06"));
@@ -679,6 +738,8 @@ mod tests {
 
         for index in 0..35 {
             fs::write(directory.join(format!("audio_{index:03}.log")), "audio").unwrap();
+            fs::write(directory.join(format!("midi_{index:03}.log")), "midi").unwrap();
+            fs::write(directory.join(format!("osc_{index:03}.log")), "osc").unwrap();
             fs::write(
                 directory.join(format!("application_{index:03}.log")),
                 "application",
@@ -695,7 +756,13 @@ mod tests {
 
         prune_log_files(&directory).unwrap();
 
-        for prefix in ["audio_", "application_", "diagnostic_report_"] {
+        for prefix in [
+            "audio_",
+            "midi_",
+            "osc_",
+            "application_",
+            "diagnostic_report_",
+        ] {
             let count = fs::read_dir(&directory)
                 .unwrap()
                 .filter_map(Result::ok)

@@ -57,27 +57,4 @@ impl SessionReport {
         info!("Session report saved: {:?}", path);
         Ok(path)
     }
-
-    pub fn to_text_summary(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("=== Session Report: {} ===\n", self.project_name));
-        if let Some(start) = self.session_start {
-            out.push_str(&format!("Start: {}\n", start.format("%Y-%m-%d %H:%M:%S")));
-        }
-        if let Some(end) = self.session_end {
-            out.push_str(&format!("End:   {}\n", end.format("%Y-%m-%d %H:%M:%S")));
-        }
-        out.push_str(&format!("Events: {}\n\n", self.events.len()));
-        for e in &self.events {
-            out.push_str(&format!(
-                "[{}] {} — {} {} ({:.1}s)\n",
-                e.timestamp.format("%H:%M:%S"),
-                e.cue_number,
-                e.cue_name,
-                e.action,
-                e.duration_played_secs
-            ));
-        }
-        out
-    }
 }

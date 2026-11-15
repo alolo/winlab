@@ -31,30 +31,70 @@ impl Default for ProjectSettings {
     }
 }
 
+/// Project-scoped logical audio configuration. Keys use the same
+/// `backend::device-name` identity as the audio engine so a project can retain
+/// a distinct mapping and default stereo pair for every endpoint it uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectAudioRouting {
+    /// Logical TaSQ output slot -> native driver channel index, per endpoint.
+    pub output_channel_orders: std::collections::HashMap<String, Vec<usize>>,
+    /// Default stereo left/right logical TaSQ output slots, per endpoint.
+    pub default_output_pairs: std::collections::HashMap<String, [usize; 2]>,
+}
+
+impl ProjectAudioRouting {
+    pub fn from_maps(
+        output_channel_orders: std::collections::HashMap<String, Vec<usize>>,
+        default_output_pairs: std::collections::HashMap<String, [usize; 2]>,
+    ) -> Self {
+        Self {
+            output_channel_orders,
+            default_output_pairs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub version: u32,
     pub settings: ProjectSettings,
     pub cue_list: CueList,
+    /// None means this is a legacy project created before audio routing was
+    /// stored per project. The app migrates it from workstation defaults once.
+    #[serde(default)]
+    pub audio_routing: Option<ProjectAudioRouting>,
 }
 
 impl Default for Project {
     fn default() -> Self {
         Self {
-            // Version 3 stores per-Cue routing in logical TaSQ output slots;
-            // the native driver channel is resolved at audio playback time.
-            version: 3,
+            // Version 4 stores both per-Cue logical routes and the project's
+            // endpoint-specific Logical Output Mapping / Default Stereo Pair.
+            version: 4,
             settings: ProjectSettings::default(),
             cue_list: CueList::new("Main"),
+            audio_routing: Some(ProjectAudioRouting::default()),
         }
     }
 }
 
 impl Project {
+    pub fn with_audio_routing(audio_routing: ProjectAudioRouting) -> Self {
+        Self {
+            audio_routing: Some(audio_routing),
+            ..Self::default()
+        }
+    }
+
     /// Save media paths relative to the project file whenever the media is
     /// inside the project directory. External media references remain absolute.
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut project = self.clone();
+        project.version = project.version.max(4);
+        project
+            .audio_routing
+            .get_or_insert_with(ProjectAudioRouting::default);
 
         let is_backup = path
             .parent()
@@ -94,6 +134,10 @@ impl Project {
     /// backup can be opened directly without losing its media references.
     pub fn save_backup(&self, backup_path: &Path, source_project_path: &Path) -> Result<()> {
         let mut project = self.clone();
+        project.version = project.version.max(4);
+        project
+            .audio_routing
+            .get_or_insert_with(ProjectAudioRouting::default);
         let source_project_dir = project_directory(source_project_path);
 
         for cue in &mut project.cue_list.cues {
@@ -220,11 +264,121 @@ fn project_directory(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod project_version_tests {
-    use super::Project;
+    use super::{Project, ProjectAudioRouting};
+    use crate::config::AudioBackend;
+    use crate::cue::{ChannelRoute, Cue};
+    use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
-    fn new_projects_use_version_three_for_logical_audio_routes() {
-        assert_eq!(Project::default().version, 3);
+    fn cue_endpoint_and_logical_routes_round_trip_in_project_file() {
+        let path =
+            std::env::temp_dir().join(format!("tasq-routing-roundtrip-{}.tsq", Uuid::new_v4()));
+        let mut project = Project::with_audio_routing(ProjectAudioRouting::from_maps(
+            [(
+                "WASAPI::Creative Sound Blaster Omni".to_string(),
+                vec![2, 3, 0, 1],
+            )]
+            .into_iter()
+            .collect(),
+            [("WASAPI::Creative Sound Blaster Omni".to_string(), [2, 3])]
+                .into_iter()
+                .collect(),
+        ));
+        let mut cue = Cue::new_audio(PathBuf::from("audio/test.wav"));
+        cue.io.output_device = Some("Creative Sound Blaster Omni".to_string());
+        cue.io.output_device_id = Some("wasapi:{creative-endpoint}".to_string());
+        cue.io.output_backend = Some(AudioBackend::Wasapi);
+        cue.io.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 2,
+                output_channels: vec![2],
+                gain_db: -3.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 3,
+                output_channels: vec![3],
+                gain_db: -1.5,
+            },
+        ];
+        cue.io.output_gains_db = vec![0.0, -1.0, -2.0, -3.0];
+        project.cue_list.add(cue);
+
+        project.save(&path).expect("project should save");
+        let loaded = Project::load(&path).expect("project should load");
+        let loaded_cue = loaded.cue_list.cues.first().expect("cue should persist");
+
+        assert_eq!(
+            loaded_cue.io.output_device.as_deref(),
+            Some("Creative Sound Blaster Omni")
+        );
+        assert_eq!(
+            loaded_cue.io.output_device_id.as_deref(),
+            Some("wasapi:{creative-endpoint}")
+        );
+        assert_eq!(loaded_cue.io.output_backend, Some(AudioBackend::Wasapi));
+        assert_eq!(loaded_cue.io.channel_routes[0].output_channels, vec![2]);
+        assert_eq!(loaded_cue.io.channel_routes[1].output_channels, vec![3]);
+        assert_eq!(loaded_cue.io.output_gains_db, vec![0.0, -1.0, -2.0, -3.0]);
+        let audio_routing = loaded
+            .audio_routing
+            .as_ref()
+            .expect("project audio routing should persist");
+        assert_eq!(
+            audio_routing.output_channel_orders["WASAPI::Creative Sound Blaster Omni"],
+            vec![2, 3, 0, 1]
+        );
+        assert_eq!(
+            audio_routing.default_output_pairs["WASAPI::Creative Sound Blaster Omni"],
+            [2, 3]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_backup_preserves_project_scoped_audio_routing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("tasq-audio-routing-backup-{}", Uuid::new_v4()));
+        let project_path = temp_dir.join("Show.tsq");
+        let backup_dir = temp_dir.join("backup");
+        let backup_path = backup_dir.join("Show__snapshot.tsq");
+        std::fs::create_dir_all(&temp_dir).expect("temp project directory should be created");
+
+        let project = Project::with_audio_routing(ProjectAudioRouting::from_maps(
+            [("ASIO::TASCAM".to_string(), vec![4, 5, 0, 1, 2, 3])]
+                .into_iter()
+                .collect(),
+            [("ASIO::TASCAM".to_string(), [2, 3])].into_iter().collect(),
+        ));
+        project
+            .save_backup(&backup_path, &project_path)
+            .expect("project backup should save");
+
+        let loaded = Project::load(&backup_path).expect("project backup should load");
+        let routing = loaded
+            .audio_routing
+            .as_ref()
+            .expect("backup should include project audio routing");
+        assert_eq!(
+            routing.output_channel_orders["ASIO::TASCAM"],
+            vec![4, 5, 0, 1, 2, 3]
+        );
+        assert_eq!(routing.default_output_pairs["ASIO::TASCAM"], [2, 3]);
+        assert_eq!(loaded.version, 4);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn new_projects_use_version_four_and_include_project_audio_routing() {
+        let project = Project::default();
+        assert_eq!(project.version, 4);
+        assert!(project.audio_routing.is_some());
     }
 
     #[test]
@@ -245,5 +399,6 @@ mod project_version_tests {
         let project: Project =
             serde_json::from_str(json).expect("version-one projects should still load");
         assert_eq!(project.version, 1);
+        assert!(project.audio_routing.is_none());
     }
 }

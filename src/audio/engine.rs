@@ -3,12 +3,16 @@
 use crate::audio::device_registry::{
     AudioEndpoint, DeviceAvailability, DeviceRegistry, DeviceScanResult,
 };
+use crate::audio::worker::{
+    run_audio_worker_manager, spawn_audio_worker, AudioWorkerJobSupervisor,
+    AudioWorkerManagerEvent, WorkerEngineMetadata, WorkerStartupConfig, WORKER_PROTOCOL_VERSION,
+};
 use crate::audio::OutputChannelInfo;
 use crate::config::{AudioBackend, AudioPerformanceSettings};
 use crate::cue::{ChannelRoute, CueState, FadeCurve, OutputChannelSetting, TimePitchSettings};
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::{Device, Host};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, Host, Sample};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::RwLock;
 use rodio::Source;
@@ -22,7 +26,7 @@ use std::mem::MaybeUninit;
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -30,6 +34,35 @@ use uuid::Uuid;
 
 type SharedOutputSettings = Arc<RwLock<Vec<OutputChannelSetting>>>;
 type OutputSettingsByDevice = Arc<RwLock<HashMap<String, SharedOutputSettings>>>;
+const AUDIO_MANAGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const AUDIO_MANAGER_FORCE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// Playback payload shared by a single Worker batch. Endpoint selection is
+/// already resolved by the parent Worker Manager, so every cue in this batch
+/// belongs to the same native output stream.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioPlayRequest {
+    pub id: Uuid,
+    pub generation: u64,
+    pub file: PathBuf,
+    pub start_secs: f64,
+    pub end_secs: Option<f64>,
+    pub duration_secs: f64,
+    pub volume: f32,
+    pub volume_automation_enabled: bool,
+    pub volume_automation: Vec<[f64; 2]>,
+    pub time_pitch: TimePitchSettings,
+    pub fade_in_secs: f64,
+    pub fade_out_secs: f64,
+    pub fade_curve: FadeCurve,
+    pub custom_fade_points: Vec<[f32; 2]>,
+    pub channel_routes: Vec<ChannelRoute>,
+    pub output_gains_db: Vec<f32>,
+    pub loop_enabled: bool,
+    pub loop_start: f64,
+    pub loop_end: f64,
+    pub loop_count: i32,
+}
 
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
@@ -40,6 +73,9 @@ pub enum AudioCommand {
         file: PathBuf,
         /// None uses the global output device; Some selects a per-cue device.
         output_device: Option<String>,
+        /// Backend and stable identity for an explicit per-Cue endpoint.
+        output_backend: Option<AudioBackend>,
+        output_device_id: Option<String>,
         start_secs: f64,
         end_secs: Option<f64>,
         duration_secs: f64,
@@ -57,6 +93,23 @@ pub enum AudioCommand {
         loop_start: f64,
         loop_end: f64,
         loop_count: i32, // -1 = бесконечный, >0 = число повторов
+    },
+    /// Internal child-Worker command: prepare several cues and arm them against
+    /// one output sample-frame clock. A batch is created from an explicit launch
+    /// transaction, never by guessing from the arrival-time distance between
+    /// independent Play commands.
+    PlayBatch {
+        transaction_id: Uuid,
+        cues: Vec<AudioPlayRequest>,
+    },
+    /// GUI -> Worker Manager boundary for one logical GO/Auto-Continue launch.
+    /// The manager forwards these markers only to endpoint workers that receive
+    /// at least one Play command inside this transaction.
+    BeginLaunchTransaction {
+        transaction_id: Uuid,
+    },
+    EndLaunchTransaction {
+        transaction_id: Uuid,
     },
     Stop(Uuid),
     StopAll,
@@ -88,6 +141,7 @@ pub enum AudioCommand {
     },
     SetOutputDevice {
         device_name: String,
+        endpoint_id: Option<String>,
         performance: AudioPerformanceSettings,
         reply: Sender<Result<(usize, u32), String>>,
     },
@@ -112,10 +166,24 @@ pub enum AudioCommand {
         id: Uuid,
         gains_db: Vec<f32>,
     },
+    SetOutputChannelSettings {
+        device_name: String,
+        settings: Vec<OutputChannelSetting>,
+    },
+    /// Manager-only snapshot of workstation-wide endpoint preferences. The
+    /// manager applies the matching profile whenever it starts an endpoint worker.
+    SetEndpointPreferences {
+        performance_settings_by_device: HashMap<String, AudioPerformanceSettings>,
+        output_channel_settings_by_device: HashMap<String, Vec<OutputChannelSetting>>,
+    },
+    /// Fresh endpoint availability snapshot from the background hot-plug monitor.
+    UpdateDeviceRegistry {
+        endpoints: Vec<AudioEndpoint>,
+    },
     Shutdown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PositionUpdate {
     pub id: Uuid,
     pub generation: u64,
@@ -257,9 +325,63 @@ fn supported_output_buffer_sizes(device: &Device, backend: AudioBackend) -> Vec<
 }
 
 fn preferred_output_config(
+    backend: AudioBackend,
     device: &Device,
     requested_sample_rate: Option<u32>,
 ) -> Option<cpal::SupportedStreamConfig> {
+    // WASAPI Shared follows the Windows endpoint mix format unless the user
+    // explicitly selects another supported rate. ASIO always follows the
+    // driver's currently selected hardware clock and never accepts an override.
+    if backend == AudioBackend::Wasapi {
+        if let Ok(default_config) = device.default_output_config() {
+            match requested_sample_rate {
+                None => return Some(default_config),
+                Some(rate) if default_config.sample_rate() == rate => {
+                    return Some(default_config);
+                }
+                Some(rate) => {
+                    let default_channels = default_config.channels();
+                    if let Ok(configs) = device.supported_output_configs() {
+                        if let Some(config) = configs
+                            .filter(|config| {
+                                config.channels() == default_channels && config.contains_rate(rate)
+                            })
+                            .map(|config| config.with_sample_rate(rate))
+                            .next()
+                        {
+                            return Some(config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if backend == AudioBackend::Asio {
+        let default_config = device.default_output_config().ok()?;
+        let driver_rate = default_config.sample_rate();
+        let preferred_format = default_config.sample_format();
+        debug!(
+            "ASIO driver current clock: {} Hz ({:?}); TaSQ performance overrides are ignored",
+            driver_rate, preferred_format
+        );
+        if let Ok(configs) = device.supported_output_configs() {
+            if let Some(config) = configs
+                .filter(|config| config.contains_rate(driver_rate))
+                .max_by_key(|config| {
+                    (
+                        config.channels(),
+                        (config.sample_format() == preferred_format) as u8,
+                        (config.sample_format() == cpal::SampleFormat::F32) as u8,
+                    )
+                })
+            {
+                return Some(config.with_sample_rate(driver_rate));
+            }
+        }
+        return Some(default_config);
+    }
+
     let configs: Vec<_> = device.supported_output_configs().ok()?.collect();
     let max_channels = configs.iter().map(|config| config.channels()).max()?;
     let config = configs
@@ -320,8 +442,11 @@ pub struct AudioEngine {
     pub supported_buffer_sizes: Vec<u32>,
     output_device_channels: HashMap<String, usize>,
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
-    /// Per-device output mute/trim settings shared with the audio worker.
+    /// Per-device output mute/trim settings shared with the active backend worker.
     output_settings_by_device: OutputSettingsByDevice,
+    /// Workstation output settings for endpoints owned by other backend workers.
+    /// The manager forwards these settings when a per-Cue worker is created.
+    endpoint_output_channel_settings: Arc<RwLock<HashMap<String, Vec<OutputChannelSetting>>>>,
     /// Optional channel names reported by the native ASIO driver, keyed by CPAL device name.
     output_driver_channel_info: HashMap<String, Vec<OutputChannelInfo>>,
     /// User-defined aliases override driver-provided names but never change routing indices.
@@ -331,6 +456,18 @@ pub struct AudioEngine {
     /// Stored per device so non-standard driver orders do not affect other interfaces.
     output_channel_orders: HashMap<String, Vec<usize>>,
     detected_default_output_pairs: HashMap<String, [usize; 2]>,
+    /// Present only inside an audio child process; joins the in-process render thread on shutdown.
+    audio_thread: Option<std::thread::JoinHandle<()>>,
+    /// Present only in the GUI process; routes commands across endpoint workers.
+    worker_manager_thread: Option<std::thread::JoinHandle<()>>,
+    worker_manager_shutdown: Option<Arc<AtomicBool>>,
+    /// Manager-to-GUI notifications for endpoint loss and asynchronous recovery.
+    worker_event_rx: Option<Receiver<AudioWorkerManagerEvent>>,
+    /// Lock-free sample-peak accumulator updated by each output mix callback.
+    /// In worker-child mode the IPC loop drains it at 10 Hz for the GUI meter.
+    output_peak_meter: Arc<AtomicU32>,
+    /// Supervises isolated worker processes and can terminate them if manager shutdown stalls.
+    worker_job_supervisor: Option<Arc<AudioWorkerJobSupervisor>>,
 }
 
 impl AudioEngine {
@@ -373,6 +510,7 @@ impl AudioEngine {
         selected_device: Option<&str>,
         performance: AudioPerformanceSettings,
     ) -> Result<Self> {
+        let performance = AudioPerformanceSettings::for_backend(backend, performance);
         let device_registry = DeviceRegistry::from_scan(Self::scan_output_endpoints());
         Self::new_with_backend_and_endpoint_using_registry_and_performance(
             backend,
@@ -387,9 +525,110 @@ impl AudioEngine {
         backend: AudioBackend,
         selected_device_id: Option<&str>,
         selected_device: Option<&str>,
-        mut device_registry: DeviceRegistry,
+        device_registry: DeviceRegistry,
         performance: AudioPerformanceSettings,
     ) -> Result<Self> {
+        let performance = AudioPerformanceSettings::for_backend(backend, performance);
+        let config = WorkerStartupConfig {
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            backend,
+            selected_device_id: selected_device_id.map(str::to_owned),
+            selected_device: selected_device.map(str::to_owned),
+            performance,
+            include_full_device_metadata: true,
+            registry_endpoints: Some(device_registry.snapshot_endpoints()),
+        };
+        let job_supervisor = AudioWorkerJobSupervisor::new();
+        let spawned = spawn_audio_worker(config, job_supervisor.clone())?;
+        let metadata = spawned.metadata.clone();
+
+        let registry = if metadata.registry_endpoints.is_empty() {
+            device_registry
+        } else {
+            DeviceRegistry::from_endpoints(metadata.registry_endpoints.clone())
+        };
+
+        let mut output_device_channels = metadata.output_device_channels.clone();
+        output_device_channels
+            .entry(metadata.current_device.clone())
+            .or_insert(metadata.output_channels.max(1));
+        let mut output_device_channel_layouts = metadata.output_device_channel_layouts.clone();
+        output_device_channel_layouts
+            .entry(metadata.current_device.clone())
+            .or_insert_with(|| vec![metadata.output_channels.max(1)]);
+
+        let output_settings_by_device = Arc::new(RwLock::new(HashMap::new()));
+        for (device_name, channels) in &output_device_channels {
+            let _ =
+                shared_output_settings(&output_settings_by_device, device_name, (*channels).max(1));
+        }
+
+        // Driver initialization can take several seconds. An unbounded control
+        // queue prevents a slow worker startup from blocking the GUI thread.
+        let (manager_command_tx, manager_command_rx) = unbounded::<AudioCommand>();
+        let (manager_position_tx, manager_position_rx) = bounded::<PositionUpdate>(4096);
+        let manager_registry_endpoints = registry.snapshot_endpoints();
+        let manager_shutdown = Arc::new(AtomicBool::new(false));
+        let manager_shutdown_thread = manager_shutdown.clone();
+        let manager_job_supervisor = job_supervisor.clone();
+        let (manager_event_tx, manager_event_rx) = unbounded::<AudioWorkerManagerEvent>();
+        let manager_thread = std::thread::Builder::new()
+            .name("tasq-audio-worker-manager".to_string())
+            .spawn(move || {
+                run_audio_worker_manager(
+                    spawned,
+                    manager_command_rx,
+                    manager_position_tx,
+                    manager_registry_endpoints,
+                    manager_shutdown_thread,
+                    manager_job_supervisor,
+                    manager_event_tx,
+                );
+            })
+            .map_err(|error| anyhow::anyhow!("Could not start audio worker manager: {error}"))?;
+
+        Ok(Self {
+            backend: metadata.backend,
+            cmd_tx: manager_command_tx,
+            pos_rx: manager_position_rx,
+            output_devices: metadata.output_devices,
+            device_registry: registry,
+            input_devices: metadata.input_devices,
+            current_device: metadata.current_device,
+            current_device_id: metadata.current_device_id,
+            current_input_device: metadata.current_input_device,
+            output_channels: metadata.output_channels,
+            current_sample_rate: metadata.current_sample_rate,
+            performance_settings: metadata.performance_settings,
+            supported_sample_rates: metadata.supported_sample_rates,
+            supported_buffer_sizes: metadata.supported_buffer_sizes,
+            output_device_channels,
+            output_device_channel_layouts,
+            output_settings_by_device,
+            endpoint_output_channel_settings: Arc::new(RwLock::new(HashMap::new())),
+            output_driver_channel_info: metadata.output_driver_channel_info,
+            output_channel_names: HashMap::new(),
+            default_output_pairs: HashMap::new(),
+            output_channel_orders: HashMap::new(),
+            detected_default_output_pairs: metadata.detected_default_output_pairs,
+            audio_thread: None,
+            worker_manager_thread: Some(manager_thread),
+            worker_manager_shutdown: Some(manager_shutdown),
+            worker_event_rx: Some(manager_event_rx),
+            output_peak_meter: Arc::new(AtomicU32::new(0)),
+            worker_job_supervisor: Some(job_supervisor),
+        })
+    }
+
+    pub(crate) fn new_in_process_with_backend_and_endpoint_using_registry_and_performance(
+        backend: AudioBackend,
+        selected_device_id: Option<&str>,
+        selected_device: Option<&str>,
+        mut device_registry: DeviceRegistry,
+        performance: AudioPerformanceSettings,
+        include_full_device_metadata: bool,
+    ) -> Result<Self> {
+        let performance = AudioPerformanceSettings::for_backend(backend, performance);
         if backend == AudioBackend::DirectSound {
             #[cfg(target_os = "windows")]
             {
@@ -431,6 +670,7 @@ impl AudioEngine {
             }
         }
 
+        let endpoint_init_started = Instant::now();
         let host = host_for_backend(backend).map_err(|error| {
             error!(
                 "Could not initialize {} audio host: {error:#}",
@@ -438,13 +678,6 @@ impl AudioEngine {
             );
             error
         })?;
-        let output_devices = Self::list_output_devices(&host);
-        info!(
-            "Enumerated {} output device(s) for {}: {:?}",
-            output_devices.len(),
-            backend.label(),
-            output_devices
-        );
         let out_dev = if let Some(selected_id) = selected_device_id {
             let parsed_id = selected_id.parse::<cpal::DeviceId>().ok();
             let by_id = parsed_id
@@ -495,12 +728,60 @@ impl AudioEngine {
         let out_name = out_dev.to_string();
         let out_id = Self::cpal_endpoint_id(backend, &out_dev, &out_name);
 
+        // A per-Cue isolated worker owns one endpoint only. Enumerating every
+        // ASIO input/output port in that process can take several seconds and
+        // delays the first GO. The global worker still collects the complete
+        // inventory for the settings UI.
+        let output_devices = if include_full_device_metadata {
+            Self::list_output_devices(&host)
+        } else {
+            vec![out_name.clone()]
+        };
+        info!(
+            "Enumerated {} output device(s) for {} (full metadata={}): {:?}",
+            output_devices.len(),
+            backend.label(),
+            include_full_device_metadata,
+            output_devices
+        );
+
         // No vendor-specific ASIO probes or hardcoded Computer Bus mapping.
         // CPAL's stream order is authoritative; generic channel labels are
         // used until a backend exposes driver-native names directly.
         let output_driver_channel_info: HashMap<String, Vec<OutputChannelInfo>> = HashMap::new();
-        let (output_device_channels, output_device_channel_layouts) =
-            Self::list_output_device_info(&host);
+        let (mut output_device_channels, mut output_device_channel_layouts) =
+            if include_full_device_metadata {
+                Self::list_output_device_info(&host)
+            } else {
+                (HashMap::new(), HashMap::new())
+            };
+
+        let output_config = preferred_output_config(backend, &out_dev, performance.sample_rate)
+            .or_else(|| {
+                out_dev.default_output_config().ok().filter(|config| {
+                    performance
+                        .sample_rate
+                        .map_or(true, |rate| config.sample_rate() == rate)
+                })
+            })
+            .ok_or_else(|| {
+                if let Some(rate) = performance.sample_rate {
+                    anyhow::anyhow!(
+                        "{} does not expose a supported output configuration at {} Hz",
+                        out_name,
+                        rate
+                    )
+                } else {
+                    anyhow::anyhow!("No supported output configuration found for {}", out_name)
+                }
+            })?;
+        let preferred_output_channels = output_config.channels() as usize;
+        if !include_full_device_metadata {
+            output_device_channels.insert(out_name.clone(), preferred_output_channels.max(1));
+            output_device_channel_layouts
+                .insert(out_name.clone(), vec![preferred_output_channels.max(1)]);
+        }
+
         for device_name in &output_devices {
             let channels = output_device_channels
                 .get(device_name)
@@ -523,37 +804,31 @@ impl AudioEngine {
                 availability: DeviceAvailability::Available,
             });
         }
-        let input_devices = Self::list_input_devices(&host);
+
+        let input_devices = if include_full_device_metadata {
+            Self::list_input_devices(&host)
+        } else {
+            Vec::new()
+        };
         info!(
-            "Enumerated {} input device(s) for {}: {:?}",
+            "Enumerated {} input device(s) for {} (full metadata={}): {:?}",
             input_devices.len(),
             backend.label(),
+            include_full_device_metadata,
             input_devices
         );
 
-        let output_config = preferred_output_config(&out_dev, performance.sample_rate)
-            .or_else(|| {
-                out_dev.default_output_config().ok().filter(|config| {
-                    performance
-                        .sample_rate
-                        .map_or(true, |rate| config.sample_rate() == rate)
-                })
-            })
-            .ok_or_else(|| {
-                if let Some(rate) = performance.sample_rate {
-                    anyhow::anyhow!(
-                        "{} does not expose a supported output configuration at {} Hz",
-                        out_name,
-                        rate
-                    )
-                } else {
-                    anyhow::anyhow!("No supported output configuration found for {}", out_name)
-                }
-            })?;
-        let supported_sample_rates = supported_output_sample_rates(&out_dev);
-        let driver_buffer_sizes = supported_output_buffer_sizes(&out_dev, backend);
+        let supported_sample_rates = if include_full_device_metadata {
+            supported_output_sample_rates(&out_dev)
+        } else {
+            vec![output_config.sample_rate()]
+        };
+        let driver_buffer_sizes = if include_full_device_metadata {
+            supported_output_buffer_sizes(&out_dev, backend)
+        } else {
+            Vec::new()
+        };
         let supported_buffer_sizes = buffer_size_options_for_backend(backend, &driver_buffer_sizes);
-        let preferred_output_channels = output_config.channels() as usize;
         info!(
             "Selected output configuration for '{}': {} channels @ {} Hz, {:?}",
             out_name,
@@ -561,10 +836,13 @@ impl AudioEngine {
             output_config.sample_rate(),
             output_config.sample_format()
         );
-        let in_name = host
-            .default_input_device()
-            .map(|device| device.to_string())
-            .unwrap_or_else(|| "Default Input".to_string());
+        let in_name = if include_full_device_metadata {
+            host.default_input_device()
+                .map(|device| device.to_string())
+                .unwrap_or_else(|| "Default Input".to_string())
+        } else {
+            "Not enumerated for per-Cue endpoint worker".to_string()
+        };
 
         info!(
             "Audio backend: {}; Output: {}, Input: {}",
@@ -572,6 +850,12 @@ impl AudioEngine {
             out_name,
             in_name
         );
+
+        // Release the enumeration-thread CPAL endpoint/host before the render
+        // thread resolves its own native handle. Some WASAPI vendor drivers
+        // keep apartment-bound endpoint references alive for the host lifetime.
+        drop(out_dev);
+        drop(host);
 
         let (cmd_tx, cmd_rx) = bounded::<AudioCommand>(256);
         let (pos_tx, pos_rx) = bounded::<PositionUpdate>(1024);
@@ -583,17 +867,20 @@ impl AudioEngine {
         );
         let worker_output_settings = output_settings_by_device.clone();
         let worker_default_device = out_name.clone();
+        let worker_default_device_id = out_id.clone();
+        let output_peak_meter = Arc::new(AtomicU32::new(0));
+        let worker_output_peak_meter = output_peak_meter.clone();
         let (ready_tx, ready_rx) = bounded::<Result<(usize, u32), String>>(1);
 
-        std::thread::spawn(move || {
+        let audio_thread = std::thread::spawn(move || {
             audio_worker(
                 backend,
-                out_dev,
-                output_config,
+                worker_default_device_id,
                 worker_default_device,
                 cmd_rx,
                 pos_tx,
                 worker_output_settings,
+                worker_output_peak_meter,
                 performance,
                 ready_tx,
             );
@@ -605,6 +892,15 @@ impl AudioEngine {
                 anyhow::anyhow!("Audio output initialization did not respond: {error}")
             })?
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        info!(
+            "Audio endpoint initialization completed in {:.1} ms: {} — '{}' ({} channels @ {} Hz; full metadata={})",
+            endpoint_init_started.elapsed().as_secs_f64() * 1_000.0,
+            backend.short_label(),
+            out_name,
+            output_channels,
+            actual_sample_rate,
+            include_full_device_metadata
+        );
         let output_device_channels = {
             let mut channels = output_device_channels;
             channels.insert(out_name.clone(), output_channels);
@@ -649,11 +945,18 @@ impl AudioEngine {
             output_device_channels,
             output_device_channel_layouts,
             output_settings_by_device,
+            endpoint_output_channel_settings: Arc::new(RwLock::new(HashMap::new())),
             output_driver_channel_info,
             output_channel_names: HashMap::new(),
             default_output_pairs: HashMap::new(),
             output_channel_orders: HashMap::new(),
             detected_default_output_pairs,
+            audio_thread: Some(audio_thread),
+            worker_manager_thread: None,
+            worker_manager_shutdown: None,
+            worker_event_rx: None,
+            output_peak_meter,
+            worker_job_supervisor: None,
         })
     }
 
@@ -666,14 +969,17 @@ impl AudioEngine {
         let (pos_tx, pos_rx) = bounded::<PositionUpdate>(1024);
         let output_settings_by_device = Arc::new(RwLock::new(HashMap::new()));
         let worker_output_settings = output_settings_by_device.clone();
+        let output_peak_meter = Arc::new(AtomicU32::new(0));
+        let worker_output_peak_meter = output_peak_meter.clone();
         let (ready_tx, ready_rx) = bounded::<Result<DirectSoundInitInfo, String>>(1);
 
-        std::thread::spawn(move || {
+        let audio_thread = std::thread::spawn(move || {
             audio_worker_directsound(
                 selected_device,
                 cmd_rx,
                 pos_tx,
                 worker_output_settings,
+                worker_output_peak_meter,
                 performance,
                 ready_tx,
             );
@@ -727,11 +1033,18 @@ impl AudioEngine {
             output_device_channels: ready.output_device_channels,
             output_device_channel_layouts: ready.output_device_channel_layouts,
             output_settings_by_device,
+            endpoint_output_channel_settings: Arc::new(RwLock::new(HashMap::new())),
             output_driver_channel_info: HashMap::new(),
             output_channel_names: HashMap::new(),
             default_output_pairs: HashMap::new(),
             output_channel_orders: HashMap::new(),
             detected_default_output_pairs,
+            audio_thread: Some(audio_thread),
+            worker_manager_thread: None,
+            worker_manager_shutdown: None,
+            worker_event_rx: None,
+            output_peak_meter,
+            worker_job_supervisor: None,
         })
     }
 
@@ -811,10 +1124,9 @@ impl AudioEngine {
             .unwrap_or_default()
     }
 
-    /// Enumerate endpoint identities without opening streams or probing every
-    /// device's channel configurations. The registry monitor calls this on a
-    /// background thread; full channel capabilities are queried only when a
-    /// backend becomes active or a user selects a route.
+    /// Enumerate endpoint identities and supported channel layouts without
+    /// opening streams. The registry monitor calls this on a background thread;
+    /// capability queries provide the channel count needed by per-Cue routing.
     pub fn scan_output_endpoints() -> DeviceScanResult {
         Self::scan_output_endpoints_with_asio(true)
     }
@@ -843,12 +1155,20 @@ impl AudioEngine {
                         for device in devices {
                             let device_name = device.to_string();
                             let id = Self::cpal_endpoint_id(backend, &device, &device_name);
+                            // Query supported layouts without opening a stream. Per-Cue
+                            // routing needs this metadata before the endpoint worker starts.
+                            let channel_layouts = supported_output_channel_layouts(&device);
+                            let channels = channel_layouts.last().copied().unwrap_or(0);
+                            info!(
+                                "Scanned output endpoint '{}' [{}]: channels={}, layouts={:?}",
+                                device_name, id, channels, channel_layouts
+                            );
                             scan.endpoints.push(AudioEndpoint {
                                 id,
                                 backend,
                                 device_name,
-                                channels: 0,
-                                channel_layouts: Vec::new(),
+                                channels,
+                                channel_layouts,
                                 availability: DeviceAvailability::Available,
                             });
                         }
@@ -883,8 +1203,8 @@ impl AudioEngine {
                     ),
                     backend: AudioBackend::DirectSound,
                     device_name: endpoint.device_name,
-                    channels: 0,
-                    channel_layouts: Vec::new(),
+                    channels: endpoint.channels,
+                    channel_layouts: endpoint.channel_layouts,
                     availability: DeviceAvailability::Available,
                 });
             }
@@ -1036,21 +1356,72 @@ impl AudioEngine {
             .unwrap_or_default()
     }
 
-    /// Physical output count for a selected cue device. `None` means global default.
-    pub fn output_channels_for_device(&self, device_name: Option<&str>) -> usize {
-        match device_name {
-            Some(name) => self
-                .output_device_channels
-                .get(name)
-                .copied()
-                .unwrap_or(self.output_channels)
-                .max(1),
-            None => self.output_channels.max(1),
+    /// Physical output count for a selected cue endpoint. The stable registry
+    /// identity is preferred so equal display names across backends stay distinct.
+    pub fn output_channels_for_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> usize {
+        if backend == self.backend
+            && endpoint_id.is_some_and(|id| id == self.current_device_id.as_str())
+        {
+            return self.output_channels.max(1);
+        }
+
+        if let Some(endpoint) = endpoint_id
+            .and_then(|id| self.device_registry.find_by_id(id))
+            .filter(|endpoint| endpoint.backend == backend)
+        {
+            return if endpoint.channels == 0 {
+                2
+            } else {
+                endpoint.channels
+            };
+        }
+
+        if let Some(name) = device_name {
+            if backend == self.backend {
+                if let Some(channels) = self.output_device_channels.get(name) {
+                    return (*channels).max(1);
+                }
+            }
+            if let Some(endpoint) = self.device_registry.find_by_backend_name(backend, name) {
+                return if endpoint.channels == 0 {
+                    2
+                } else {
+                    endpoint.channels
+                };
+            }
+        }
+
+        if backend == self.backend && device_name.is_none() {
+            self.output_channels.max(1)
+        } else {
+            2
         }
     }
 
+    /// Physical output count for a selected cue device on the active backend.
+    /// `None` means the global default.
+    pub fn output_channels_for_device(&self, device_name: Option<&str>) -> usize {
+        let endpoint_id =
+            device_name.and_then(|name| self.registered_endpoint_id(self.backend, name));
+        let endpoint_id = endpoint_id.as_deref().or_else(|| {
+            device_name
+                .is_none()
+                .then_some(self.current_device_id.as_str())
+        });
+        self.output_channels_for_endpoint(self.backend, endpoint_id, device_name)
+    }
+
+    fn output_device_config_key_for_backend(backend: AudioBackend, device_name: &str) -> String {
+        format!("{}::{}", backend.label(), device_name)
+    }
+
     fn output_device_config_key(&self, device_name: &str) -> String {
-        format!("{}::{}", self.backend.label(), device_name)
+        Self::output_device_config_key_for_backend(self.backend, device_name)
     }
 
     /// Public key helper so AppSettings can persist calibration separately for
@@ -1059,10 +1430,91 @@ impl AudioEngine {
         self.output_device_config_key(device_name)
     }
 
-    /// The driver reports native channel indices. The default TaSQ output map
-    /// is the identity permutation on every backend and every device.
-    fn default_output_channel_order(&self, device_name: &str, channels: usize) -> Vec<usize> {
-        Self::default_output_channel_order_for(self.backend, device_name, channels)
+    pub fn output_device_settings_key_for_backend(
+        backend: AudioBackend,
+        device_name: &str,
+    ) -> String {
+        Self::output_device_config_key_for_backend(backend, device_name)
+    }
+
+    /// Publish workstation-wide per-endpoint preferences to the worker manager.
+    /// Project-scoped logical routing is intentionally not included here.
+    pub fn set_endpoint_preferences(
+        &self,
+        performance_settings_by_device: HashMap<String, AudioPerformanceSettings>,
+        output_channel_settings_by_device: HashMap<String, Vec<OutputChannelSetting>>,
+    ) {
+        *self.endpoint_output_channel_settings.write() = output_channel_settings_by_device.clone();
+        self.send(AudioCommand::SetEndpointPreferences {
+            performance_settings_by_device,
+            output_channel_settings_by_device,
+        });
+    }
+
+    /// Publish the latest endpoint availability snapshot to the worker manager.
+    pub fn update_device_registry(&self) {
+        self.send(AudioCommand::UpdateDeviceRegistry {
+            endpoints: self.device_registry.snapshot_endpoints(),
+        });
+    }
+
+    /// True when the isolated render thread exited while its Worker control
+    /// process is still running. The child IPC loop uses this to surface native
+    /// stream failures to the parent supervisor.
+    pub(crate) fn audio_thread_finished(&self) -> bool {
+        self.audio_thread
+            .as_ref()
+            .is_some_and(|audio_thread| audio_thread.is_finished())
+    }
+
+    pub(crate) fn drain_worker_manager_events(&self) -> Vec<AudioWorkerManagerEvent> {
+        let mut events = Vec::new();
+        if let Some(receiver) = self.worker_event_rx.as_ref() {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Take the maximum absolute sample from the final mixed output since the previous read.
+    /// This is consumed by the audio worker's IPC loop, not by the output callback.
+    pub(crate) fn take_output_peak(&self) -> f32 {
+        f32::from_bits(self.output_peak_meter.swap(0, Ordering::Relaxed)).max(0.0)
+    }
+
+    /// Refresh global-output metadata after its endpoint worker has been
+    /// recreated. Project routing maps are deliberately left untouched.
+    pub(crate) fn apply_recovered_worker_metadata(&mut self, metadata: &WorkerEngineMetadata) {
+        if metadata.backend != self.backend || metadata.current_device_id != self.current_device_id
+        {
+            return;
+        }
+
+        self.current_device = metadata.current_device.clone();
+        self.output_devices = metadata.output_devices.clone();
+        self.output_channels = metadata.output_channels.max(1);
+        self.current_sample_rate = metadata.current_sample_rate;
+        self.performance_settings = metadata.performance_settings;
+        self.supported_sample_rates = metadata.supported_sample_rates.clone();
+        self.supported_buffer_sizes = metadata.supported_buffer_sizes.clone();
+        self.output_device_channels = metadata.output_device_channels.clone();
+        self.output_device_channel_layouts = metadata.output_device_channel_layouts.clone();
+        self.output_driver_channel_info = metadata.output_driver_channel_info.clone();
+        self.detected_default_output_pairs = metadata.detected_default_output_pairs.clone();
+
+        let _ = shared_output_settings(
+            &self.output_settings_by_device,
+            &self.current_device,
+            self.output_channels,
+        );
+        info!(
+            "Applied recovered global audio endpoint metadata: {} — '{}' ({} channels @ {} Hz)",
+            self.backend.short_label(),
+            self.current_device,
+            self.output_channels,
+            self.current_sample_rate
+        );
     }
 
     fn default_output_channel_order_for(
@@ -1073,13 +1525,18 @@ impl AudioEngine {
         (0..channels).collect()
     }
 
-    /// Display logical Theatre Show Cue outputs in their configured order. Values remain
-    /// native zero-based stream indices, so existing cue routes keep their exact
-    /// physical destination when a display/order profile is introduced.
-    pub fn output_channel_display_order(&self, device_name: Option<&str>) -> Vec<usize> {
+    /// Display logical Theatre Show Cue outputs in their configured order for
+    /// a specific backend/endpoint. The map is project-scoped and keyed by
+    /// backend + stable endpoint display name.
+    pub fn output_channel_display_order_for_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> Vec<usize> {
         let name = device_name.unwrap_or(self.current_device.as_str());
-        let channels = self.output_channels_for_device(Some(name));
-        let key = self.output_device_config_key(name);
+        let channels = self.output_channels_for_endpoint(backend, endpoint_id, device_name);
+        let key = Self::output_device_config_key_for_backend(backend, name);
         let configured = self.output_channel_orders.get(&key);
         let mut order = Vec::with_capacity(channels);
         let mut used = std::collections::HashSet::new();
@@ -1091,21 +1548,29 @@ impl AudioEngine {
                 }
             }
         } else {
-            for index in self.default_output_channel_order(name, channels) {
+            for index in Self::default_output_channel_order_for(backend, name, channels) {
                 if used.insert(index) {
                     order.push(index);
                 }
             }
         }
 
-        // Be defensive with old or hand-edited settings: complete an incomplete
-        // mapping with every native channel not already assigned.
         for index in 0..channels {
             if used.insert(index) {
                 order.push(index);
             }
         }
         order
+    }
+
+    pub fn output_channel_display_order(&self, device_name: Option<&str>) -> Vec<usize> {
+        let endpoint_id =
+            device_name.and_then(|name| self.registered_endpoint_id(self.backend, name));
+        let endpoint_id = endpoint_id.as_deref().or_else(|| {
+            (device_name.is_none() || device_name == Some(self.current_device.as_str()))
+                .then_some(self.current_device_id.as_str())
+        });
+        self.output_channel_display_order_for_endpoint(self.backend, endpoint_id, device_name)
     }
 
     /// Replace the logical output order for one device. The order is normalized
@@ -1200,6 +1665,61 @@ impl AudioEngine {
         }
     }
 
+    pub fn output_channel_label_for_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+        channel_index: usize,
+    ) -> String {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let key = Self::output_device_config_key_for_backend(backend, name);
+        let order =
+            self.output_channel_display_order_for_endpoint(backend, endpoint_id, device_name);
+        let logical_index = order
+            .iter()
+            .position(|&native_index| native_index == channel_index)
+            .unwrap_or(channel_index);
+        let alias = self
+            .output_channel_names
+            .get(&key)
+            .and_then(|labels| labels.get(channel_index))
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned);
+        let driver_name = if backend == self.backend {
+            self.output_driver_channel_name(Some(name), channel_index)
+        } else {
+            None
+        };
+        let driver_name = driver_name.filter(|driver_name| {
+            let normalized = Self::normalize_device_name(driver_name);
+            let generic_output = normalized == format!("output{}", channel_index + 1)
+                || normalized == format!("asiooutput{}", channel_index + 1)
+                || normalized == format!("ch{}", channel_index + 1)
+                || normalized == format!("channel{}", channel_index + 1);
+            !generic_output
+        });
+        let base = alias.or(driver_name);
+
+        match (backend, base) {
+            (AudioBackend::Asio, Some(label)) => {
+                format!("{} · ASIO {}", label, channel_index + 1)
+            }
+            (AudioBackend::Asio, None) => format!(
+                "TaSQ Output {} · ASIO {}",
+                logical_index + 1,
+                channel_index + 1
+            ),
+            (_, Some(label)) => format!("{} · Ch. {}", label, channel_index + 1),
+            (_, None) => format!(
+                "TaSQ Output {} · Ch. {}",
+                logical_index + 1,
+                channel_index + 1
+            ),
+        }
+    }
+
     pub fn detected_default_output_pair_for_device(
         &self,
         device_name: Option<&str>,
@@ -1208,6 +1728,45 @@ impl AudioEngine {
         self.detected_default_output_pairs
             .get(&self.output_device_config_key(name))
             .copied()
+    }
+
+    pub fn output_channel_settings_for_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> Vec<OutputChannelSetting> {
+        let channels = self.output_channels_for_endpoint(backend, endpoint_id, device_name);
+        let resolved_name = device_name
+            .map(str::to_owned)
+            .or_else(|| {
+                endpoint_id
+                    .and_then(|id| self.device_registry.find_by_id(id))
+                    .filter(|endpoint| endpoint.backend == backend)
+                    .map(|endpoint| endpoint.device_name.clone())
+            })
+            .or_else(|| (backend == self.backend).then(|| self.current_device.clone()));
+        let Some(resolved_name) = resolved_name else {
+            return vec![OutputChannelSetting::default(); channels];
+        };
+        let key = Self::output_device_config_key_for_backend(backend, &resolved_name);
+
+        let saved_settings = self
+            .endpoint_output_channel_settings
+            .read()
+            .get(&key)
+            .cloned();
+        if let Some(mut settings) = saved_settings {
+            settings.resize(channels, OutputChannelSetting::default());
+            settings.truncate(channels);
+            return settings;
+        }
+
+        if backend == self.backend {
+            return self.output_channel_settings_for_device(Some(&resolved_name));
+        }
+
+        vec![OutputChannelSetting::default(); channels]
     }
 
     pub fn output_channel_names_for_device(&self, device_name: Option<&str>) -> Vec<String> {
@@ -1293,22 +1852,60 @@ impl AudioEngine {
         native_gains
     }
 
-    pub fn cue_routes_for_device(
+    pub fn cue_routes_for_endpoint(
         &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
         device_name: Option<&str>,
         logical_routes: &[ChannelRoute],
     ) -> Vec<ChannelRoute> {
-        let order = self.output_channel_display_order(device_name);
+        let order =
+            self.output_channel_display_order_for_endpoint(backend, endpoint_id, device_name);
         Self::map_cue_routes_to_native(logical_routes, &order)
     }
 
-    pub fn cue_gains_for_device(
+    pub fn cue_gains_for_endpoint(
         &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
         device_name: Option<&str>,
         logical_gains: &[f32],
     ) -> Vec<f32> {
-        let order = self.output_channel_display_order(device_name);
+        let order =
+            self.output_channel_display_order_for_endpoint(backend, endpoint_id, device_name);
         Self::map_cue_gains_to_native(logical_gains, &order)
+    }
+
+    pub fn default_output_pair_for_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> [usize; 2] {
+        let name = device_name.unwrap_or(self.current_device.as_str());
+        let key = Self::output_device_config_key_for_backend(backend, name);
+        let channels = self.output_channels_for_endpoint(backend, endpoint_id, device_name);
+        Self::resolve_default_output_pair(self.default_output_pairs.get(&key).copied(), channels)
+    }
+
+    pub fn default_route_channels_for_source_endpoint(
+        &self,
+        backend: AudioBackend,
+        endpoint_id: Option<&str>,
+        device_name: Option<&str>,
+        source_channels: usize,
+    ) -> Vec<usize> {
+        let channels = self.output_channels_for_endpoint(backend, endpoint_id, device_name);
+        if source_channels <= 2 {
+            let pair = self.default_output_pair_for_endpoint(backend, endpoint_id, device_name);
+            if pair[0] < channels && pair[1] < channels {
+                vec![pair[0], pair[1]]
+            } else {
+                Vec::new()
+            }
+        } else {
+            (0..channels.min(source_channels)).collect()
+        }
     }
 
     pub fn set_default_output_pairs(&mut self, pairs: HashMap<String, [usize; 2]>) {
@@ -1437,10 +2034,10 @@ impl AudioEngine {
             .cloned()
     }
 
-    /// Rebuild the active stream in its existing worker. This is required for
-    /// ASIO because opening a replacement stream while the old driver stream is
-    /// still alive can fail with a device-busy error.
+    /// Rebuild the active global endpoint stream inside its owning worker.
+    /// Other endpoint workers are unaffected.
     pub fn reconfigure_output(&mut self, performance: AudioPerformanceSettings) -> Result<()> {
+        let performance = AudioPerformanceSettings::for_backend(self.backend, performance);
         let (reply_tx, reply_rx) = bounded::<Result<(usize, u32), String>>(1);
         self.cmd_tx
             .send(AudioCommand::ReconfigureOutput {
@@ -1452,9 +2049,11 @@ impl AudioEngine {
             })?;
 
         let result = reply_rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(Duration::from_secs(45))
             .map_err(|error| {
-                anyhow::anyhow!("Audio worker did not confirm performance reconfiguration: {error}")
+                anyhow::anyhow!(
+                    "Audio worker manager did not confirm performance reconfiguration: {error}"
+                )
             })?
             .map_err(|error| anyhow::anyhow!("{error}"))?;
 
@@ -1466,12 +2065,16 @@ impl AudioEngine {
         Ok(())
     }
 
+    /// Switch the global-output pointer to an endpoint worker. If this endpoint
+    /// has not been opened yet, the manager starts an isolated child process;
+    /// workers already serving other Cues remain alive.
     pub fn set_output_endpoint(
         &mut self,
         endpoint_id: &str,
         name: &str,
         performance: AudioPerformanceSettings,
     ) -> Result<()> {
+        let performance = AudioPerformanceSettings::for_backend(self.backend, performance);
         let resolved_name = self
             .device_registry
             .find_available_by_id(endpoint_id)
@@ -1489,6 +2092,7 @@ impl AudioEngine {
         self.cmd_tx
             .send(AudioCommand::SetOutputDevice {
                 device_name: resolved_name.clone(),
+                endpoint_id: Some(endpoint_id.to_string()),
                 performance,
                 reply: reply_tx,
             })
@@ -1497,9 +2101,11 @@ impl AudioEngine {
             })?;
 
         let switch_result = reply_rx
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(Duration::from_secs(45))
             .map_err(|error| {
-                anyhow::anyhow!("Audio worker did not confirm output-device switch: {error}")
+                anyhow::anyhow!(
+                    "Audio worker manager did not confirm output-device switch: {error}"
+                )
             })
             .and_then(|result| result.map_err(|error| anyhow::anyhow!("{error}")));
         let (channels, _sample_rate) = match switch_result {
@@ -1578,10 +2184,23 @@ impl AudioEngine {
     ) {
         let channels = self.output_channels_for_device(Some(device_name));
         let shared = shared_output_settings(&self.output_settings_by_device, device_name, channels);
-        let mut current = shared.write();
-        *current = settings;
-        current.resize(channels, OutputChannelSetting::default());
-        current.truncate(channels);
+        {
+            let mut current = shared.write();
+            *current = settings.clone();
+            current.resize(channels, OutputChannelSetting::default());
+            current.truncate(channels);
+        }
+        let settings_key = Self::output_device_config_key_for_backend(self.backend, device_name);
+        self.endpoint_output_channel_settings
+            .write()
+            .insert(settings_key, settings.clone());
+
+        if self.worker_manager_thread.is_some() {
+            self.send(AudioCommand::SetOutputChannelSettings {
+                device_name: device_name.to_string(),
+                settings,
+            });
+        }
     }
 
     pub fn set_input_device(&mut self, name: &str) {
@@ -1602,11 +2221,112 @@ impl AudioEngine {
         }
         updates
     }
+
+    pub(crate) fn shutdown_and_wait(&mut self) {
+        info!("AudioEngine shutdown requested");
+
+        // The GUI-side manager owns every child process. Worker-child mode has
+        // no manager and only joins its local render thread.
+        if let Some(shutdown_requested) = self.worker_manager_shutdown.take() {
+            shutdown_requested.store(true, Ordering::Release);
+        }
+        let _ = self
+            .cmd_tx
+            .send_timeout(AudioCommand::Shutdown, Duration::from_millis(250));
+
+        if let Some(manager_thread) = self.worker_manager_thread.take() {
+            info!(
+                "Waiting up to {:?} for the audio worker manager to shut down",
+                AUDIO_MANAGER_SHUTDOWN_TIMEOUT
+            );
+            let (joined_tx, joined_rx) = bounded::<bool>(1);
+            let joiner = std::thread::Builder::new()
+                .name("tasq-audio-manager-joiner".to_string())
+                .spawn(move || {
+                    let joined_cleanly = manager_thread.join().is_ok();
+                    let _ = joined_tx.send(joined_cleanly);
+                });
+
+            match joiner {
+                Ok(_joiner) => {
+                    match joined_rx.recv_timeout(AUDIO_MANAGER_SHUTDOWN_TIMEOUT) {
+                        Ok(true) => info!("Audio worker manager joined cleanly"),
+                        Ok(false) => error!("Audio worker manager panicked during shutdown"),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            error!(
+                            "Audio worker manager did not stop within {:?}; force-terminating its isolated worker processes",
+                            AUDIO_MANAGER_SHUTDOWN_TIMEOUT
+                        );
+                            if let Some(supervisor) = self.worker_job_supervisor.as_ref() {
+                                supervisor.terminate_all();
+                            }
+                            match joined_rx.recv_timeout(AUDIO_MANAGER_FORCE_SHUTDOWN_GRACE) {
+                            Ok(true) => info!(
+                                "Audio worker manager stopped after forced worker-process termination"
+                            ),
+                            Ok(false) => error!(
+                                "Audio worker manager panicked after forced worker-process termination"
+                            ),
+                            Err(_) => error!(
+                                "Audio worker manager is still blocked after forced worker-process termination; detaching its joiner so application shutdown can continue"
+                            ),
+                        }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            error!("Audio worker manager join notification channel closed unexpectedly");
+                            if let Some(supervisor) = self.worker_job_supervisor.as_ref() {
+                                supervisor.terminate_all();
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        "Could not start bounded audio-manager joiner: {}; force-terminating isolated worker processes",
+                        error
+                    );
+                    if let Some(supervisor) = self.worker_job_supervisor.as_ref() {
+                        supervisor.terminate_all();
+                    }
+                }
+            }
+        }
+
+        if let Some(audio_thread) = self.audio_thread.take() {
+            info!("Waiting for the in-process audio render thread to exit");
+            if audio_thread.join().is_err() {
+                error!("In-process audio render thread panicked during shutdown");
+            }
+        }
+
+        info!("AudioEngine shutdown sequence completed");
+    }
+
+    pub(crate) fn worker_metadata(&self) -> crate::audio::worker::WorkerEngineMetadata {
+        crate::audio::worker::WorkerEngineMetadata {
+            backend: self.backend,
+            output_devices: self.output_devices.clone(),
+            registry_endpoints: self.device_registry.snapshot_endpoints(),
+            input_devices: self.input_devices.clone(),
+            current_device: self.current_device.clone(),
+            current_device_id: self.current_device_id.clone(),
+            current_input_device: self.current_input_device.clone(),
+            output_channels: self.output_channels,
+            current_sample_rate: self.current_sample_rate,
+            performance_settings: self.performance_settings,
+            supported_sample_rates: self.supported_sample_rates.clone(),
+            supported_buffer_sizes: self.supported_buffer_sizes.clone(),
+            output_device_channels: self.output_device_channels.clone(),
+            output_device_channel_layouts: self.output_device_channel_layouts.clone(),
+            output_driver_channel_info: self.output_driver_channel_info.clone(),
+            detected_default_output_pairs: self.detected_default_output_pairs.clone(),
+        }
+    }
 }
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(AudioCommand::Shutdown);
+        self.shutdown_and_wait();
     }
 }
 
@@ -1642,6 +2362,7 @@ struct ActivePlayer {
     channel_routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_gains: Arc<RwLock<Vec<f32>>>,
     output_channels: usize,
+    output_sample_rate: u32,
     output_device: String,
     uses_global_default: bool,
     mixer: rodio::mixer::Mixer,
@@ -1652,6 +2373,10 @@ struct ActivePlayer {
     loops_remaining: i32, // -1 = inf
     paused_at: Option<f64>,
     dynamic_fade: Option<DynamicFade>,
+    /// Set by the render source on its first scheduled output frame for a batch Cue.
+    start_frame_observed: Option<Arc<AtomicU64>>,
+    start_frame_reported: bool,
+    launch_transaction_id: Option<Uuid>,
 }
 
 impl ActivePlayer {
@@ -1797,6 +2522,168 @@ where
 
     fn total_duration(&self) -> Option<Duration> {
         self.source.total_duration()
+    }
+}
+
+/// Measures the final summed output signal without locking or changing PCM.
+/// It publishes one atomic sample peak per 1,024 samples; the worker reads the
+/// accumulator outside the audio callback. This runs once per output stream,
+/// after all Cue sources for that endpoint have been mixed.
+struct OutputPeakMeterSource<S> {
+    source: S,
+    peak: Arc<AtomicU32>,
+    local_peak: f32,
+    samples_since_publish: usize,
+}
+
+impl<S> OutputPeakMeterSource<S> {
+    fn new(source: S, peak: Arc<AtomicU32>) -> Self {
+        Self {
+            source,
+            peak,
+            local_peak: 0.0,
+            samples_since_publish: 0,
+        }
+    }
+
+    fn publish_peak(&mut self) {
+        if self.local_peak > 0.0 && self.local_peak.is_finite() {
+            self.peak
+                .fetch_max(self.local_peak.to_bits(), Ordering::Relaxed);
+            self.local_peak = 0.0;
+        }
+        self.samples_since_publish = 0;
+    }
+}
+
+impl<S> Iterator for OutputPeakMeterSource<S>
+where
+    S: Source,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some(sample) = self.source.next() else {
+            self.publish_peak();
+            return None;
+        };
+        let magnitude = sample.abs();
+        if magnitude.is_finite() {
+            self.local_peak = self.local_peak.max(magnitude);
+        }
+        self.samples_since_publish += 1;
+        if self.samples_since_publish >= 1_024 {
+            self.publish_peak();
+        }
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.source.size_hint()
+    }
+}
+
+impl<S> Drop for OutputPeakMeterSource<S> {
+    fn drop(&mut self) {
+        self.publish_peak();
+    }
+}
+
+impl<S> Source for OutputPeakMeterSource<S>
+where
+    S: Source,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.source.current_span_len()
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.source.try_seek(position)
+    }
+}
+
+/// Counts complete interleaved output frames as the final mixed stream is
+/// consumed. The increment happens after each frame, so all cue sources polled
+/// while mixing that frame observe the same frame index.
+struct SampleFrameClockSource<S> {
+    source: S,
+    frame_clock: Arc<AtomicU64>,
+    channels: usize,
+    channel_index: usize,
+}
+
+impl<S> SampleFrameClockSource<S> {
+    fn new(source: S, frame_clock: Arc<AtomicU64>, channels: usize) -> Self {
+        Self {
+            source,
+            frame_clock,
+            channels: channels.max(1),
+            channel_index: 0,
+        }
+    }
+}
+
+impl<S> Iterator for SampleFrameClockSource<S>
+where
+    S: Source,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sample = self.source.next()?;
+        self.channel_index += 1;
+        if self.channel_index >= self.channels {
+            self.channel_index = 0;
+            self.frame_clock.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.source.size_hint()
+    }
+}
+
+impl<S> Source for SampleFrameClockSource<S>
+where
+    S: Source,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.source.current_span_len()
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.source.try_seek(position)
     }
 }
 
@@ -2506,6 +3393,91 @@ where
     }
 }
 
+/// Holds a prepared Cue at silence until the endpoint's shared sample-frame
+/// clock reaches the batch target. The gate is armed only after every Cue in
+/// the batch has been decoded and attached to the same mixer.
+struct SampleScheduledSource<S> {
+    source: S,
+    frame_clock: Arc<AtomicU64>,
+    start_frame_gate: Arc<AtomicU64>,
+    start_frame_observed: Option<Arc<AtomicU64>>,
+    started: bool,
+}
+
+impl<S> SampleScheduledSource<S> {
+    fn new(
+        source: S,
+        frame_clock: Arc<AtomicU64>,
+        start_frame_gate: Arc<AtomicU64>,
+        start_frame_observed: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        Self {
+            source,
+            frame_clock,
+            start_frame_gate,
+            start_frame_observed,
+            started: false,
+        }
+    }
+}
+
+impl<S> Iterator for SampleScheduledSource<S>
+where
+    S: Source,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.started {
+            let target_frame = self.start_frame_gate.load(Ordering::Acquire);
+            let current_frame = self.frame_clock.load(Ordering::Relaxed);
+            if target_frame == u64::MAX || current_frame < target_frame {
+                return Some(0.0);
+            }
+            if let Some(observed) = &self.start_frame_observed {
+                observed.store(current_frame, Ordering::Release);
+            }
+            self.started = true;
+        }
+        self.source.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (_, upper) = self.source.size_hint();
+        (0, upper)
+    }
+}
+
+impl<S> Source for SampleScheduledSource<S>
+where
+    S: Source,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        // The leading silence has a dynamic length determined by the shared
+        // output clock, so expose one continuous span to Rodio.
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.source.try_seek(position)
+    }
+}
+
 /// Rodio's Player normally attaches its queue to the mixer while the queue is
 /// still empty (and therefore reports the Empty source's mono channel count).
 /// The queue can then expose a 6-channel source while its initial 512-sample
@@ -2562,6 +3534,7 @@ fn open_sink_at(
     offset_secs: f64,
     initial_vol: f32,
     output_channels: usize,
+    output_sample_rate: u32,
     routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_settings: SharedOutputSettings,
     output_gains: Arc<RwLock<Vec<f32>>>,
@@ -2570,9 +3543,22 @@ fn open_sink_at(
     automation_updates: Receiver<VolumeAutomationUpdate>,
     time_pitch: Arc<RwLock<TimePitchSettings>>,
     position_state: Arc<RwLock<f64>>,
+    start_frame_gate: Option<Arc<AtomicU64>>,
+    sample_frame_clock: Option<Arc<AtomicU64>>,
+    start_frame_observed: Option<Arc<AtomicU64>>,
 ) -> Option<rodio::Player> {
     let file = std::fs::File::open(file_path).ok()?;
     let decoder = rodio::Decoder::try_from(file).ok()?;
+    let source_channels = decoder.channels().get();
+    let source_sample_rate = decoder.sample_rate().get();
+    debug!(
+        "CUE SOURCE FORMAT: file='{}', source={} channels @ {} Hz, endpoint={} channels @ {} Hz; TaSQ converts the source to endpoint format before sample scheduling",
+        file_path.display(),
+        source_channels,
+        source_sample_rate,
+        output_channels,
+        output_sample_rate
+    );
     let source = decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)));
     let automated = VolumeAutomationSource::new(
         source,
@@ -2590,12 +3576,30 @@ fn open_sink_at(
         output_gains,
         output_channels,
     );
+    // Convert each Cue to the endpoint's exact channel/sample-rate layout
+    // before applying the shared frame gate. This is important: the scheduler
+    // must count output frames, not decoder-rate frames.
+    let target_channels =
+        std::num::NonZeroU16::new(output_channels.max(1).min(u16::MAX as usize) as u16)?;
+    let target_sample_rate = std::num::NonZeroU32::new(output_sample_rate.max(1))?;
+    let endpoint_source =
+        rodio::source::UniformSourceIterator::new(routed, target_channels, target_sample_rate);
     // Build the Player queue without connecting it yet. Its first queued
     // source already has the final multichannel layout when Rodio creates the
     // mixer adapter, preventing an initial mono/512-sample bootstrap.
     let (player, queue_source) = rodio::Player::new();
     player.set_volume(initial_vol);
-    player.append(routed);
+    if let Some((start_frame_gate, sample_frame_clock)) = start_frame_gate.zip(sample_frame_clock) {
+        player.append(SampleScheduledSource::new(
+            endpoint_source,
+            sample_frame_clock,
+            start_frame_gate,
+            start_frame_observed,
+        ));
+    } else {
+        // Normal single-Cue playback stays on the immediate, zero-extra-check path.
+        player.append(endpoint_source);
+    }
     mixer.add(FrameAlignedPlayerQueue {
         inner: queue_source,
     });
@@ -2693,7 +3697,7 @@ const DIRECTSOUND_DEFAULT_QUEUE_FRAMES: usize = 4_096;
 
 #[allow(dead_code)]
 enum OutputStreamHandle {
-    Cpal(rodio::MixerDeviceSink),
+    Cpal(cpal::Stream),
     // Use SDL's queue API instead of its callback API. SDL2 0.38's callback
     // trampoline can panic on Windows when its callback userdata is observed
     // before initialization; a queue avoids that callback thread entirely.
@@ -2834,9 +3838,16 @@ impl DirectSoundQueue {
 #[cfg(target_os = "windows")]
 impl Drop for DirectSoundQueue {
     fn drop(&mut self) {
+        debug!(
+            "Releasing DirectSound queue device {}: pause, clear queued PCM, then close",
+            self.device_id
+        );
         unsafe {
+            sdl2::sys::SDL_PauseAudioDevice(self.device_id, 1);
+            sdl2::sys::SDL_ClearQueuedAudio(self.device_id);
             sdl2::sys::SDL_CloseAudioDevice(self.device_id);
         }
+        debug!("Released DirectSound queue device {}", self.device_id);
     }
 }
 
@@ -2850,6 +3861,14 @@ struct DirectSoundInitInfo {
     output_device_channel_layouts: HashMap<String, Vec<usize>>,
 }
 
+#[derive(Default)]
+struct AudioStreamHealth {
+    /// Incremented once per native output callback, not per sample.
+    callback_count: AtomicU64,
+    /// Set by CPAL's stream-error callback; the control thread consumes it.
+    stream_error: AtomicBool,
+}
+
 struct DeviceOutput {
     // Keeping the native stream/device alive is required for audio playback.
     _stream: OutputStreamHandle,
@@ -2858,9 +3877,21 @@ struct DeviceOutput {
     sample_rate: u32,
     performance: AudioPerformanceSettings,
     settings: SharedOutputSettings,
+    /// Present for CPAL streams. DirectSound currently uses SDL's queued-output
+    /// path and has no CPAL callback to monitor.
+    stream_health: Option<Arc<AudioStreamHealth>>,
+    /// Monotonic count of output sample frames rendered by this endpoint.
+    /// Cue sources in the same Worker read this clock to share an exact start frame.
+    sample_frame_clock: Arc<AtomicU64>,
+    last_callback_count: u64,
+    last_callback_progress_at: Instant,
     #[cfg(target_os = "windows")]
-    directsound_source: Option<rodio::mixer::MixerSource>,
+    directsound_source:
+        Option<SampleFrameClockSource<OutputPeakMeterSource<rodio::mixer::MixerSource>>>,
 }
+
+const ASIO_STREAM_CALLBACK_STALL_TIMEOUT: Duration = Duration::from_millis(750);
+const ASIO_STREAM_INITIAL_CALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn shared_output_settings(
     settings_by_device: &OutputSettingsByDevice,
@@ -2888,11 +3919,45 @@ fn shared_output_settings(
 }
 
 fn output_config_candidates(
+    backend: AudioBackend,
     device: &Device,
     preferred: cpal::SupportedStreamConfig,
     requested_sample_rate: Option<u32>,
 ) -> Vec<cpal::SupportedStreamConfig> {
-    let mut candidates = vec![preferred];
+    let mut candidates = vec![preferred.clone()];
+
+    if backend == AudioBackend::Asio {
+        // ASIO's default configuration reflects the driver's active clock and
+        // format. Re-enumerating the driver for alternatives adds latency and
+        // risks selecting a configuration that the driver itself did not offer.
+        return candidates;
+    }
+
+    if backend == AudioBackend::Wasapi {
+        // WASAPI Shared should follow the Windows endpoint mix format in Auto,
+        // or the explicitly selected supported rate. Do not probe unrelated
+        // sample rates: the shared audio engine performs system-side conversion.
+        let rate = requested_sample_rate.unwrap_or(preferred.sample_rate());
+        let channels = preferred.channels();
+        if let Ok(ranges) = device.supported_output_configs() {
+            for range in ranges {
+                if range.channels() == channels && range.contains_rate(rate) {
+                    let candidate = range.with_sample_rate(rate);
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        candidates.sort_by_key(|config| {
+            std::cmp::Reverse((
+                (config.sample_format() == preferred.sample_format()) as u8,
+                (config.sample_format() == cpal::SampleFormat::F32) as u8,
+            ))
+        });
+        candidates.truncate(8);
+        return candidates;
+    }
 
     if let Some(rate) = requested_sample_rate {
         if let Ok(ranges) = device.supported_output_configs() {
@@ -2969,13 +4034,41 @@ fn output_config_candidates(
 }
 
 fn build_device_output(
+    backend: AudioBackend,
     device: &Device,
     preferred_config: cpal::SupportedStreamConfig,
     device_name: &str,
     settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
-) -> Option<DeviceOutput> {
-    let candidates = output_config_candidates(device, preferred_config, performance.sample_rate);
+) -> std::result::Result<DeviceOutput, String> {
+    let performance = AudioPerformanceSettings::for_backend(backend, performance);
+    let preferred_config_for_order = preferred_config.clone();
+    let candidate_sample_rate = if backend == AudioBackend::Asio {
+        Some(preferred_config.sample_rate())
+    } else {
+        performance.sample_rate
+    };
+    let candidates =
+        output_config_candidates(backend, device, preferred_config, candidate_sample_rate);
+    let device_id = device
+        .id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    debug!(
+        "Opening output endpoint '{}' [{}] with {} candidate configuration(s)",
+        device_name,
+        device_id,
+        candidates.len()
+    );
+    let mut candidates = candidates;
+    if let Some(index) = candidates
+        .iter()
+        .position(|candidate| candidate == &preferred_config_for_order)
+    {
+        let preferred = candidates.remove(index);
+        candidates.insert(0, preferred);
+    }
     let mut failures = Vec::new();
 
     for config in candidates {
@@ -2991,14 +4084,49 @@ fn build_device_output(
             device_name, channels, sample_rate, sample_format, requested_buffer
         );
 
-        let mut stream = match rodio::DeviceSinkBuilder::default()
-            .with_device(device.clone())
-            .with_supported_config(&config)
-            .with_buffer_size(requested_buffer)
-            .open_stream()
-        {
+        let mixer_channels = std::num::NonZeroU16::new(channels as u16)
+            .ok_or_else(|| format!("Output endpoint '{}' reported zero channels", device_name))?;
+        let mixer_sample_rate = std::num::NonZeroU32::new(sample_rate).ok_or_else(|| {
+            format!(
+                "Output endpoint '{}' reported an invalid sample rate",
+                device_name
+            )
+        })?;
+        let (mixer, source) = rodio::mixer::mixer(mixer_channels, mixer_sample_rate);
+        let metered_source = OutputPeakMeterSource::new(source, output_peak_meter.clone());
+        let sample_frame_clock = Arc::new(AtomicU64::new(0));
+        let clocked_source =
+            SampleFrameClockSource::new(metered_source, sample_frame_clock.clone(), channels);
+        let stream_health = Arc::new(AudioStreamHealth::default());
+        let stream_config = cpal::StreamConfig {
+            channels: config.channels(),
+            sample_rate: config.sample_rate(),
+            buffer_size: requested_buffer,
+        };
+        let stream = match build_metered_cpal_stream(
+            device,
+            stream_config,
+            sample_format,
+            clocked_source,
+            device_name,
+            stream_health.clone(),
+        ) {
             Ok(stream) => stream,
             Err(open_error) => {
+                let device_busy = open_error.contains("DeviceBusy")
+                    || open_error.contains("AUDCLNT_E_DEVICE_IN_USE")
+                    || open_error.contains("-2004287478")
+                    || open_error.contains("0x8889000A");
+                if device_busy {
+                    let message = format!(
+                        "Output endpoint '{}' is busy and cannot be opened by {}. Another backend or application may already hold the device: {}",
+                        device_name,
+                        backend.short_label(),
+                        open_error
+                    );
+                    warn!("{message}");
+                    return Err(message);
+                }
                 failures.push(format!(
                     "{}ch @ {}Hz {:?}: {}",
                     channels, sample_rate, sample_format, open_error
@@ -3006,33 +4134,107 @@ fn build_device_output(
                 continue;
             }
         };
+        if let Err(play_error) = stream.play() {
+            failures.push(format!(
+                "{}ch @ {}Hz {:?}: could not start stream: {}",
+                channels, sample_rate, sample_format, play_error
+            ));
+            continue;
+        }
 
         info!(
-            "Audio output stream opened successfully: '{}' ({} channels @ {} Hz, {:?}, requested buffer={:?})",
-            device_name, channels, sample_rate, sample_format, requested_buffer
+            "Audio output stream opened successfully: '{}' ({} channels @ {} Hz, {:?}, requested sample_rate={:?}, requested buffer={:?}; final-mix peak metering enabled)",
+            device_name,
+            channels,
+            sample_rate,
+            sample_format,
+            performance.sample_rate,
+            requested_buffer
         );
-        stream.log_on_drop(false);
-        let mixer = stream.mixer().clone();
         let settings = shared_output_settings(settings_by_device, device_name, channels);
-        return Some(DeviceOutput {
+        return Ok(DeviceOutput {
             _stream: OutputStreamHandle::Cpal(stream),
             mixer,
             channels,
             sample_rate,
             performance,
             settings,
+            stream_health: Some(stream_health),
+            sample_frame_clock,
+            last_callback_count: 0,
+            last_callback_progress_at: Instant::now(),
             #[cfg(target_os = "windows")]
             directsound_source: None,
         });
     }
 
-    warn!(
+    let message = format!(
         "Could not open audio output '{}'. Tried {} supported configurations. Details: {}",
         device_name,
         failures.len(),
         failures.join(" | ")
     );
-    None
+    warn!("{}", message);
+    Err(message)
+}
+
+fn build_metered_cpal_stream<S>(
+    device: &Device,
+    stream_config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    source: S,
+    _device_name: &str,
+    stream_health: Arc<AudioStreamHealth>,
+) -> std::result::Result<cpal::Stream, String>
+where
+    S: Iterator<Item = f32> + Send + 'static,
+{
+    macro_rules! build_output_stream {
+        ($sample_type:ty) => {{
+            let mut source = source;
+            let callback_health = stream_health.clone();
+            let error_health = stream_health.clone();
+            device
+                .build_output_stream::<$sample_type, _, _>(
+                    stream_config.clone(),
+                    move |data: &mut [$sample_type], _| {
+                        callback_health
+                            .callback_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        data.iter_mut().for_each(|sample| {
+                            *sample = source
+                                .next()
+                                .map(Sample::from_sample)
+                                .unwrap_or(<$sample_type>::EQUILIBRIUM);
+                        });
+                    },
+                    move |_error| {
+                        // Do not format or write logs from the native stream callback.
+                        // The audio control loop observes this lock-free flag and
+                        // reports the failure through the supervised Worker process.
+                        error_health.stream_error.store(true, Ordering::Release);
+                    },
+                    None,
+                )
+                .map_err(|error| format!("{error} [{error:?}]"))
+        }};
+    }
+
+    match sample_format {
+        cpal::SampleFormat::F32 => build_output_stream!(f32),
+        cpal::SampleFormat::F64 => build_output_stream!(f64),
+        cpal::SampleFormat::I8 => build_output_stream!(i8),
+        cpal::SampleFormat::I16 => build_output_stream!(i16),
+        cpal::SampleFormat::I24 => build_output_stream!(cpal::I24),
+        cpal::SampleFormat::I32 => build_output_stream!(i32),
+        cpal::SampleFormat::I64 => build_output_stream!(i64),
+        cpal::SampleFormat::U8 => build_output_stream!(u8),
+        cpal::SampleFormat::U16 => build_output_stream!(u16),
+        cpal::SampleFormat::U24 => build_output_stream!(cpal::U24),
+        cpal::SampleFormat::U32 => build_output_stream!(u32),
+        cpal::SampleFormat::U64 => build_output_stream!(u64),
+        unsupported => Err(format!("Unsupported output sample format: {unsupported:?}")),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -3094,6 +4296,7 @@ fn build_directsound_device_output(
     audio: &sdl2::AudioSubsystem,
     device_name: &str,
     settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
     use std::num::{NonZeroU16, NonZeroU32};
@@ -3151,6 +4354,13 @@ fn build_directsound_device_output(
             continue;
         };
         let (mixer, source) = rodio::mixer::mixer(mixer_channels, mixer_rate);
+        let metered_source = OutputPeakMeterSource::new(source, output_peak_meter.clone());
+        let sample_frame_clock = Arc::new(AtomicU64::new(0));
+        let source = SampleFrameClockSource::new(
+            metered_source,
+            sample_frame_clock.clone(),
+            actual_channels,
+        );
 
         // Prime the queue with silence before resuming playback.
         let initial_silence = vec![0.0_f32; actual_channels * queue.target_queue_frames];
@@ -3165,12 +4375,13 @@ fn build_directsound_device_output(
 
         queue.resume();
         info!(
-            "DirectSound output opened: '{}' ({} channels @ {} Hz; queue={} frames / {:.1} ms; float32; SDL driver: directsound)",
+            "DirectSound output opened: '{}' ({} channels @ {} Hz; queue={} frames / {:.1} ms; requested performance={:?}; float32; SDL driver: directsound)",
             device_name,
             actual_channels,
             actual_sample_rate,
             queue.target_queue_frames,
-            queue.target_queue_frames as f64 * 1_000.0 / actual_sample_rate as f64
+            queue.target_queue_frames as f64 * 1_000.0 / actual_sample_rate as f64,
+            performance
         );
 
         let settings = shared_output_settings(settings_by_device, device_name, actual_channels);
@@ -3181,6 +4392,10 @@ fn build_directsound_device_output(
             sample_rate: actual_sample_rate,
             performance,
             settings,
+            stream_health: None,
+            sample_frame_clock,
+            last_callback_count: 0,
+            last_callback_progress_at: Instant::now(),
             directsound_source: Some(source),
         });
     }
@@ -3194,19 +4409,22 @@ fn build_directsound_device_output(
 }
 
 fn open_device_output(
+    backend: AudioBackend,
     device_name: &str,
     context: &AudioOutputContext,
     settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
+    let performance = AudioPerformanceSettings::for_backend(backend, performance);
     match context {
         AudioOutputContext::Cpal(host) => {
             let devices = host.output_devices().ok()?;
             let device = devices
                 .into_iter()
                 .find(|device| device.to_string() == device_name)?;
-            let config =
-                preferred_output_config(&device, performance.sample_rate).or_else(|| {
+            let config = preferred_output_config(backend, &device, performance.sample_rate)
+                .or_else(|| {
                     device.default_output_config().ok().filter(|config| {
                         performance
                             .sample_rate
@@ -3214,17 +4432,24 @@ fn open_device_output(
                     })
                 })?;
             build_device_output(
+                backend,
                 &device,
                 config,
                 device_name,
                 settings_by_device,
+                output_peak_meter,
                 performance,
             )
+            .ok()
         }
         #[cfg(target_os = "windows")]
-        AudioOutputContext::DirectSound { audio, .. } => {
-            build_directsound_device_output(audio, device_name, settings_by_device, performance)
-        }
+        AudioOutputContext::DirectSound { audio, .. } => build_directsound_device_output(
+            audio,
+            device_name,
+            settings_by_device,
+            output_peak_meter,
+            performance,
+        ),
     }
 }
 #[cfg(target_os = "windows")]
@@ -3266,10 +4491,12 @@ fn pump_directsound_queues(streams: &mut HashMap<String, DeviceOutput>) {
 }
 
 fn ensure_device_output(
+    backend: AudioBackend,
     streams: &mut HashMap<String, DeviceOutput>,
     device_name: &str,
     context: &AudioOutputContext,
     settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
 ) -> Option<(rodio::mixer::Mixer, usize, u32, SharedOutputSettings)> {
     let needs_reopen = streams
@@ -3285,7 +4512,14 @@ fn ensure_device_output(
         streams.remove(device_name);
     }
     if !streams.contains_key(device_name) {
-        let output = open_device_output(device_name, context, settings_by_device, performance)?;
+        let output = open_device_output(
+            backend,
+            device_name,
+            context,
+            settings_by_device,
+            output_peak_meter,
+            performance,
+        )?;
         streams.insert(device_name.to_string(), output);
     }
     let output = streams.get_mut(device_name)?;
@@ -3300,12 +4534,12 @@ fn ensure_device_output(
 
 fn audio_worker(
     backend: AudioBackend,
-    initial_device: Device,
-    initial_config: cpal::SupportedStreamConfig,
+    initial_device_id: String,
     initial_device_name: String,
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    output_peak_meter: Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
     ready_tx: Sender<Result<(usize, u32), String>>,
 ) {
@@ -3325,23 +4559,104 @@ fn audio_worker(
             return;
         }
     };
-    let Some(initial_output) = build_device_output(
+
+    // CPAL's WASAPI Device wraps a native COM endpoint. Do not move a Device
+    // handle created on the GUI thread into the audio thread: some vendor
+    // drivers reject stream creation from a different COM apartment. Resolve
+    // the endpoint again on this thread, then open it here.
+    let initial_device_by_id = initial_device_id
+        .parse::<cpal::DeviceId>()
+        .ok()
+        .and_then(|device_id| host.device_by_id(&device_id));
+    let initial_device = if initial_device_by_id.is_some() {
+        initial_device_by_id
+    } else {
+        match host.output_devices() {
+            Ok(devices) => devices
+                .into_iter()
+                .find(|device| device.to_string() == initial_device_name),
+            Err(error) => {
+                error!(
+                    "Could not enumerate {} output devices on the audio worker thread: {}",
+                    backend.label(),
+                    error
+                );
+                let _ = ready_tx.send(Err(format!(
+                    "Could not enumerate {} output devices on the audio worker thread: {}",
+                    backend.label(),
+                    error
+                )));
+                return;
+            }
+        }
+    };
+    let Some(initial_device) = initial_device else {
+        let message = format!(
+            "Selected {} output device '{}' disappeared before the audio worker opened it",
+            backend.label(),
+            initial_device_name
+        );
+        error!("{}", message);
+        let _ = ready_tx.send(Err(message));
+        return;
+    };
+
+    let device_id = initial_device
+        .id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "unavailable".to_string());
+    debug!(
+        "Resolved initial {} endpoint on audio worker thread: '{}' (requested ID: '{}', resolved ID: '{}')",
+        backend.label(),
+        initial_device_name,
+        initial_device_id,
+        device_id
+    );
+
+    let initial_config = preferred_output_config(backend, &initial_device, performance.sample_rate)
+        .or_else(|| {
+            initial_device
+                .default_output_config()
+                .ok()
+                .filter(|config| {
+                    performance
+                        .sample_rate
+                        .map_or(true, |rate| config.sample_rate() == rate)
+                })
+        });
+    let Some(initial_config) = initial_config else {
+        let message = format!(
+            "No supported output configuration found for {} device '{}' on the audio worker thread",
+            backend.label(),
+            initial_device_name
+        );
+        error!("{}", message);
+        let _ = ready_tx.send(Err(message));
+        return;
+    };
+
+    let initial_output = match build_device_output(
+        backend,
         &initial_device,
         initial_config,
         &initial_device_name,
         &output_settings_by_device,
+        &output_peak_meter,
         performance,
-    ) else {
-        error!(
-            "Could not open initial {} audio output stream",
-            backend.label()
-        );
-        let _ = ready_tx.send(Err(format!(
-            "Could not open initial {} audio output stream for '{}'",
-            backend.label(),
-            initial_device_name
-        )));
-        return;
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let message = format!(
+                "Could not open initial {} audio output stream for '{}' [{}]: {}",
+                backend.label(),
+                initial_device_name,
+                device_id,
+                error
+            );
+            error!("{}", message);
+            let _ = ready_tx.send(Err(message));
+            return;
+        }
     };
 
     let _ = ready_tx.send(Ok((initial_output.channels, initial_output.sample_rate)));
@@ -3353,6 +4668,7 @@ fn audio_worker(
         cmd_rx,
         pos_tx,
         output_settings_by_device,
+        output_peak_meter,
         performance,
     );
 }
@@ -3363,6 +4679,7 @@ fn audio_worker_directsound(
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    output_peak_meter: Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
     ready_tx: Sender<Result<DirectSoundInitInfo, String>>,
 ) {
@@ -3411,6 +4728,7 @@ fn audio_worker_directsound(
             &audio,
             &current_device,
             &output_settings_by_device,
+            &output_peak_meter,
             performance,
         )
         .ok_or_else(|| {
@@ -3454,6 +4772,7 @@ fn audio_worker_directsound(
                 cmd_rx,
                 pos_tx,
                 output_settings_by_device,
+                output_peak_meter,
                 performance,
             );
         }
@@ -3464,6 +4783,49 @@ fn audio_worker_directsound(
     }
 }
 
+fn detect_output_stream_failure(
+    backend: AudioBackend,
+    streams: &mut HashMap<String, DeviceOutput>,
+    now: Instant,
+) -> Option<(String, String)> {
+    for (device_name, output) in streams.iter_mut() {
+        let Some(health) = output.stream_health.as_ref() else {
+            continue;
+        };
+
+        if health.stream_error.load(Ordering::Acquire) {
+            return Some((
+                device_name.clone(),
+                "native audio backend reported an output-stream error".to_string(),
+            ));
+        }
+
+        let callback_count = health.callback_count.load(Ordering::Relaxed);
+        if callback_count != output.last_callback_count {
+            output.last_callback_count = callback_count;
+            output.last_callback_progress_at = now;
+        } else if backend == AudioBackend::Asio {
+            let timeout = if output.last_callback_count == 0 {
+                ASIO_STREAM_INITIAL_CALLBACK_TIMEOUT
+            } else {
+                ASIO_STREAM_CALLBACK_STALL_TIMEOUT
+            };
+            let stalled_for = now.saturating_duration_since(output.last_callback_progress_at);
+            if stalled_for >= timeout {
+                return Some((
+                    device_name.clone(),
+                    format!(
+                        "ASIO output callback made no progress for {:.0} ms",
+                        stalled_for.as_secs_f64() * 1_000.0
+                    ),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 fn audio_worker_loop(
     backend: AudioBackend,
     context: AudioOutputContext,
@@ -3472,8 +4834,10 @@ fn audio_worker_loop(
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
+    output_peak_meter: Arc<AtomicU32>,
     mut performance: AudioPerformanceSettings,
 ) {
+    performance = AudioPerformanceSettings::for_backend(backend, performance);
     let mut streams = HashMap::new();
     streams.insert(initial_device_name.clone(), initial_output);
     let mut default_device_name = initial_device_name;
@@ -3486,6 +4850,12 @@ fn audio_worker_loop(
             match cmd {
                 AudioCommand::Shutdown => {
                     for player in &players {
+                        let _ = pos_tx.try_send(PositionUpdate {
+                            id: player.id,
+                            generation: player.generation,
+                            position_secs: player.current_pos(),
+                            state: CueState::Stopped,
+                        });
                         player.sink.stop();
                     }
                     players.clear();
@@ -3496,6 +4866,8 @@ fn audio_worker_loop(
                     performance: requested_performance,
                     reply,
                 } => {
+                    let requested_performance =
+                        AudioPerformanceSettings::for_backend(backend, requested_performance);
                     let previous_performance = performance;
                     test_generation.fetch_add(1, Ordering::Relaxed);
                     for player in &players {
@@ -3513,10 +4885,12 @@ fn audio_worker_loop(
                     streams.clear();
 
                     if let Some((_, channels, sample_rate, settings)) = ensure_device_output(
+                        backend,
                         &mut streams,
                         &default_device_name,
                         &context,
                         &output_settings_by_device,
+                        &output_peak_meter,
                         requested_performance,
                     ) {
                         let mut current = settings.write();
@@ -3534,10 +4908,12 @@ fn audio_worker_loop(
                     } else {
                         streams.clear();
                         let restored = ensure_device_output(
+                            backend,
                             &mut streams,
                             &default_device_name,
                             &context,
                             &output_settings_by_device,
+                            &output_peak_meter,
                             previous_performance,
                         );
                         if restored.is_some() {
@@ -3565,16 +4941,19 @@ fn audio_worker_loop(
                 }
                 AudioCommand::SetOutputDevice {
                     device_name: dev_name,
+                    endpoint_id: _,
                     performance: requested_performance,
                     reply,
                 } => {
+                    let requested_performance =
+                        AudioPerformanceSettings::for_backend(backend, requested_performance);
                     let previous_default_device = default_device_name.clone();
                     test_generation.fetch_add(1, Ordering::Relaxed);
 
                     if backend == AudioBackend::Asio && dev_name != previous_default_device {
-                        // CPAL's ASIO host owns one driver at a time per process.
-                        // Stop all players and drop every stream before opening
-                        // another ASIO device; Stage 4 will isolate drivers in processes.
+                        // Legacy in-process path: CPAL's ASIO host owns one driver
+                        // at a time per process. The GUI path switches endpoint
+                        // workers in the parent manager instead of using this branch.
                         for player in &players {
                             let _ = pos_tx.try_send(PositionUpdate {
                                 id: player.id,
@@ -3614,10 +4993,12 @@ fn audio_worker_loop(
 
                     default_device_name = dev_name.clone();
                     if let Some((_, channels, sample_rate, settings)) = ensure_device_output(
+                        backend,
                         &mut streams,
                         &dev_name,
                         &context,
                         &output_settings_by_device,
+                        &output_peak_meter,
                         requested_performance,
                     ) {
                         let mut current = settings.write();
@@ -3645,10 +5026,12 @@ fn audio_worker_loop(
                             && previous_default_device != dev_name
                         {
                             ensure_device_output(
+                                backend,
                                 &mut streams,
                                 &previous_default_device,
                                 &context,
                                 &output_settings_by_device,
+                                &output_peak_meter,
                                 performance,
                             )
                         } else {
@@ -3697,6 +5080,23 @@ fn audio_worker_loop(
                 AudioCommand::SetInputDevice(dev_name) => {
                     info!("Selected input audio device: {}", dev_name);
                 }
+                AudioCommand::PlayBatch {
+                    transaction_id,
+                    cues,
+                } => handle_play_batch(
+                    transaction_id,
+                    cues,
+                    backend,
+                    &mut players,
+                    &mut streams,
+                    &context,
+                    &default_device_name,
+                    &output_settings_by_device,
+                    &output_peak_meter,
+                    performance,
+                    &test_generation,
+                    &pos_tx,
+                ),
                 other => handle_command(
                     other,
                     backend,
@@ -3705,10 +5105,39 @@ fn audio_worker_loop(
                     &context,
                     &default_device_name,
                     &output_settings_by_device,
+                    &output_peak_meter,
                     performance,
                     &test_generation,
+                    &pos_tx,
+                    None,
+                    None,
                 ),
             }
+        }
+
+        if let Some((device_name, reason)) =
+            detect_output_stream_failure(backend, &mut streams, Instant::now())
+        {
+            let message = format!(
+                "{} output stream '{}' failed: {}",
+                backend.short_label(),
+                device_name,
+                reason
+            );
+            error!(
+                "Audio Worker render loop is stopping because its native output stream is unhealthy: {}",
+                message
+            );
+            for player in &players {
+                let _ = pos_tx.try_send(PositionUpdate {
+                    id: player.id,
+                    generation: player.generation,
+                    position_secs: player.current_pos(),
+                    state: CueState::Error(message.clone()),
+                });
+                player.sink.stop();
+            }
+            return;
         }
 
         let mut finished_ids: Vec<(Uuid, u64)> = Vec::new();
@@ -3725,6 +5154,22 @@ fn audio_worker_loop(
 
             let mut pos = player.current_pos();
 
+            if !player.start_frame_reported {
+                if let Some(observed) = &player.start_frame_observed {
+                    let actual_start_frame = observed.load(Ordering::Acquire);
+                    if actual_start_frame != u64::MAX {
+                        info!(
+                            "Cue {} actual output start frame: {} (generation={}, transaction_id={:?})",
+                            player.id,
+                            actual_start_frame,
+                            player.generation,
+                            player.launch_transaction_id
+                        );
+                        player.start_frame_reported = true;
+                    }
+                }
+            }
+
             // Loop restart must use the same output device as the original cue.
             let valid_loop = player.loop_enabled && player.loop_end > player.loop_start;
             if valid_loop && pos >= player.loop_end {
@@ -3739,6 +5184,7 @@ fn audio_worker_loop(
                         player.loop_start,
                         player.current_volume,
                         player.output_channels,
+                        player.output_sample_rate,
                         player.channel_routes.clone(),
                         player.output_settings.clone(),
                         player.output_gains.clone(),
@@ -3747,6 +5193,9 @@ fn audio_worker_loop(
                         player.automation_update_rx.clone(),
                         player.time_pitch.clone(),
                         player.position_state.clone(),
+                        None,
+                        None,
+                        None,
                     ) {
                         player.sink = new_sink;
                         pos = player.loop_start;
@@ -3843,6 +5292,138 @@ fn audio_worker_loop(
     }
 }
 
+fn handle_play_batch(
+    transaction_id: Uuid,
+    cues: Vec<AudioPlayRequest>,
+    backend: AudioBackend,
+    players: &mut Vec<ActivePlayer>,
+    streams: &mut HashMap<String, DeviceOutput>,
+    context: &AudioOutputContext,
+    default_device_name: &str,
+    output_settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
+    performance: AudioPerformanceSettings,
+    test_generation: &Arc<AtomicU64>,
+    pos_tx: &Sender<PositionUpdate>,
+) {
+    if cues.is_empty() {
+        return;
+    }
+
+    let batch_size = cues.len();
+    let cue_ids: Vec<Uuid> = cues.iter().map(|cue| cue.id).collect();
+
+    // Make sure the endpoint clock exists before preparing the batch. In the
+    // normal case the Worker already owns an open stream, so this is a lookup.
+    let output_ready = ensure_device_output(
+        backend,
+        streams,
+        default_device_name,
+        context,
+        output_settings_by_device,
+        output_peak_meter,
+        performance,
+    )
+    .is_some();
+
+    let sample_frame_clock = output_ready
+        .then(|| {
+            streams
+                .get(default_device_name)
+                .map(|output| output.sample_frame_clock.clone())
+        })
+        .flatten();
+
+    // MAX means "not armed". Every scheduled source emits silence until this
+    // one shared gate is assigned after all decoders and queues are prepared.
+    let start_frame_gate = Arc::new(AtomicU64::new(u64::MAX));
+
+    for cue in cues {
+        handle_command(
+            AudioCommand::Play {
+                id: cue.id,
+                generation: cue.generation,
+                file: cue.file,
+                output_device: None,
+                output_backend: None,
+                output_device_id: None,
+                start_secs: cue.start_secs,
+                end_secs: cue.end_secs,
+                duration_secs: cue.duration_secs,
+                volume: cue.volume,
+                volume_automation_enabled: cue.volume_automation_enabled,
+                volume_automation: cue.volume_automation,
+                time_pitch: cue.time_pitch,
+                fade_in_secs: cue.fade_in_secs,
+                fade_out_secs: cue.fade_out_secs,
+                fade_curve: cue.fade_curve,
+                custom_fade_points: cue.custom_fade_points,
+                channel_routes: cue.channel_routes,
+                output_gains_db: cue.output_gains_db,
+                loop_enabled: cue.loop_enabled,
+                loop_start: cue.loop_start,
+                loop_end: cue.loop_end,
+                loop_count: cue.loop_count,
+            },
+            backend,
+            players,
+            streams,
+            context,
+            default_device_name,
+            output_settings_by_device,
+            output_peak_meter,
+            performance,
+            test_generation,
+            pos_tx,
+            Some(start_frame_gate.clone()),
+            Some(transaction_id),
+        );
+    }
+
+    if let Some(frame_clock) = sample_frame_clock {
+        // Use at least one configured output buffer as a preparation margin.
+        // The exact target is selected only after all sources have been attached.
+        let configured_buffer_frames = streams
+            .get(default_device_name)
+            .and_then(|output| output.performance.buffer_size_frames)
+            .unwrap_or(512) as u64;
+        let preroll_frames = configured_buffer_frames.max(256);
+        let current_frame = frame_clock.load(Ordering::Relaxed);
+        let target_frame = current_frame.saturating_add(preroll_frames);
+        start_frame_gate.store(target_frame, Ordering::Release);
+
+        info!(
+            "Sample-synchronized PlayBatch armed: transaction_id={}, cues={}, cue_ids={:?}, endpoint='{}', backend={}, sample_rate={} Hz, current_frame={}, target_frame={}, preroll={} frames ({:.2} ms)",
+            transaction_id,
+            batch_size,
+            cue_ids,
+            default_device_name,
+            backend.short_label(),
+            streams
+                .get(default_device_name)
+                .map(|output| output.sample_rate)
+                .unwrap_or_default(),
+            current_frame,
+            target_frame,
+            preroll_frames,
+            preroll_frames as f64
+                * 1_000.0
+                / streams
+                    .get(default_device_name)
+                    .map(|output| output.sample_rate.max(1))
+                    .unwrap_or(48_000) as f64
+        );
+    } else {
+        // This fallback is only expected if the native endpoint cannot expose a
+        // render-frame clock. The prepared sources are released immediately.
+        warn!(
+            "Sample-synchronized PlayBatch could not access an output frame clock for '{}'; cues will start immediately without sample alignment",
+            default_device_name
+        );
+        start_frame_gate.store(0, Ordering::Release);
+    }
+}
+
 fn handle_command(
     cmd: AudioCommand,
     backend: AudioBackend,
@@ -3851,8 +5432,12 @@ fn handle_command(
     context: &AudioOutputContext,
     default_device_name: &str,
     output_settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
     test_generation: &Arc<AtomicU64>,
+    pos_tx: &Sender<PositionUpdate>,
+    scheduled_start_gate: Option<Arc<AtomicU64>>,
+    launch_transaction_id: Option<Uuid>,
 ) {
     match cmd {
         AudioCommand::Play {
@@ -3860,6 +5445,8 @@ fn handle_command(
             generation,
             file,
             output_device,
+            output_backend: _,
+            output_device_id: _,
             start_secs,
             end_secs,
             duration_secs,
@@ -3931,22 +5518,31 @@ fn handle_command(
 
             let uses_global_default = output_device.is_none();
             let device_name = output_device.unwrap_or_else(|| default_device_name.to_string());
-            let Some((mixer, output_channels, _sample_rate, output_settings)) =
-                ensure_device_output(
-                    streams,
-                    &device_name,
-                    context,
-                    output_settings_by_device,
-                    performance,
-                )
-            else {
+            let Some((mixer, output_channels, sample_rate, output_settings)) = ensure_device_output(
+                backend,
+                streams,
+                &device_name,
+                context,
+                output_settings_by_device,
+                output_peak_meter,
+                performance,
+            ) else {
                 warn!("Cannot open output device '{}' for cue {}", device_name, id);
                 return;
             };
+            let sample_frame_clock = streams
+                .get(&device_name)
+                .map(|output| output.sample_frame_clock.clone());
+            let start_frame_observed =
+                if scheduled_start_gate.is_some() && sample_frame_clock.is_some() {
+                    Some(Arc::new(AtomicU64::new(u64::MAX)))
+                } else {
+                    None
+                };
 
             info!(
-                "CUE OUTPUT ROUTING: cue={}, device='{}', stream_channels={}, routes={:?}",
-                id, device_name, output_channels, channel_routes
+                "CUE OUTPUT ROUTING: cue={}, backend={}, device='{}', stream_channels={}, sample_rate={} Hz, routes={:?}",
+                id, backend.short_label(), device_name, output_channels, sample_rate, channel_routes
             );
             let initial_volume = if effective_fade_in_secs > 0.0 {
                 0.0
@@ -3975,6 +5571,7 @@ fn handle_command(
                 start_secs,
                 initial_volume,
                 output_channels,
+                sample_rate,
                 route_state.clone(),
                 output_settings.clone(),
                 output_gains_state.clone(),
@@ -3983,6 +5580,9 @@ fn handle_command(
                 automation_update_rx.clone(),
                 time_pitch_state.clone(),
                 position_state.clone(),
+                scheduled_start_gate.clone(),
+                sample_frame_clock,
+                start_frame_observed.clone(),
             ) else {
                 warn!("Cannot open audio file for playback: {:?}", file);
                 return;
@@ -4033,6 +5633,7 @@ fn handle_command(
                 channel_routes: route_state,
                 output_gains: output_gains_state,
                 output_channels,
+                output_sample_rate: sample_rate,
                 output_device: device_name,
                 uses_global_default,
                 mixer,
@@ -4043,11 +5644,20 @@ fn handle_command(
                 loops_remaining: loop_count,
                 paused_at: None,
                 dynamic_fade: None,
+                start_frame_observed,
+                start_frame_reported: false,
+                launch_transaction_id,
             });
         }
 
         AudioCommand::Stop(id) => {
             for player in players.iter().filter(|player| player.id == id) {
+                let _ = pos_tx.try_send(PositionUpdate {
+                    id: player.id,
+                    generation: player.generation,
+                    position_secs: player.current_pos(),
+                    state: CueState::Stopped,
+                });
                 player.sink.stop();
             }
             players.retain(|player| player.id != id);
@@ -4055,6 +5665,12 @@ fn handle_command(
 
         AudioCommand::StopAll => {
             for player in players.iter() {
+                let _ = pos_tx.try_send(PositionUpdate {
+                    id: player.id,
+                    generation: player.generation,
+                    position_secs: player.current_pos(),
+                    state: CueState::Stopped,
+                });
                 player.sink.stop();
             }
             players.clear();
@@ -4084,6 +5700,7 @@ fn handle_command(
                     position,
                     player.current_volume,
                     player.output_channels,
+                    player.output_sample_rate,
                     player.channel_routes.clone(),
                     player.output_settings.clone(),
                     player.output_gains.clone(),
@@ -4092,6 +5709,9 @@ fn handle_command(
                     player.automation_update_rx.clone(),
                     player.time_pitch.clone(),
                     player.position_state.clone(),
+                    None,
+                    None,
+                    None,
                 ) {
                     new_sink.pause();
                     player.sink = new_sink;
@@ -4208,10 +5828,12 @@ fn handle_command(
             // is added directly to that stream's mixer and emits non-zero samples
             // only on the requested native interleaved channel.
             let Some((mixer, output_channels, sample_rate, _)) = ensure_device_output(
+                backend,
                 streams,
                 &device_name,
                 context,
                 output_settings_by_device,
+                output_peak_meter,
                 performance,
             ) else {
                 warn!(
@@ -4258,8 +5880,29 @@ fn handle_command(
                 sample_rate
             );
         }
-        AudioCommand::SetOutputDevice { .. }
+        AudioCommand::SetOutputChannelSettings {
+            device_name,
+            settings,
+        } => {
+            let channels = streams
+                .get(&device_name)
+                .map(|output| output.channels)
+                .unwrap_or_else(|| settings.len().max(1));
+            let shared = shared_output_settings(output_settings_by_device, &device_name, channels);
+            let mut current = shared.write();
+            *current = settings;
+            current.resize(channels.max(1), OutputChannelSetting::default());
+            current.truncate(channels.max(1));
+        }
+        AudioCommand::PlayBatch { .. } => {
+            warn!("PlayBatch reached the single-command handler; refusing to bypass sample scheduling");
+        }
+        AudioCommand::BeginLaunchTransaction { .. }
+        | AudioCommand::EndLaunchTransaction { .. }
+        | AudioCommand::SetOutputDevice { .. }
         | AudioCommand::ReconfigureOutput { .. }
+        | AudioCommand::SetEndpointPreferences { .. }
+        | AudioCommand::UpdateDeviceRegistry { .. }
         | AudioCommand::SetInputDevice(_)
         | AudioCommand::Shutdown => {}
     }
@@ -4269,6 +5912,143 @@ fn handle_command(
 mod channel_router_tests {
     use super::*;
     use rodio::buffer::SamplesBuffer;
+
+    #[test]
+    fn sample_frame_clock_advances_once_per_complete_interleaved_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 6_usize;
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(channels as u16).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.1_f32; 24],
+        );
+        let frame_clock = Arc::new(AtomicU64::new(0));
+        let mut clocked = SampleFrameClockSource::new(source, frame_clock.clone(), channels);
+
+        for _ in 0..(channels - 1) {
+            assert!(clocked.next().is_some());
+            assert_eq!(frame_clock.load(Ordering::Relaxed), 0);
+        }
+        assert!(clocked.next().is_some());
+        assert_eq!(frame_clock.load(Ordering::Relaxed), 1);
+        for _ in 0..channels {
+            assert!(clocked.next().is_some());
+        }
+        assert_eq!(frame_clock.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn scheduled_source_waits_for_the_shared_target_sample_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.25_f32, 0.5, 0.75, 1.0],
+        );
+        let frame_clock = Arc::new(AtomicU64::new(10));
+        let start_gate = Arc::new(AtomicU64::new(12));
+        let observed_start = Arc::new(AtomicU64::new(u64::MAX));
+        let mut scheduled = SampleScheduledSource::new(
+            source,
+            frame_clock.clone(),
+            start_gate,
+            Some(observed_start.clone()),
+        );
+
+        // Both channels of frames 10 and 11 remain silent.
+        assert_eq!(scheduled.next(), Some(0.0));
+        assert_eq!(scheduled.next(), Some(0.0));
+        assert_eq!(scheduled.next(), Some(0.0));
+        assert_eq!(scheduled.next(), Some(0.0));
+
+        frame_clock.store(12, Ordering::Relaxed);
+        assert_eq!(scheduled.next(), Some(0.25));
+        assert_eq!(scheduled.next(), Some(0.5));
+        assert_eq!(scheduled.next(), Some(0.75));
+        assert_eq!(scheduled.next(), Some(1.0));
+        assert_eq!(observed_start.load(Ordering::Acquire), 12);
+    }
+
+    #[test]
+    fn mixer_batch_sources_begin_on_the_same_output_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 2_u16;
+        let sample_rate = 48_000_u32;
+        let (mixer, output) = rodio::mixer::mixer(
+            NonZeroU16::new(channels).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+        );
+        let frame_clock = Arc::new(AtomicU64::new(0));
+        let start_gate = Arc::new(AtomicU64::new(3));
+
+        let observed_frames = [
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(AtomicU64::new(u64::MAX)),
+        ];
+        for (sample, observed) in [0.25_f32, 0.5_f32].into_iter().zip(observed_frames.iter()) {
+            let endpoint_source = rodio::source::UniformSourceIterator::new(
+                SamplesBuffer::new(
+                    NonZeroU16::new(channels).unwrap(),
+                    NonZeroU32::new(sample_rate).unwrap(),
+                    vec![sample; 8],
+                ),
+                NonZeroU16::new(channels).unwrap(),
+                NonZeroU32::new(sample_rate).unwrap(),
+            );
+            mixer.add(SampleScheduledSource::new(
+                endpoint_source,
+                frame_clock.clone(),
+                start_gate.clone(),
+                Some(observed.clone()),
+            ));
+        }
+
+        let mut output =
+            SampleFrameClockSource::new(output, frame_clock.clone(), channels as usize);
+        for _ in 0..(3 * channels as usize) {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert_eq!(frame_clock.load(Ordering::Relaxed), 3);
+        assert_eq!(output.next(), Some(0.75));
+        assert_eq!(output.next(), Some(0.75));
+        assert_eq!(observed_frames[0].load(Ordering::Acquire), 3);
+        assert_eq!(observed_frames[1].load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn output_peak_meter_measures_the_summed_mixer_signal() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let (mixer, source) = rodio::mixer::mixer(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+        );
+        mixer.add(SamplesBuffer::new(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.4_f32; 1_024],
+        ));
+        mixer.add(SamplesBuffer::new(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.5_f32; 1_024],
+        ));
+
+        let peak_bits = Arc::new(AtomicU32::new(0));
+        let mut metered = OutputPeakMeterSource::new(source, peak_bits.clone());
+        for _ in 0..1_024 {
+            assert!(metered.next().is_some());
+        }
+
+        let measured_peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
+        assert!(
+            (measured_peak - 0.9).abs() < 0.000_1,
+            "expected the post-mix peak to be 0.9, got {measured_peak}"
+        );
+    }
 
     #[test]
     fn player_queue_preserves_six_channel_frame_alignment_from_first_sample() {
@@ -4307,6 +6087,56 @@ mod channel_router_tests {
 
         assert_eq!(actual, expected);
         player.stop();
+    }
+
+    #[test]
+    fn mixer_resampling_preserves_source_duration_across_common_rate_ratios() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        fn assert_duration(source_rate: u32, endpoint_rate: u32) {
+            let channels = 2_u16;
+            let (mixer, mixer_source) = rodio::mixer::mixer(
+                NonZeroU16::new(channels).unwrap(),
+                NonZeroU32::new(endpoint_rate).unwrap(),
+            );
+
+            let input = SamplesBuffer::new(
+                NonZeroU16::new(channels).unwrap(),
+                NonZeroU32::new(source_rate).unwrap(),
+                vec![0.25_f32; source_rate as usize * channels as usize],
+            );
+            let (player, queue_source) = rodio::Player::new();
+            player.append(input);
+            player.play();
+            assert_eq!(queue_source.sample_rate().get(), source_rate);
+
+            mixer.add(FrameAlignedPlayerQueue {
+                inner: queue_source,
+            });
+            assert_eq!(mixer_source.sample_rate().get(), endpoint_rate);
+
+            // Render two endpoint seconds. A one-second constant source should
+            // occupy one endpoint second even when the rate ratio is 4:1.
+            let expected_active_samples = endpoint_rate as usize * channels as usize;
+            let rendered = mixer_source
+                .take(expected_active_samples * 2)
+                .collect::<Vec<_>>();
+            let active_samples = rendered.iter().filter(|sample| sample.abs() > 0.1).count();
+            let tolerance = expected_active_samples / 100;
+            assert!(
+                active_samples.abs_diff(expected_active_samples) <= tolerance,
+                "source {} Hz -> endpoint {} Hz produced {} active samples; expected about {}",
+                source_rate,
+                endpoint_rate,
+                active_samples,
+                expected_active_samples
+            );
+            player.stop();
+        }
+
+        assert_duration(44_100, 48_000);
+        assert_duration(48_000, 192_000);
+        assert_duration(192_000, 48_000);
     }
 
     #[test]
@@ -4365,6 +6195,22 @@ mod channel_router_tests {
 
         assert_eq!(actual, expected);
         player.stop();
+    }
+
+    #[test]
+    fn output_mapping_settings_keys_are_scoped_by_backend() {
+        let asio_key = AudioEngine::output_device_config_key_for_backend(
+            AudioBackend::Asio,
+            "US-322 / US-366",
+        );
+        let wasapi_key = AudioEngine::output_device_config_key_for_backend(
+            AudioBackend::Wasapi,
+            "US-322 / US-366",
+        );
+
+        assert_ne!(asio_key, wasapi_key);
+        assert!(asio_key.starts_with("ASIO::"));
+        assert!(wasapi_key.starts_with("WASAPI"));
     }
 
     #[test]

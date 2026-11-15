@@ -17,6 +17,15 @@ enum WaveformAutomationLane {
     Pitch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WaveformRegionMarker {
+    #[default]
+    Start,
+    End,
+    LoopStart,
+    LoopEnd,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct WaveformViewState {
     zoom: f32,
@@ -30,6 +39,32 @@ impl Default for WaveformViewState {
             offset: 0.0,
         }
     }
+}
+
+fn nearest_region_marker(
+    pointer_x: f32,
+    start_x: f32,
+    end_x: Option<f32>,
+    loop_start_x: Option<f32>,
+    loop_end_x: Option<f32>,
+) -> Option<WaveformRegionMarker> {
+    let mut candidates = vec![(WaveformRegionMarker::Start, start_x)];
+    if let Some(x) = end_x {
+        candidates.push((WaveformRegionMarker::End, x));
+    }
+    if let Some(x) = loop_start_x {
+        candidates.push((WaveformRegionMarker::LoopStart, x));
+    }
+    if let Some(x) = loop_end_x {
+        candidates.push((WaveformRegionMarker::LoopEnd, x));
+    }
+
+    candidates
+        .into_iter()
+        .map(|(marker, x)| (marker, (x - pointer_x).abs()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .filter(|(_, distance)| *distance <= 25.0)
+        .map(|(marker, _)| marker)
 }
 
 impl WaveformEditor {
@@ -49,12 +84,14 @@ impl WaveformEditor {
             ui.separator();
 
             ui.label("Start:");
-            ui.add(
-                DragValue::new(&mut cue.start_secs)
-                    .range(0.0..=eff_end)
-                    .speed(0.02)
-                    .suffix(" s"),
-            );
+            Theme::input_scope(ui, |ui| {
+                ui.add(
+                    DragValue::new(&mut cue.start_secs)
+                        .range(0.0..=eff_end)
+                        .speed(0.02)
+                        .suffix(" s"),
+                );
+            });
 
             let mut has_custom_end = cue.end_secs.is_some();
             if ui
@@ -70,12 +107,14 @@ impl WaveformEditor {
 
             let start_min = cue.start_secs;
             if let Some(ref mut end_val) = cue.end_secs {
-                ui.add(
-                    DragValue::new(end_val)
-                        .range(start_min..=dur)
-                        .speed(0.02)
-                        .suffix(" s"),
-                );
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(end_val)
+                            .range(start_min..=dur)
+                            .speed(0.02)
+                            .suffix(" s"),
+                    );
+                });
             }
 
             ui.separator();
@@ -95,21 +134,25 @@ impl WaveformEditor {
             if cue.loop_region.enabled {
                 let loop_end_max = cue.loop_region.end_secs.max(0.01);
                 ui.label("Loop Start:");
-                ui.add(
-                    DragValue::new(&mut cue.loop_region.start_secs)
-                        .range(0.0..=loop_end_max)
-                        .speed(0.02)
-                        .suffix(" s"),
-                );
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(&mut cue.loop_region.start_secs)
+                            .range(0.0..=loop_end_max)
+                            .speed(0.02)
+                            .suffix(" s"),
+                    );
+                });
 
                 let loop_start_min = cue.loop_region.start_secs;
                 ui.label("Loop End:");
-                ui.add(
-                    DragValue::new(&mut cue.loop_region.end_secs)
-                        .range(loop_start_min..=dur)
-                        .speed(0.02)
-                        .suffix(" s"),
-                );
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(&mut cue.loop_region.end_secs)
+                            .range(loop_start_min..=dur)
+                            .speed(0.02)
+                            .suffix(" s"),
+                    );
+                });
 
                 let mut inf = cue.loop_region.count < 0;
                 if ui.checkbox(&mut inf, "∞ Infinite").changed() {
@@ -117,9 +160,11 @@ impl WaveformEditor {
                 }
                 if !inf {
                     let mut n = cue.loop_region.count.max(1);
-                    if ui
-                        .add(DragValue::new(&mut n).range(1..=999).suffix("×"))
-                        .changed()
+                    if Theme::input_scope(ui, |ui| {
+                        ui.add(DragValue::new(&mut n).range(1..=999).suffix("×"))
+                    })
+                    .inner
+                    .changed()
                     {
                         cue.loop_region.count = n;
                     }
@@ -163,7 +208,8 @@ impl WaveformEditor {
         };
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Automation:").color(Theme::accent()).strong());
-            ComboBox::from_id_salt(("waveform_automation_select", cue.id))
+            Theme::input_scope(ui, |ui| {
+                ComboBox::from_id_salt(("waveform_automation_select", cue.id))
                 .selected_text(match automation_lane {
                     WaveformAutomationLane::Volume => "Volume",
                     WaveformAutomationLane::Speed => "Playback speed (×)",
@@ -174,6 +220,7 @@ impl WaveformEditor {
                     ui.selectable_value(&mut automation_lane, WaveformAutomationLane::Speed, "Playback speed (×)");
                     ui.selectable_value(&mut automation_lane, WaveformAutomationLane::Pitch, "Pitch shift (cents)");
                 });
+            });
             if automation_lane != ui
                 .ctx()
                 .data(|data| data.get_temp::<WaveformAutomationLane>(lane_id))
@@ -247,7 +294,7 @@ impl WaveformEditor {
                     }
                 };
                 ui.label(RichText::new(format!("{} · click curve to add · drag points · right-click to remove", hint))
-                    .color(Theme::text_dim()).size(10.0));
+                    .color(Theme::text_dim()).size(Theme::scaled_font_size(10.0)));
                 if ui.small_button("Reset curve").clicked() {
                     automation_points = vec![[0.0, default_value], [dur, default_value]];
                     match automation_lane {
@@ -363,11 +410,16 @@ impl WaveformEditor {
         );
 
         if cue.waveform.is_empty() || cue.duration_secs <= 0.0 {
+            let message = if cue.file_path.is_file() {
+                "Generating waveform in background…"
+            } else {
+                "Audio file unavailable — check the media path"
+            };
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "No waveform data (select an Audio cue with a loaded file)",
-                FontId::proportional(12.0),
+                message,
+                FontId::proportional(Theme::scaled_font_size(12.0)),
                 Theme::text_dim(),
             );
             Self::store_automation_lane(cue, automation_lane, lane_enabled, automation_points);
@@ -624,7 +676,7 @@ impl WaveformEditor {
                     pos2(x, rect.bottom() - 13.0),
                     Align2::CENTER_BOTTOM,
                     format_timecode(tick),
-                    FontId::monospace(10.0),
+                    FontId::monospace(Theme::scaled_font_size(10.0)),
                     Color32::WHITE,
                 );
             }
@@ -636,7 +688,7 @@ impl WaveformEditor {
             pos2(rect.right() - 8.0, rect.top() + 6.0),
             Align2::RIGHT_TOP,
             format!("{:.1}×", view.zoom),
-            FontId::monospace(12.0),
+            FontId::monospace(Theme::scaled_font_size(12.0)),
             Color32::WHITE,
         );
 
@@ -782,40 +834,74 @@ impl WaveformEditor {
             }
         }
 
-        // Dragging near a region marker edits it instead of seeking or drawing
-        // automation. A volume node takes precedence when one was grabbed.
-        if resp.dragged() && dragging_point.is_none() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let secs = x_to_secs(pos.x).clamp(0.0, dur);
-                let start_dx = (secs_to_x(cue.start_secs) - pos.x).abs();
-                let end_dx = cue
-                    .end_secs
-                    .map(|e| (secs_to_x(e) - pos.x).abs())
-                    .unwrap_or(f32::INFINITY);
-                let loop_s_dx = if cue.loop_region.enabled {
-                    (secs_to_x(cue.loop_region.start_secs) - pos.x).abs()
-                } else {
-                    f32::INFINITY
-                };
-                let loop_e_dx = if cue.loop_region.enabled {
-                    (secs_to_x(cue.loop_region.end_secs) - pos.x).abs()
-                } else {
-                    f32::INFINITY
-                };
+        // Capture the region handle once when the drag begins. Do not re-detect
+        // the nearest handle on every frame: after a fast pointer movement the
+        // cursor can be more than 25 px away from the marker and the old logic
+        // would stop updating it. Use press_origin so the initial handle is
+        // still identified even if the pointer has already moved by drag-start.
+        let region_drag_id = Id::new(("waveform_region_marker_drag", cue.id));
+        let mut dragging_region_marker = ui
+            .ctx()
+            .data(|data| data.get_temp::<WaveformRegionMarker>(region_drag_id));
 
-                let min_dx = start_dx.min(end_dx).min(loop_s_dx).min(loop_e_dx);
-                if min_dx < 25.0 {
-                    if min_dx == start_dx {
+        if resp.drag_started() && dragging_point.is_none() {
+            let press_origin = ui
+                .ctx()
+                .input(|input| input.pointer.press_origin())
+                .or_else(|| resp.interact_pointer_pos());
+
+            if let Some(origin) = press_origin {
+                dragging_region_marker = nearest_region_marker(
+                    origin.x,
+                    secs_to_x(cue.start_secs),
+                    cue.end_secs.map(secs_to_x),
+                    cue.loop_region
+                        .enabled
+                        .then(|| secs_to_x(cue.loop_region.start_secs)),
+                    cue.loop_region
+                        .enabled
+                        .then(|| secs_to_x(cue.loop_region.end_secs)),
+                );
+
+                if let Some(marker) = dragging_region_marker {
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(region_drag_id, marker));
+                }
+            }
+        }
+
+        // While a region handle is captured, keep following the pointer even
+        // when it moves far away from the original marker or outside the rect.
+        // The active egui pointer position remains available for the drag.
+        if resp.dragged() && dragging_point.is_none() {
+            let pointer = ui
+                .ctx()
+                .input(|input| input.pointer.interact_pos())
+                .or_else(|| resp.interact_pointer_pos());
+
+            if let (Some(marker), Some(pos)) = (dragging_region_marker, pointer) {
+                let secs = x_to_secs(pos.x).clamp(0.0, dur);
+                match marker {
+                    WaveformRegionMarker::Start => {
                         cue.start_secs = secs.min(eff_end);
-                    } else if min_dx == end_dx {
+                    }
+                    WaveformRegionMarker::End => {
                         cue.end_secs = Some(secs.max(cue.start_secs));
-                    } else if min_dx == loop_s_dx {
+                    }
+                    WaveformRegionMarker::LoopStart => {
                         cue.loop_region.start_secs = secs.min(cue.loop_region.end_secs);
-                    } else {
+                    }
+                    WaveformRegionMarker::LoopEnd => {
                         cue.loop_region.end_secs = secs.max(cue.loop_region.start_secs);
                     }
                 }
+                ui.ctx().request_repaint();
             }
+        }
+
+        if resp.drag_stopped() {
+            ui.ctx()
+                .data_mut(|data| data.remove_temp::<WaveformRegionMarker>(region_drag_id));
         }
 
         // Full-width waveform scrollbar. The track spans the whole editor and
@@ -894,7 +980,7 @@ impl WaveformEditor {
             pos2(x, rect.top() + 2.0),
             Align2::CENTER_TOP,
             label,
-            FontId::monospace(9.0),
+            FontId::monospace(Theme::scaled_font_size(9.0)),
             color,
         );
     }
@@ -947,6 +1033,35 @@ mod timecode_tests {
     fn formats_hours_minutes_seconds_and_milliseconds() {
         assert_eq!(format_timecode(3661.234), "01:01:01.234");
         assert_eq!(format_timecode(120.0), "00:02:00.000");
+    }
+}
+
+#[cfg(test)]
+mod region_marker_drag_tests {
+    use super::{nearest_region_marker, WaveformRegionMarker};
+
+    #[test]
+    fn captures_start_marker_from_pointer_press_origin() {
+        assert_eq!(
+            nearest_region_marker(101.0, 100.0, Some(400.0), None, None),
+            Some(WaveformRegionMarker::Start)
+        );
+    }
+
+    #[test]
+    fn captures_nearest_enabled_loop_marker() {
+        assert_eq!(
+            nearest_region_marker(302.0, 100.0, Some(500.0), Some(200.0), Some(300.0)),
+            Some(WaveformRegionMarker::LoopEnd)
+        );
+    }
+
+    #[test]
+    fn ignores_pointer_press_far_from_all_region_markers() {
+        assert_eq!(
+            nearest_region_marker(250.0, 100.0, Some(400.0), None, None),
+            None
+        );
     }
 }
 

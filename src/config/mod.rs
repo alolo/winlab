@@ -157,14 +157,26 @@ impl AudioBackend {
     }
 }
 
-/// User-selected global output stream parameters. `None` delegates to the
-/// backend/device default. DirectSound maps the buffer setting to its queued
-/// audio safety window; CPAL backends map it to callback frames.
+/// User-selected output stream parameters for WASAPI and DirectSound. `None`
+/// delegates to the backend/device default. ASIO always normalizes this struct
+/// to `None` because its clock and hardware block size belong to the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AudioPerformanceSettings {
     pub sample_rate: Option<u32>,
     pub buffer_size_frames: Option<u32>,
+}
+
+impl AudioPerformanceSettings {
+    /// ASIO owns its clock and hardware block size. TaSQ must never request
+    /// either value; the driver control panel is the single source of truth.
+    pub fn for_backend(backend: AudioBackend, requested: Self) -> Self {
+        if backend == AudioBackend::Asio {
+            Self::default()
+        } else {
+            requested
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -174,6 +186,43 @@ pub enum ThemePreset {
     Light,
     Black,
     Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UiScalePreset {
+    #[default]
+    Standard,
+    Large,
+    Small,
+    Custom,
+}
+
+impl UiScalePreset {
+    pub const ALL: &'static [UiScalePreset] = &[
+        UiScalePreset::Standard,
+        UiScalePreset::Large,
+        UiScalePreset::Small,
+        UiScalePreset::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiScalePreset::Standard => "Standard · 100%",
+            UiScalePreset::Large => "Large · 125%",
+            UiScalePreset::Small => "Small · 75%",
+            UiScalePreset::Custom => "Custom",
+        }
+    }
+
+    pub fn factor(self, custom_percent: u16) -> f32 {
+        let percent = match self {
+            UiScalePreset::Standard => 100,
+            UiScalePreset::Large => 125,
+            UiScalePreset::Small => 75,
+            UiScalePreset::Custom => custom_percent.clamp(75, 150),
+        };
+        percent as f32 / 100.0
+    }
 }
 
 impl ThemePreset {
@@ -192,6 +241,16 @@ impl ThemePreset {
             ThemePreset::Custom => "Custom",
         }
     }
+}
+
+/// Optional per-role icon override used by the Custom appearance preset.
+/// Built-in choices reuse the supplied icon pack; custom files are copied into
+/// the user's TaSQ configuration folder so moving the original file is safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", content = "value")]
+pub enum IconOverride {
+    Builtin(String),
+    CustomFile(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -229,13 +288,16 @@ pub struct AppearanceSettings {
     /// Fill and waveform tint used for the active loop region.
     #[serde(default = "default_loop_region_color")]
     pub loop_region_color: [u8; 3],
-    /// Base fill for ordinary buttons, including the main cue-creation toolbar.
+    /// Base fill for ordinary buttons.
     #[serde(default = "default_button_color")]
     pub button_color: [u8; 3],
+    /// Background fill for the icon buttons in the upper toolbar (Custom theme only).
+    #[serde(default = "default_toolbar_button_color")]
+    pub toolbar_button_color: [u8; 3],
     /// Outline color used to frame Group cue blocks in the Cue List.
     #[serde(default = "default_group_outline_color")]
     pub group_outline_color: [u8; 3],
-    /// Background fill for text inputs and editable fields.
+    /// Background fill for text inputs, numeric controls and dropdown selectors.
     #[serde(default = "default_input_color")]
     pub input_color: [u8; 3],
     /// Dedicated transport button colors.
@@ -247,6 +309,15 @@ pub struct AppearanceSettings {
     pub pause_button_color: [u8; 3],
     #[serde(default)]
     pub design: UiDesign,
+    /// Text and Cue List row scale. Does not scale toolbar icons, controls or faders.
+    #[serde(default)]
+    pub ui_scale: UiScalePreset,
+    /// Custom text/Cue List scale percentage, used when ui_scale is Custom.
+    #[serde(default = "default_custom_ui_scale_percent")]
+    pub custom_ui_scale_percent: u16,
+    /// Per-role icon overrides are applied only while the Custom theme is active.
+    #[serde(default)]
+    pub icon_overrides: HashMap<String, IconOverride>,
 }
 
 impl Default for AppearanceSettings {
@@ -259,14 +330,22 @@ impl Default for AppearanceSettings {
             muted_text_color: [150, 150, 165],
             loop_region_color: [75, 155, 245],
             button_color: [42, 45, 54],
+            toolbar_button_color: [255, 255, 255],
             group_outline_color: [60, 220, 130],
             input_color: [18, 20, 25],
             go_button_color: [40, 180, 80],
             stop_button_color: [200, 50, 50],
             pause_button_color: [200, 160, 30],
             design: UiDesign::Material,
+            ui_scale: UiScalePreset::Standard,
+            custom_ui_scale_percent: 100,
+            icon_overrides: HashMap::new(),
         }
     }
+}
+
+fn default_custom_ui_scale_percent() -> u16 {
+    100
 }
 
 fn default_loop_region_color() -> [u8; 3] {
@@ -275,6 +354,10 @@ fn default_loop_region_color() -> [u8; 3] {
 
 fn default_button_color() -> [u8; 3] {
     [42, 45, 54]
+}
+
+fn default_toolbar_button_color() -> [u8; 3] {
+    [255, 255, 255]
 }
 
 fn default_group_outline_color() -> [u8; 3] {
@@ -327,6 +410,9 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// Maximum number of project paths retained by File → Open Recent.
+pub const MAX_RECENT_PROJECTS: usize = 15;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -348,6 +434,11 @@ pub struct AppSettings {
     /// Requested output buffer in frames; None uses the backend default.
     #[serde(default)]
     pub audio_buffer_size_frames: Option<u32>,
+    /// Per-endpoint sample-rate and buffer preferences. Keys use the same
+    /// `backend::device-name` format as output_channel_settings_by_device.
+    /// These are workstation preferences, not project routing.
+    #[serde(default)]
+    pub audio_performance_settings_by_device: HashMap<String, AudioPerformanceSettings>,
     pub audio_input_device: Option<String>,
     pub osc_listen_port: u16,
     pub osc_send_addr: String,
@@ -363,11 +454,14 @@ pub struct AppSettings {
     /// Native ASIO channel names are queried separately from the driver.
     #[serde(default)]
     pub output_channel_names: HashMap<String, Vec<String>>,
-    /// Default stereo left/right logical TaSQ output indices for each device.
+    /// Workstation template for new projects and migration of legacy projects:
+    /// default stereo left/right logical TaSQ output indices for each device.
+    /// The active project's values are stored in Project::audio_routing.
     #[serde(default)]
     pub default_output_pairs: HashMap<String, [usize; 2]>,
-    /// Logical TaSQ output order mapped to native driver stream-channel indices.
-    /// Each vector is a permutation, keyed by backend and device name.
+    /// Workstation template for new projects and migration of legacy projects:
+    /// logical TaSQ output order mapped to native driver stream-channel indices.
+    /// The active project's values are stored in Project::audio_routing.
     #[serde(default)]
     pub output_channel_orders: HashMap<String, Vec<usize>>,
     /// Version of saved default-pair semantics: 3 = logical TaSQ outputs.
@@ -389,6 +483,10 @@ pub struct AppSettings {
     /// None uses the standard per-user LocalAppData folder.
     #[serde(default)]
     pub diagnostic_log_directory: Option<String>,
+    /// Most recently opened or saved project files, newest first. Missing paths
+    /// are intentionally retained so the UI can show them as unavailable.
+    #[serde(default)]
+    pub recent_projects: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -401,6 +499,7 @@ impl Default for AppSettings {
             audio_output_device_id: None,
             audio_sample_rate: None,
             audio_buffer_size_frames: None,
+            audio_performance_settings_by_device: HashMap::new(),
             audio_input_device: None,
             osc_listen_port: 7700,
             osc_send_addr: "127.0.0.1:7701".to_string(),
@@ -418,6 +517,7 @@ impl Default for AppSettings {
             bottom_panel_height: default_bottom_panel_height(),
             backup_interval_minutes: default_backup_interval_minutes(),
             diagnostic_log_directory: None,
+            recent_projects: Vec::new(),
         }
     }
 }
@@ -466,6 +566,15 @@ impl AppSettings {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
+
+        let recent_count_before_normalization = settings.recent_projects.len();
+        settings
+            .recent_projects
+            .retain(|path| !path.trim().is_empty());
+        settings.recent_projects.truncate(MAX_RECENT_PROJECTS);
+        if settings.recent_projects.len() != recent_count_before_normalization {
+            let _ = settings.save();
+        }
 
         // Move the old CueLabs preferences to the new application namespace.
         // The legacy file is deliberately retained as a safety copy.
@@ -562,6 +671,7 @@ mod stable_audio_settings_tests {
         assert!(settings.audio_sample_rate.is_none());
         assert!(settings.audio_buffer_size_frames.is_none());
         assert_eq!(settings.audio_routing_schema, 0);
+        assert!(settings.recent_projects.is_empty());
     }
 
     #[test]
@@ -574,5 +684,134 @@ mod stable_audio_settings_tests {
         let decoded: AudioPerformanceSettings =
             serde_json::from_str(&encoded).expect("settings should deserialize");
         assert_eq!(decoded, settings);
+
+        let mut app_settings = AppSettings::default();
+        app_settings
+            .audio_performance_settings_by_device
+            .insert("ASIO::TASCAM US-366".to_string(), settings);
+        let encoded =
+            serde_json::to_string(&app_settings).expect("application settings should serialize");
+        let decoded: AppSettings =
+            serde_json::from_str(&encoded).expect("application settings should deserialize");
+        assert_eq!(
+            decoded
+                .audio_performance_settings_by_device
+                .get("ASIO::TASCAM US-366"),
+            Some(&settings)
+        );
+
+        let legacy: AppSettings = serde_json::from_str(r#"{"osc_listen_port":7700}"#)
+            .expect("legacy settings without per-endpoint preferences should load");
+        assert!(legacy.audio_performance_settings_by_device.is_empty());
+    }
+
+    #[test]
+    fn recent_projects_settings_round_trip_and_keep_legacy_defaults() {
+        let mut settings = AppSettings::default();
+        settings.recent_projects = vec![
+            r"C:\Shows\OpeningNight.tsq".to_string(),
+            r"D:\Archive\Tour.tsq".to_string(),
+        ];
+
+        let encoded = serde_json::to_string(&settings).expect("settings should serialize");
+        let decoded: AppSettings =
+            serde_json::from_str(&encoded).expect("settings should deserialize");
+        assert_eq!(decoded.recent_projects, settings.recent_projects);
+
+        let legacy: AppSettings = serde_json::from_str(r#"{"osc_listen_port":7700}"#)
+            .expect("legacy settings without recent projects should load");
+        assert!(legacy.recent_projects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audio_performance_settings_tests {
+    use super::*;
+
+    #[test]
+    fn asio_uses_driver_owned_rate_and_buffer() {
+        let requested = AudioPerformanceSettings {
+            sample_rate: Some(192_000),
+            buffer_size_frames: Some(256),
+        };
+        assert_eq!(
+            AudioPerformanceSettings::for_backend(AudioBackend::Asio, requested),
+            AudioPerformanceSettings::default()
+        );
+    }
+
+    #[test]
+    fn wasapi_and_directsound_keep_user_selected_performance() {
+        let requested = AudioPerformanceSettings {
+            sample_rate: Some(96_000),
+            buffer_size_frames: Some(1_024),
+        };
+        assert_eq!(
+            AudioPerformanceSettings::for_backend(AudioBackend::Wasapi, requested),
+            requested
+        );
+        assert_eq!(
+            AudioPerformanceSettings::for_backend(AudioBackend::DirectSound, requested),
+            requested
+        );
+    }
+}
+
+#[cfg(test)]
+mod ui_scale_settings_tests {
+    use super::{AppearanceSettings, UiScalePreset};
+
+    #[test]
+    fn fixed_ui_scale_presets_resolve_to_expected_percentages() {
+        assert_eq!(UiScalePreset::Standard.factor(160), 1.0);
+        assert_eq!(UiScalePreset::Large.factor(80), 1.25);
+        assert_eq!(UiScalePreset::Small.factor(160), 0.75);
+    }
+
+    #[test]
+    fn custom_ui_scale_is_clamped_to_supported_range() {
+        assert_eq!(UiScalePreset::Custom.factor(75), 0.75);
+        assert_eq!(UiScalePreset::Custom.factor(137), 1.37);
+        assert_eq!(UiScalePreset::Custom.factor(150), 1.5);
+        assert_eq!(UiScalePreset::Custom.factor(50), 0.75);
+        assert_eq!(UiScalePreset::Custom.factor(200), 1.5);
+    }
+
+    #[test]
+    fn legacy_appearance_settings_default_to_standard_scale() {
+        let appearance: AppearanceSettings =
+            serde_json::from_str(r#"{"preset":"Dark","window_color":[18,18,22]}"#)
+                .expect("legacy appearance settings should deserialize");
+
+        assert_eq!(appearance.ui_scale, UiScalePreset::Standard);
+        assert_eq!(appearance.custom_ui_scale_percent, 100);
+    }
+
+    #[test]
+    fn custom_ui_scale_round_trips_through_json() {
+        let mut appearance = AppearanceSettings::default();
+        appearance.ui_scale = UiScalePreset::Custom;
+        appearance.custom_ui_scale_percent = 137;
+
+        let encoded = serde_json::to_string(&appearance).expect("serialize appearance");
+        let decoded: AppearanceSettings =
+            serde_json::from_str(&encoded).expect("deserialize appearance");
+
+        assert_eq!(decoded.ui_scale, UiScalePreset::Custom);
+        assert_eq!(decoded.custom_ui_scale_percent, 137);
+    }
+}
+
+#[cfg(test)]
+mod appearance_settings_compatibility_tests {
+    use super::{AppearanceSettings, ThemePreset};
+
+    #[test]
+    fn legacy_custom_appearance_defaults_the_new_toolbar_button_color() {
+        let appearance: AppearanceSettings =
+            serde_json::from_str(r#"{"preset":"Custom"}"#).expect("legacy appearance settings");
+
+        assert_eq!(appearance.preset, ThemePreset::Custom);
+        assert_eq!(appearance.toolbar_button_color, [255, 255, 255]);
     }
 }

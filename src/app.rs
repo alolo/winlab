@@ -2,21 +2,34 @@
 
 use crate::audio::device_registry::DeviceRegistryMonitor;
 use crate::audio::engine::{AudioCommand, AudioEngine};
-use crate::audio::waveform::{generate_waveform, get_channel_count, get_duration};
+use crate::audio::waveform::{
+    analyze_audio_file, audio_analysis_cache_stats, AudioAnalysisCacheStats,
+    WaveformAnalysisManager,
+};
+use crate::audio::worker::AudioWorkerManagerEvent;
 use crate::config::{
-    AppAction, AppSettings, AudioBackend, AudioPerformanceSettings, MidiControlBinding,
-    MidiControlKind, ThemePreset, UiDesign,
+    AppAction, AppSettings, AudioBackend, AudioPerformanceSettings, IconOverride,
+    MidiControlBinding, MidiControlKind, ThemePreset, UiDesign, UiScalePreset, MAX_RECENT_PROJECTS,
 };
 use crate::cue::{
     ContinueMode, Cue, CueList, CueState, CueType, FadeCurve, GroupMode, MidiMessageKind,
     OscCueArg, WaitPhase,
 };
 use crate::export::session_report::SessionReport;
-use crate::midi::input::{MidiInputManager, MidiOutputManager};
-use crate::osc::server::OscServer;
-use crate::project::{asset_manager::AssetManager, save_load::Project};
+use crate::midi::input::{MidiDispatch, MidiInputManager, MidiOutputManager};
+use crate::osc::server::{OscDispatch, OscServer};
+use crate::performance::SystemCpuMonitor;
+use crate::project::{
+    asset_manager::AssetManager,
+    save_load::{Project, ProjectAudioRouting},
+};
 use crate::ui::{
+    audio_log::AudioLogViewer,
     cue_table::{visible_cue_ids, visible_navigation_cue_ids, CueTable, CueTableAction, EditField},
+    icons::{
+        icon_button, icon_selectable_label, import_custom_icon, toolbar_icon_colors, IconManager,
+        BUILTIN_ICON_KEYS, TOOLBAR_ICON_ROLES,
+    },
     inspector::{Inspector, InspectorAction},
     theme::Theme,
     transport::{TransportAction, TransportBar},
@@ -25,14 +38,16 @@ use crate::ui::{
 
 use eframe::egui::{self, Context, Id, Key, RichText};
 use rfd::FileDialog;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const INTERNAL_CUE_CLIPBOARD_MARKER: &str = "TheatreShowCue::InternalCueClipboard::v1";
 const WAVEFORM_BUCKETS: usize = 4096;
+static SLOW_GUI_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn edit_rgb_color(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
     ui.horizontal(|ui| {
@@ -70,10 +85,56 @@ fn project_name_from_path(path: &Path) -> String {
 }
 
 fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
     }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn remember_recent_project_path(recent_projects: &mut Vec<String>, path: &Path) {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    recent_projects
+        .retain(|existing| !paths_refer_to_same_location(Path::new(existing), &normalized));
+    recent_projects.insert(0, normalized.to_string_lossy().into_owned());
+    recent_projects.truncate(MAX_RECENT_PROJECTS);
+}
+
+fn recent_project_menu_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn recent_project_hover_path(path: &Path) -> String {
+    let display = path.to_string_lossy();
+
+    if let Some(unc_path) = display.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc_path}")
+    } else if let Some(normal_path) = display.strip_prefix(r"\\?\") {
+        normal_path.to_string()
+    } else {
+        display.into_owned()
+    }
+}
+
+fn serialize_project_snapshot(project: &Project, cue_list: &CueList) -> Option<Vec<u8>> {
+    let mut snapshot = project.clone();
+    snapshot.cue_list = cue_list.clone();
+    serde_json::to_vec(&snapshot).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePromptKind {
+    ExistingProject,
+    NewProject,
 }
 
 fn sanitize_project_name(name: &str) -> Option<String> {
@@ -111,16 +172,15 @@ fn cue_uses_output_endpoint(
         return false;
     }
 
+    if let Some(saved_id) = cue.io.output_device_id.as_deref() {
+        // A stable ID is authoritative. Never let a matching display name
+        // redirect a Cue to a different physical endpoint.
+        return saved_id == endpoint_id;
+    }
+
     match cue.io.output_device.as_deref() {
-        None => cue
-            .io
-            .output_device_id
-            .as_deref()
-            .map_or(true, |saved_id| saved_id == endpoint_id),
-        Some(saved_name) => match cue.io.output_device_id.as_deref() {
-            Some(saved_id) => saved_id == endpoint_id || saved_name == device_name,
-            None => saved_name == device_name,
-        },
+        None => true,
+        Some(saved_name) => saved_name == device_name,
     }
 }
 
@@ -162,6 +222,84 @@ fn cue_owns_audio_stream(cue: &Cue) -> bool {
             && !cue.file_path.as_os_str().is_empty())
 }
 
+/// Configure default channel routes once source-channel metadata is available.
+/// This helper is shared by synchronous imports and background project analysis.
+fn ensure_audio_cue_routes(audio: &AudioEngine, cue: &mut Cue) {
+    if cue.audio_channels == 0 {
+        return;
+    }
+
+    let route_backend = cue
+        .io
+        .output_backend
+        .or_else(|| {
+            cue.io
+                .output_device_id
+                .as_deref()
+                .and_then(|id| audio.device_registry.find_by_id(id))
+                .map(|endpoint| endpoint.backend)
+        })
+        .unwrap_or(audio.backend);
+    let route_device_name = cue
+        .io
+        .output_device
+        .clone()
+        .or_else(|| {
+            cue.io
+                .output_device_id
+                .as_deref()
+                .and_then(|id| audio.device_registry.find_by_id(id))
+                .filter(|endpoint| endpoint.backend == route_backend)
+                .map(|endpoint| endpoint.device_name.clone())
+        })
+        .unwrap_or_else(|| audio.current_device.clone());
+    let registered_route_id = if cue.io.output_device_id.is_none() && cue.io.output_device.is_some()
+    {
+        audio.registered_endpoint_id(route_backend, &route_device_name)
+    } else {
+        None
+    };
+    let route_endpoint_id = cue
+        .io
+        .output_device_id
+        .as_deref()
+        .or(registered_route_id.as_deref())
+        .or_else(|| {
+            cue.io
+                .output_device
+                .is_none()
+                .then_some(audio.current_device_id.as_str())
+        });
+    let output_count = audio.output_channels_for_endpoint(
+        route_backend,
+        route_endpoint_id,
+        Some(&route_device_name),
+    );
+    let default_route_channels = audio.default_route_channels_for_source_endpoint(
+        route_backend,
+        route_endpoint_id,
+        Some(&route_device_name),
+        cue.audio_channels,
+    );
+    cue.io.ensure_channel_routes_with_defaults(
+        cue.audio_channels,
+        output_count,
+        &default_route_channels,
+    );
+}
+
+fn waveform_path_key(path: &Path) -> PathBuf {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(normalized.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Panel {
     Inspector,
@@ -192,6 +330,8 @@ enum PendingAction {
     BeginPostWait,
     ClearWait,
     CompleteCue,
+    StartAllCuesSegment,
+    AdvanceAllCues,
 }
 
 #[derive(Debug, Clone)]
@@ -212,10 +352,61 @@ struct ActivePlaylist {
     fade_out_secs: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AllCuesSegment {
+    /// Cues in this segment start in the same launch transaction.
+    children: Vec<Uuid>,
+    /// Delay before the first Cue in this segment starts.
+    pre_wait_secs: f64,
+    /// Delay after the last Cue starts before the next segment is released.
+    post_wait_secs: f64,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveAllCues {
     group_id: Uuid,
+    segments: Vec<AllCuesSegment>,
+    next_segment_idx: usize,
     remaining: HashSet<Uuid>,
+    fade_in_secs: f64,
+    fade_out_secs: f64,
+}
+
+/// Build consecutive All Cues launch segments. A non-zero pre-wait starts
+/// a new segment; a non-zero post-wait closes the current segment. Therefore
+/// every segment contains only Cue events that may start in one transaction.
+fn build_all_cues_segments(cue_list: &CueList, children: &[Uuid]) -> Vec<AllCuesSegment> {
+    let mut segments = Vec::new();
+    let mut current = AllCuesSegment::default();
+
+    for child_id in children {
+        let Some(cue) = cue_list.find(*child_id) else {
+            continue;
+        };
+        let pre_wait = cue.pre_wait_secs.max(0.0);
+        let post_wait = cue.post_wait_secs.max(0.0);
+
+        if pre_wait > 0.0 && !current.children.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+
+        if current.children.is_empty() {
+            current.pre_wait_secs = pre_wait;
+        }
+
+        current.children.push(*child_id);
+
+        if post_wait > 0.0 {
+            current.post_wait_secs = post_wait;
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.children.is_empty() {
+        segments.push(current);
+    }
+
+    segments
 }
 
 /// Analyse a Normal group's automatic chain without changing runtime state.
@@ -278,9 +469,10 @@ fn normal_group_manual_stop_in(
 
 pub struct TheatreShowCueApp {
     audio: AudioEngine,
+    icons: IconManager,
     device_registry_monitor: DeviceRegistryMonitor,
-    /// True after the active endpoint disappears; the next explicit selection
-    /// of that same endpoint rebuilds the stream after it is reconnected.
+    /// True while the global endpoint worker is missing or awaiting recovery.
+    /// The worker manager clears this after automatic or manual restoration.
     active_output_needs_reopen: bool,
     midi: MidiInputManager,
     midi_out: MidiOutputManager,
@@ -290,12 +482,20 @@ pub struct TheatreShowCueApp {
     project: Project,
     project_path: Option<PathBuf>,
     project_needs_save_as: bool,
+    /// Serialized project state at the last successful open/save. Runtime-only
+    /// Cue state is excluded by the Cue serde model.
+    saved_project_snapshot: Option<Vec<u8>>,
+    close_prompt: Option<ClosePromptKind>,
+    close_allowed: bool,
     assets: AssetManager,
     report: SessionReport,
     settings: AppSettings,
     settings_open: bool,
     settings_tab: SettingsTab,
     hotkey_capture: Option<AppAction>,
+    /// Cue-specific keyboard capture is stored by stable Cue ID.
+    cue_hotkey_capture: Option<Uuid>,
+    audio_log_viewer: AudioLogViewer,
     midi_learn_action: Option<AppAction>,
     midi_cc_pressed: HashSet<(u8, u8)>,
 
@@ -312,6 +512,10 @@ pub struct TheatreShowCueApp {
     expanded_groups: HashSet<Uuid>,
     active_panel: Panel,
     master_vol: f32,
+    /// Latest output peak across all active endpoint workers (linear amplitude).
+    output_meter_peak: f32,
+    /// System-wide CPU usage sampled once per second outside the audio thread.
+    cpu_monitor: SystemCpuMonitor,
     status_msg: String,
     cue_column_widths: [f32; 9],
     bottom_panel_height: f32,
@@ -328,6 +532,22 @@ pub struct TheatreShowCueApp {
     /// Current audio playback generation per cue. Late updates from a stopped
     /// playback instance are ignored after a stop/restart race.
     audio_generations: HashMap<Uuid, u64>,
+    /// Nestable boundary for one logical GO/Auto-Continue launch. The outermost
+    /// scope gives Audio, MIDI and OSC dispatches one shared transaction ID;
+    /// each backend receives its own ordered batch when the scope is closed.
+    launch_transaction_depth: usize,
+    launch_transaction_id: Option<Uuid>,
+    launch_transaction_started_at: Option<Instant>,
+    pending_midi_dispatches: Vec<MidiDispatch>,
+    pending_osc_dispatches: Vec<OscDispatch>,
+    immediate_playlist_advances: VecDeque<Uuid>,
+    /// Background waveform workers never block the GUI or audio callback.
+    waveform_manager: WaveformAnalysisManager,
+    waveform_generation: u64,
+    waveform_pending_cues: HashSet<Uuid>,
+    waveform_scheduled_cues: HashSet<Uuid>,
+    waveform_total_cues: usize,
+    waveform_cache_stats_before: AudioAnalysisCacheStats,
     pending_triggers: Vec<PendingTrigger>,
     /// Local date + configured clock value used to deduplicate each daily time trigger.
     time_trigger_last_fired: HashMap<Uuid, String>,
@@ -342,11 +562,38 @@ impl TheatreShowCueApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let mut settings = AppSettings::load();
         let requested_backend = settings.audio_backend;
-        let requested_performance = AudioPerformanceSettings {
-            sample_rate: settings.audio_sample_rate,
-            buffer_size_frames: settings.audio_buffer_size_frames,
-        };
+        let mut asio_profiles_sanitized = false;
+        for (key, profile) in &mut settings.audio_performance_settings_by_device {
+            if key.starts_with("ASIO::") && *profile != AudioPerformanceSettings::default() {
+                *profile = AudioPerformanceSettings::default();
+                asio_profiles_sanitized = true;
+            }
+        }
+        let legacy_performance = AudioPerformanceSettings::for_backend(
+            requested_backend,
+            AudioPerformanceSettings {
+                sample_rate: settings.audio_sample_rate,
+                buffer_size_frames: settings.audio_buffer_size_frames,
+            },
+        );
+        let saved_performance = settings
+            .audio_output_device
+            .as_deref()
+            .and_then(|device_name| {
+                let key = AudioEngine::output_device_settings_key_for_backend(
+                    requested_backend,
+                    device_name,
+                );
+                settings
+                    .audio_performance_settings_by_device
+                    .get(&key)
+                    .copied()
+            })
+            .unwrap_or(legacy_performance);
+        let requested_performance =
+            AudioPerformanceSettings::for_backend(requested_backend, saved_performance);
         Theme::apply(&cc.egui_ctx, &settings.appearance);
+        let icons = IconManager::new(&cc.egui_ctx);
         let mut audio = match AudioEngine::new_with_backend_and_endpoint_and_performance(
             settings.audio_backend,
             settings.audio_output_device_id.as_deref(),
@@ -392,6 +639,22 @@ impl TheatreShowCueApp {
                 }
             }
         };
+        let active_performance_key = AudioEngine::output_device_settings_key_for_backend(
+            audio.backend,
+            &audio.current_device,
+        );
+        let active_performance_profile_missing = !settings
+            .audio_performance_settings_by_device
+            .contains_key(&active_performance_key);
+        let legacy_performance_mirror_changed = settings.audio_sample_rate
+            != audio.performance_settings.sample_rate
+            || settings.audio_buffer_size_frames != audio.performance_settings.buffer_size_frames;
+        settings
+            .audio_performance_settings_by_device
+            .insert(active_performance_key, audio.performance_settings);
+        settings.audio_sample_rate = audio.performance_settings.sample_rate;
+        settings.audio_buffer_size_frames = audio.performance_settings.buffer_size_frames;
+
         if let Some(device) = settings.audio_input_device.as_deref() {
             if audio.input_devices.iter().any(|name| name == device) {
                 audio.set_input_device(device);
@@ -422,6 +685,28 @@ impl TheatreShowCueApp {
             }
         }
         settings.output_channels = audio.output_channel_settings();
+        let active_output_settings_key = audio.output_device_settings_key(&audio.current_device);
+        let active_output_settings_profile_missing = !settings
+            .output_channel_settings_by_device
+            .contains_key(&active_output_settings_key);
+        let initial_output_settings = settings.output_channels.clone();
+        settings
+            .output_channel_settings_by_device
+            .entry(active_output_settings_key)
+            .or_insert(initial_output_settings);
+        audio.set_endpoint_preferences(
+            settings.audio_performance_settings_by_device.clone(),
+            settings.output_channel_settings_by_device.clone(),
+        );
+        if active_performance_profile_missing
+            || active_output_settings_profile_missing
+            || legacy_performance_mirror_changed
+            || asio_profiles_sanitized
+        {
+            if let Err(error) = settings.save() {
+                warn!("Could not persist migrated endpoint preferences: {error}");
+            }
+        }
         if let Some(active_directory) = crate::diagnostics::active_log_directory() {
             let saved_directory = settings
                 .diagnostic_log_directory
@@ -458,43 +743,59 @@ impl TheatreShowCueApp {
 
         let device_registry_monitor = DeviceRegistryMonitor::spawn(
             AudioEngine::scan_hotplug_output_endpoints,
-            Duration::from_secs(5),
+            Duration::from_secs(60),
+            audio.device_registry.snapshot_endpoints(),
         );
 
-        let mut midi = MidiInputManager::new();
+        let mut midi = MidiInputManager::new_with_preferred(settings.midi_input_port.as_deref());
         midi.set_repaint_context(cc.egui_ctx.clone());
-        if let Some(port) = settings.midi_input_port.as_deref() {
-            midi.refresh_and_connect(Some(port));
-        }
-        let mut midi_out = MidiOutputManager::new();
-        if let Some(port) = settings.midi_output_port.as_deref() {
-            midi_out.refresh_and_connect(Some(port));
-        }
+        let mut midi_out =
+            MidiOutputManager::new_with_preferred(settings.midi_output_port.as_deref());
+        midi_out.set_repaint_context(cc.egui_ctx.clone());
 
         let osc = OscServer::new(settings.osc_listen_port, settings.osc_send_addr.clone())
             .map_err(|e| warn!("OSC unavailable: {e}"))
             .ok();
         let cue_column_widths = settings.cue_column_widths;
         let bottom_panel_height = settings.bottom_panel_height.clamp(80.0, 1200.0);
+        let initial_project_audio_routing = ProjectAudioRouting::from_maps(
+            settings.output_channel_orders.clone(),
+            settings.default_output_pairs.clone(),
+        );
+        let initial_cue_list = CueList::new("Main");
+        let initial_project = Project::with_audio_routing(initial_project_audio_routing);
+        let saved_project_snapshot =
+            serialize_project_snapshot(&initial_project, &initial_cue_list);
+
+        let waveform_manager = WaveformAnalysisManager::new(1);
+        let waveform_generation = waveform_manager.begin_generation();
+        let waveform_cache_stats_before = audio_analysis_cache_stats();
+
         info!("Theatre Show Cue initialization complete; creating the main window");
 
         Self {
             audio,
+            icons,
             device_registry_monitor,
             active_output_needs_reopen: false,
             midi,
             midi_out,
             osc,
-            cue_list: CueList::new("Main"),
-            project: Project::default(),
+            cue_list: initial_cue_list,
+            project: initial_project,
             project_path: None,
             project_needs_save_as: false,
+            saved_project_snapshot,
+            close_prompt: None,
+            close_allowed: false,
             assets: AssetManager::new(),
             report: SessionReport::new("Untitled Project"),
             settings,
             settings_open: false,
             settings_tab: SettingsTab::Audio,
             hotkey_capture: None,
+            cue_hotkey_capture: None,
+            audio_log_viewer: AudioLogViewer::default(),
             midi_learn_action: None,
             midi_cc_pressed: HashSet::new(),
             selected: None,
@@ -509,6 +810,8 @@ impl TheatreShowCueApp {
             expanded_groups: HashSet::new(),
             active_panel: Panel::Inspector,
             master_vol: 1.0,
+            output_meter_peak: 0.0,
+            cpu_monitor: SystemCpuMonitor::new(),
             status_msg: "Ready — drag audio files here or add events from the toolbar".to_string(),
             pending_triggers: Vec::new(),
             time_trigger_last_fired: HashMap::new(),
@@ -526,6 +829,18 @@ impl TheatreShowCueApp {
             fade_started_at: HashMap::new(),
             fade_managed_targets: HashSet::new(),
             audio_generations: HashMap::new(),
+            launch_transaction_depth: 0,
+            launch_transaction_id: None,
+            launch_transaction_started_at: None,
+            pending_midi_dispatches: Vec::new(),
+            pending_osc_dispatches: Vec::new(),
+            immediate_playlist_advances: VecDeque::new(),
+            waveform_manager,
+            waveform_generation,
+            waveform_pending_cues: HashSet::new(),
+            waveform_scheduled_cues: HashSet::new(),
+            waveform_total_cues: 0,
+            waveform_cache_stats_before,
         }
     }
 
@@ -623,7 +938,134 @@ impl TheatreShowCueApp {
         None
     }
 
+    fn begin_launch_transaction(&mut self) {
+        if self.launch_transaction_depth == 0 {
+            let transaction_id = Uuid::new_v4();
+            self.launch_transaction_id = Some(transaction_id);
+            self.launch_transaction_started_at = Some(Instant::now());
+            self.audio
+                .send(AudioCommand::BeginLaunchTransaction { transaction_id });
+            info!(
+                "Launch transaction started: transaction_id={}",
+                transaction_id
+            );
+        }
+        self.launch_transaction_depth = self.launch_transaction_depth.saturating_add(1);
+    }
+
+    fn end_launch_transaction(&mut self) {
+        if self.launch_transaction_depth == 0 {
+            return;
+        }
+
+        // Advance zero-duration Playlist items iteratively before closing the
+        // outer transaction. This removes one GUI-frame delay per MIDI/OSC Cue
+        // while preserving the configured Playlist order.
+        if self.launch_transaction_depth == 1 {
+            self.drain_immediate_playlist_advances();
+        }
+
+        self.launch_transaction_depth -= 1;
+        if self.launch_transaction_depth == 0 {
+            self.launch_transaction_started_at = None;
+            if let Some(transaction_id) = self.launch_transaction_id.take() {
+                self.audio
+                    .send(AudioCommand::EndLaunchTransaction { transaction_id });
+
+                let midi_events = std::mem::take(&mut self.pending_midi_dispatches);
+                let midi_count = midi_events.len();
+                if !midi_events.is_empty() {
+                    if let Err(error) = self.midi_out.send_batch(transaction_id, midi_events) {
+                        tracing::error!(
+                            target: "TaSQ::midi::input",
+                            "Could not submit MIDI dispatch batch: transaction_id={}, error={}",
+                            transaction_id,
+                            error
+                        );
+                    }
+                }
+
+                let osc_events = std::mem::take(&mut self.pending_osc_dispatches);
+                let osc_count = osc_events.len();
+                if !osc_events.is_empty() {
+                    if let Some(server) = &self.osc {
+                        if let Err(error) = server.send_batch(transaction_id, osc_events) {
+                            tracing::error!(
+                                target: "TaSQ::osc::server",
+                                "Could not submit OSC dispatch batch: transaction_id={}, error={}",
+                                transaction_id,
+                                error
+                            );
+                        }
+                    } else {
+                        tracing::error!(
+                            target: "TaSQ::osc::server",
+                            "OSC dispatch batch dropped because OSC server is unavailable: transaction_id={}, events={}",
+                            transaction_id,
+                            osc_count
+                        );
+                    }
+                }
+
+                info!(
+                    "Launch transaction completed: transaction_id={}, midi_events={}, osc_events={}",
+                    transaction_id,
+                    midi_count,
+                    osc_count
+                );
+            }
+        }
+    }
+
+    fn drain_immediate_playlist_advances(&mut self) {
+        const MAX_IMMEDIATE_ADVANCES_PER_TRANSACTION: usize = 2048;
+        let mut processed = 0usize;
+
+        while let Some(cue_id) = self.immediate_playlist_advances.pop_front() {
+            processed += 1;
+            if processed > MAX_IMMEDIATE_ADVANCES_PER_TRANSACTION {
+                warn!(
+                    "Immediate Playlist advance limit reached; deferring remaining {} Cue(s) to the next update",
+                    self.immediate_playlist_advances.len() + 1
+                );
+                self.pending_triggers.push(PendingTrigger {
+                    cue_id,
+                    source_cue_id: None,
+                    fire_at: Instant::now(),
+                    action: PendingAction::TriggerCue,
+                });
+                while let Some(next_id) = self.immediate_playlist_advances.pop_front() {
+                    self.pending_triggers.push(PendingTrigger {
+                        cue_id: next_id,
+                        source_cue_id: None,
+                        fire_at: Instant::now(),
+                        action: PendingAction::TriggerCue,
+                    });
+                }
+                break;
+            }
+            self.trigger_cue(cue_id);
+        }
+    }
+
+    /// Public trigger boundary. Nested automatic chains and groups share the
+    /// outer transaction; only the outermost call emits Begin/End markers.
     fn trigger_cue(&mut self, id: Uuid) {
+        if self.cue_list.find(id).is_none() {
+            return;
+        }
+        self.begin_launch_transaction();
+        self.trigger_cue_inner(id);
+        self.end_launch_transaction();
+    }
+
+    fn trigger_cue_inner(&mut self, id: Uuid) {
+        self.trigger_cue_inner_with_pre_wait(id, true);
+    }
+
+    /// Trigger a Cue whose pre-wait has already elapsed. All Cues groups use
+    /// this path after their sequence scheduler releases a delayed segment.
+    fn trigger_cue_inner_with_pre_wait(&mut self, id: Uuid, honor_pre_wait: bool) {
         let is_comment = self.is_comment_cue(id);
         if self.cue_list.find(id).is_none() {
             return;
@@ -650,6 +1092,9 @@ impl TheatreShowCueApp {
         let Some(cue) = self.cue_list.find(id) else {
             return;
         };
+        let trigger_started_at = self
+            .launch_transaction_started_at
+            .unwrap_or_else(Instant::now);
         info!(
             "Cue trigger requested: id={}, number='{}', name='{}', state={:?}, pre_wait={:.3}s, post_wait={:.3}s",
             cue.id,
@@ -659,7 +1104,11 @@ impl TheatreShowCueApp {
             cue.pre_wait_secs,
             cue.post_wait_secs
         );
-        let pre_wait = cue.pre_wait_secs.max(0.0);
+        let pre_wait = if honor_pre_wait {
+            cue.pre_wait_secs.max(0.0)
+        } else {
+            0.0
+        };
         let post_wait = cue.post_wait_secs.max(0.0);
         let continue_mode = cue.continue_mode.clone();
         let is_group_run = matches!(
@@ -673,7 +1122,7 @@ impl TheatreShowCueApp {
         let cue_name = cue.name.clone();
 
         if pre_wait > 0.0 {
-            let wait_started_at = Instant::now();
+            let wait_started_at = trigger_started_at;
             if let Some(cue) = self.cue_list.find_mut(id) {
                 cue.state = CueState::Waiting;
                 cue.position_secs = 0.0;
@@ -703,7 +1152,7 @@ impl TheatreShowCueApp {
                     // own Continue setting control what follows it.
                     return;
                 }
-                let now = Instant::now();
+                let now = trigger_started_at;
                 let delay = pre_wait + post_wait;
                 if post_wait > 0.0 {
                     self.pending_triggers.push(PendingTrigger {
@@ -802,7 +1251,14 @@ impl TheatreShowCueApp {
                 action: PendingAction::CompleteCue,
             });
         } else {
+            let owns_transaction = self.launch_transaction_depth == 0;
+            if owns_transaction {
+                self.begin_launch_transaction();
+            }
             self.complete_cue(cue_id);
+            if owns_transaction {
+                self.end_launch_transaction();
+            }
         }
     }
 
@@ -846,8 +1302,9 @@ impl TheatreShowCueApp {
                 self.status_msg = "📁 Playlist finished".to_string();
                 self.schedule_cue_completion(group_id, 0.0);
             } else if let Some(next_child_id) = children.get(next_idx).copied() {
-                // Queue the next child for the next UI/audio tick instead of
-                // recursively triggering instant MIDI/command cues on the stack.
+                // Queue the next child for iterative draining at the outer
+                // launch-transaction boundary. Instant Cue runs therefore do
+                // not wait for another GUI frame or recurse through the stack.
                 self.apply_group_fades(next_child_id, fade_in, fade_out);
                 self.select_only(next_child_id);
                 self.status_msg = format!("📁 Playlist: event {}/{}", next_idx + 1, children.len());
@@ -858,12 +1315,7 @@ impl TheatreShowCueApp {
                         .map(|cue| cue.is_active())
                         .unwrap_or(false);
                 if !already_started_as_fade_target {
-                    self.pending_triggers.push(PendingTrigger {
-                        cue_id: next_child_id,
-                        source_cue_id: Some(cue_id),
-                        fire_at: Instant::now(),
-                        action: PendingAction::TriggerCue,
-                    });
+                    self.immediate_playlist_advances.push_back(next_child_id);
                 }
             }
             return;
@@ -945,13 +1397,55 @@ impl TheatreShowCueApp {
             .unwrap_or(self.audio.backend)
     }
 
+    /// Resolve the endpoint context used by both routing calculations and the
+    /// worker manager. A Cue without an explicit endpoint uses the active global
+    /// endpoint; an explicit Cue retains its own backend and stable device ID.
+    fn cue_output_endpoint_context(
+        &self,
+        cue: &Cue,
+    ) -> (AudioBackend, Option<String>, String, bool) {
+        let explicit = cue.io.output_device.is_some() || cue.io.output_device_id.is_some();
+        if explicit {
+            let backend = self.cue_output_backend(cue);
+            let name = cue
+                .io
+                .output_device_id
+                .as_deref()
+                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                .filter(|endpoint| endpoint.backend == backend)
+                .map(|endpoint| endpoint.device_name.clone())
+                .or_else(|| cue.io.output_device.clone())
+                .unwrap_or_else(|| "Unavailable endpoint".to_string());
+            let id = cue
+                .io
+                .output_device_id
+                .clone()
+                .or_else(|| self.audio.registered_endpoint_id(backend, &name));
+            (backend, id, name, true)
+        } else {
+            (
+                self.audio.backend,
+                Some(self.audio.current_device_id.clone()),
+                self.audio.current_device.clone(),
+                false,
+            )
+        }
+    }
+
     /// Resolve a saved Cue endpoint by stable ID. For older projects, migrate
     /// the legacy (backend, display name) pair to the registry ID when available.
     fn normalize_cue_output_endpoint(&mut self, cue_id: Uuid, cue: &mut Cue) {
-        let Some(device_name) = cue.io.output_device.clone() else {
+        let route_backend = self.cue_output_backend(cue);
+        let Some(device_name) = cue.io.output_device.clone().or_else(|| {
+            cue.io
+                .output_device_id
+                .as_deref()
+                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                .filter(|endpoint| endpoint.backend == route_backend)
+                .map(|endpoint| endpoint.device_name.clone())
+        }) else {
             return;
         };
-        let route_backend = self.cue_output_backend(cue);
 
         let endpoint = if let Some(saved_id) = cue.io.output_device_id.as_deref() {
             self.audio
@@ -967,9 +1461,15 @@ impl TheatreShowCueApp {
         };
 
         if let Some(endpoint) = endpoint {
-            if endpoint.backend == self.audio.backend {
-                self.audio.refresh_output_device_info(&endpoint.device_name);
-            }
+            // Do not enumerate native output devices while starting a Cue.
+            // This function is reached from the playback path (and Audio Cues
+            // can pass through it more than once). CPAL device enumeration and
+            // capability queries may block for tens of milliseconds, which
+            // serializes Auto-Continue starts and creates audible offsets.
+            //
+            // Endpoint metadata is refreshed when the user selects a device
+            // in the Inspector or changes the global output. The device
+            // registry already contains the channel metadata needed here.
             cue.io.output_device = Some(endpoint.device_name.clone());
             cue.io.output_device_id = Some(endpoint.id.clone());
             cue.io.output_backend = Some(endpoint.backend);
@@ -983,8 +1483,8 @@ impl TheatreShowCueApp {
 
     /// Returns a short reason when an Audio Cue currently has no usable output.
     /// A missing `output_device` is not an error: it intentionally means the
-    /// active global output. Explicit offline/cross-backend routes and empty
-    /// output matrices are surfaced in the Cue List.
+    /// active global output. Explicit offline routes and empty output matrices
+    /// are surfaced in the Cue List.
     fn cue_output_issue_for_table(&self, cue: &Cue) -> Option<String> {
         if !cue_owns_audio_stream(cue) {
             return None;
@@ -1002,8 +1502,6 @@ impl TheatreShowCueApp {
             .map(|endpoint| endpoint.device_name.as_str())
             .or(saved_device_name)
             .unwrap_or(self.audio.current_device.as_str());
-        let output_device = has_explicit_endpoint.then_some(device_name);
-
         if has_explicit_endpoint {
             let is_current_endpoint = route_backend == self.audio.backend
                 && device_name == self.audio.current_device.as_str();
@@ -1026,31 +1524,6 @@ impl TheatreShowCueApp {
                     device_name
                 ));
             }
-
-            if route_backend != self.audio.backend {
-                return Some(format!(
-                    "{} — '{}' cannot be used while {} is the active backend. Cross-backend playback is not available yet.",
-                    route_backend.short_label(),
-                    device_name,
-                    self.audio.backend.short_label()
-                ));
-            }
-
-            if route_backend == AudioBackend::Asio
-                && device_name != self.audio.current_device.as_str()
-            {
-                return Some(format!(
-                    "ASIO — '{}' is not the active ASIO driver. Only '{}' can play until multi-ASIO workers are implemented.",
-                    device_name,
-                    self.audio.current_device
-                ));
-            }
-        } else if route_backend != self.audio.backend {
-            return Some(format!(
-                "The global output is configured for {}, but {} is active.",
-                route_backend.short_label(),
-                self.audio.backend.short_label()
-            ));
         } else if self
             .audio
             .device_registry
@@ -1065,9 +1538,33 @@ impl TheatreShowCueApp {
             return Some("The global audio output stream is not active.".to_string());
         }
 
-        let output_count = self.audio.output_channels_for_device(output_device);
-        let output_settings = self.audio.output_channel_settings_for_device(output_device);
-        let output_order = self.audio.output_channel_display_order(output_device);
+        let registered_endpoint_id = if has_explicit_endpoint && cue.io.output_device_id.is_none() {
+            self.audio
+                .registered_endpoint_id(route_backend, device_name)
+        } else {
+            None
+        };
+        let endpoint_id = if has_explicit_endpoint {
+            cue.io
+                .output_device_id
+                .as_deref()
+                .or(registered_endpoint_id.as_deref())
+        } else {
+            Some(self.audio.current_device_id.as_str())
+        };
+        let output_count =
+            self.audio
+                .output_channels_for_endpoint(route_backend, endpoint_id, Some(device_name));
+        let output_settings = self.audio.output_channel_settings_for_endpoint(
+            route_backend,
+            endpoint_id,
+            Some(device_name),
+        );
+        let output_order = self.audio.output_channel_display_order_for_endpoint(
+            route_backend,
+            endpoint_id,
+            Some(device_name),
+        );
         let has_active_destination = cue.io.channel_routes.iter().any(|route| {
             if !route.active {
                 return false;
@@ -1108,72 +1605,32 @@ impl TheatreShowCueApp {
             .collect()
     }
 
-    /// Do not start a Cue if its saved endpoint is currently offline or belongs
-    /// to a backend/ASIO driver that this Stage 3 process cannot service.
+    /// Do not start a Cue if its selected endpoint is offline. Backend and
+    /// driver isolation are handled by the endpoint worker manager.
     fn cue_output_backend_is_active(&mut self, cue: &Cue) -> bool {
-        let Some(device_name) = cue.io.output_device.as_deref() else {
-            if self
-                .audio
+        let (backend, endpoint_id, device_name, explicit) = self.cue_output_endpoint_context(cue);
+        let available = if explicit {
+            self.audio
+                .registered_endpoint_available(backend, endpoint_id.as_deref(), &device_name)
+        } else {
+            self.audio
                 .device_registry
-                .find_available_by_id(&self.audio.current_device_id)
-                .is_some()
-            {
-                return true;
-            }
-            let message = format!(
-                "Cue '{}' uses the global output {} — '{}', but that endpoint is currently unavailable.",
-                cue.name,
-                self.audio.backend.short_label(),
-                self.audio.current_device
-            );
-            self.status_msg = message.clone();
-            warn!("{}", message);
-            return false;
+                .find_by_id(&self.audio.current_device_id)
+                .map(|endpoint| endpoint.is_available())
+                .unwrap_or(self.audio.current_sample_rate > 0 && self.audio.output_channels > 0)
         };
-        let route_backend = self.cue_output_backend(cue);
 
-        if !self.audio.registered_endpoint_available(
-            route_backend,
-            cue.io.output_device_id.as_deref(),
-            device_name,
-        ) {
+        if !available {
             let message = format!(
-                "Cue '{}' is routed to {} — '{}', but that endpoint is currently unavailable. The saved route has been retained; reconnect the device and refresh the registry.",
+                "Cue '{}' is routed to {} — '{}', but that endpoint is currently unavailable.",
                 cue.name,
-                route_backend.short_label(),
+                backend.short_label(),
                 device_name
             );
             self.status_msg = message.clone();
             warn!("{}", message);
             return false;
         }
-
-        if route_backend != self.audio.backend {
-            let message = format!(
-                "Cue '{}' is routed to {} — '{}', but the active backend is {}. Cross-backend playback will be enabled in Stage 4.",
-                cue.name,
-                route_backend.short_label(),
-                device_name,
-                self.audio.backend.short_label()
-            );
-            self.status_msg = message.clone();
-            warn!("{}", message);
-            return false;
-        }
-
-        if route_backend == AudioBackend::Asio && device_name != self.audio.current_device.as_str()
-        {
-            let message = format!(
-                "Cue '{}' is routed to ASIO — '{}', but '{}' is the active ASIO driver. Only one ASIO driver can be active in this process; select the Cue's device as the global output or wait for Stage 4.",
-                cue.name,
-                device_name,
-                self.audio.current_device
-            );
-            self.status_msg = message.clone();
-            warn!("{}", message);
-            return false;
-        }
-
         true
     }
 
@@ -1199,12 +1656,18 @@ impl TheatreShowCueApp {
         }
 
         let source_channels = snapshot.audio_channels.max(1);
-        let output_channels = self
-            .audio
-            .output_channels_for_device(snapshot.io.output_device.as_deref());
+        let (route_backend, route_endpoint_id, route_device_name, explicit_endpoint) =
+            self.cue_output_endpoint_context(&snapshot);
+        let output_channels = self.audio.output_channels_for_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
+        );
         let mut routing = snapshot.io.clone();
-        let default_route_channels = self.audio.default_route_channels_for_source(
-            snapshot.io.output_device.as_deref(),
+        let default_route_channels = self.audio.default_route_channels_for_source_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
             source_channels,
         );
         routing.ensure_channel_routes_with_defaults(
@@ -1235,12 +1698,16 @@ impl TheatreShowCueApp {
             ),
         };
 
-        let native_routes = self.audio.cue_routes_for_device(
-            snapshot.io.output_device.as_deref(),
+        let native_routes = self.audio.cue_routes_for_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
             &routing.channel_routes,
         );
-        let native_gains = self.audio.cue_gains_for_device(
-            snapshot.io.output_device.as_deref(),
+        let native_gains = self.audio.cue_gains_for_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
             &routing.output_gains_db,
         );
         info!(
@@ -1248,15 +1715,22 @@ impl TheatreShowCueApp {
             snapshot.id,
             routing.channel_routes,
             native_routes,
-            self.audio
-                .output_channel_display_order(snapshot.io.output_device.as_deref()),
+            self.audio.output_channel_display_order_for_endpoint(
+                route_backend,
+                route_endpoint_id.as_deref(),
+                Some(&route_device_name),
+            ),
         );
         let generation = self.bump_audio_generation(snapshot.id);
         self.audio.send(AudioCommand::Play {
             id: snapshot.id,
             generation,
             file: snapshot.file_path.clone(),
-            output_device: snapshot.io.output_device.clone(),
+            output_device: explicit_endpoint.then_some(route_device_name.clone()),
+            output_backend: explicit_endpoint.then_some(route_backend),
+            output_device_id: explicit_endpoint
+                .then(|| route_endpoint_id.clone())
+                .flatten(),
             start_secs: Self::cue_play_start_position(&snapshot),
             end_secs: snapshot.end_secs,
             duration_secs: snapshot.duration_secs,
@@ -1349,14 +1823,21 @@ impl TheatreShowCueApp {
                 } else if !cue_snapshot.file_path.as_os_str().is_empty() {
                     started_audio = true;
                     let source_channels = cue_snapshot.audio_channels.max(1);
-                    let track_output_channels = self
-                        .audio
-                        .output_channels_for_device(cue_snapshot.io.output_device.as_deref());
-                    let mut io_routing = cue_snapshot.io.clone();
-                    let default_route_channels = self.audio.default_route_channels_for_source(
-                        cue_snapshot.io.output_device.as_deref(),
-                        source_channels,
+                    let (route_backend, route_endpoint_id, route_device_name, explicit_endpoint) =
+                        self.cue_output_endpoint_context(&cue_snapshot);
+                    let track_output_channels = self.audio.output_channels_for_endpoint(
+                        route_backend,
+                        route_endpoint_id.as_deref(),
+                        Some(&route_device_name),
                     );
+                    let mut io_routing = cue_snapshot.io.clone();
+                    let default_route_channels =
+                        self.audio.default_route_channels_for_source_endpoint(
+                            route_backend,
+                            route_endpoint_id.as_deref(),
+                            Some(&route_device_name),
+                            source_channels,
+                        );
                     io_routing.ensure_channel_routes_with_defaults(
                         source_channels,
                         track_output_channels,
@@ -1368,12 +1849,16 @@ impl TheatreShowCueApp {
                         cue.io.channel_routes = io_routing.channel_routes.clone();
                         cue.io.output_gains_db = io_routing.output_gains_db.clone();
                     }
-                    let native_routes = self.audio.cue_routes_for_device(
-                        cue_snapshot.io.output_device.as_deref(),
+                    let native_routes = self.audio.cue_routes_for_endpoint(
+                        route_backend,
+                        route_endpoint_id.as_deref(),
+                        Some(&route_device_name),
                         &io_routing.channel_routes,
                     );
-                    let native_gains = self.audio.cue_gains_for_device(
-                        cue_snapshot.io.output_device.as_deref(),
+                    let native_gains = self.audio.cue_gains_for_endpoint(
+                        route_backend,
+                        route_endpoint_id.as_deref(),
+                        Some(&route_device_name),
                         &io_routing.output_gains_db,
                     );
                     info!(
@@ -1381,14 +1866,22 @@ impl TheatreShowCueApp {
                         cue_snapshot.id,
                         io_routing.channel_routes,
                         native_routes,
-                        self.audio.output_channel_display_order(cue_snapshot.io.output_device.as_deref()),
+                        self.audio.output_channel_display_order_for_endpoint(
+                            route_backend,
+                            route_endpoint_id.as_deref(),
+                            Some(&route_device_name),
+                        ),
                     );
                     let generation = self.bump_audio_generation(cue_snapshot.id);
                     self.audio.send(AudioCommand::Play {
                         id: cue_snapshot.id,
                         generation,
                         file: cue_snapshot.file_path.clone(),
-                        output_device: cue_snapshot.io.output_device.clone(),
+                        output_device: explicit_endpoint.then_some(route_device_name.clone()),
+                        output_backend: explicit_endpoint.then_some(route_backend),
+                        output_device_id: explicit_endpoint
+                            .then(|| route_endpoint_id.clone())
+                            .flatten(),
                         start_secs: Self::cue_play_start_position(&cue_snapshot),
                         end_secs: cue_snapshot.end_secs,
                         duration_secs: cue_snapshot.duration_secs,
@@ -1652,10 +2145,15 @@ impl TheatreShowCueApp {
                     } else {
                         message.to_bytes(channel)
                     };
-                let _ = self.midi_out.send_bytes(&bytes);
+                self.pending_midi_dispatches.push(MidiDispatch {
+                    cue_id: cue_snapshot.id,
+                    cue_number: cue_snapshot.number.clone(),
+                    cue_name: cue_snapshot.name.clone(),
+                    bytes: bytes.clone(),
+                });
                 self.report
                     .record(&cue_snapshot.number, &cue_snapshot.name, 0.0, "MIDI");
-                self.status_msg = format!("🎹 MIDI Sent: {:02X?}", bytes);
+                self.status_msg = format!("🎹 MIDI queued: {:02X?}", bytes);
                 self.schedule_cue_completion(id, 0.0);
             }
 
@@ -1674,12 +2172,25 @@ impl TheatreShowCueApp {
                         OscCueArg::Bool(value) => rosc::OscType::Bool(value),
                     })
                     .collect();
-                if let Some(server) = &self.osc {
-                    server.send(&address, osc_args);
-                    self.status_msg = format!("📡 OSC sent: {address}");
+                if self.osc.is_some() {
+                    self.pending_osc_dispatches.push(OscDispatch {
+                        cue_id: cue_snapshot.id,
+                        cue_number: cue_snapshot.number.clone(),
+                        cue_name: cue_snapshot.name.clone(),
+                        addr: address.clone(),
+                        args: osc_args,
+                    });
+                    self.status_msg = format!("📡 OSC queued: {address}");
                     self.report
                         .record(&cue_snapshot.number, &cue_snapshot.name, 0.0, "OSC");
                 } else {
+                    tracing::warn!(
+                        target: "TaSQ::osc::server",
+                        "OSC Cue could not be queued because OSC server is unavailable: cue_id={}, cue_number='{}', address='{}'",
+                        cue_snapshot.id,
+                        cue_snapshot.number,
+                        address
+                    );
                     self.status_msg = "OSC is not available; check Settings → OSC".to_string();
                 }
                 self.schedule_cue_completion(id, 0.0);
@@ -1768,27 +2279,231 @@ impl TheatreShowCueApp {
                             self.schedule_cue_completion(id, 0.0);
                         } else {
                             self.active_all_cues.retain(|run| run.group_id != id);
+                            let segments = build_all_cues_segments(&self.cue_list, &valid_children);
+                            let segment_count = segments.len();
                             self.active_all_cues.push(ActiveAllCues {
                                 group_id: id,
+                                segments,
+                                next_segment_idx: 0,
                                 remaining: valid_children.iter().copied().collect(),
+                                fade_in_secs,
+                                fade_out_secs,
                             });
+                            info!(
+                                "All Cues group started: group_id={}, children={}, launch_segments={}",
+                                id,
+                                valid_children.len(),
+                                segment_count
+                            );
                             self.status_msg =
                                 format!("📁 All Cues: starting {} events", valid_children.len());
-                            for child_id in valid_children {
-                                self.apply_group_fades(child_id, fade_in_secs, fade_out_secs);
-                                let already_running = self
-                                    .cue_list
-                                    .find(child_id)
-                                    .map(|cue| cue.is_active())
-                                    .unwrap_or(false);
-                                if !already_running {
-                                    self.trigger_cue(child_id);
-                                }
-                            }
+                            self.advance_all_cues(id);
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Release the next All Cues segment. Consecutive zero-wait children
+    /// share one launch transaction; a pre-wait delays the entire next segment,
+    /// and a post-wait delays every segment after the current one.
+    fn advance_all_cues(&mut self, group_id: Uuid) {
+        let next_segment = self
+            .active_all_cues
+            .iter_mut()
+            .find(|run| run.group_id == group_id)
+            .and_then(|run| {
+                let segment_index = run.next_segment_idx + 1;
+                let segment = run.segments.get(run.next_segment_idx)?.clone();
+                let segment_count = run.segments.len();
+                run.next_segment_idx += 1;
+                Some((
+                    segment,
+                    run.fade_in_secs,
+                    run.fade_out_secs,
+                    segment_index,
+                    segment_count,
+                ))
+            });
+
+        let Some((segment, fade_in, fade_out, segment_index, segment_count)) = next_segment else {
+            return;
+        };
+
+        if segment.children.is_empty() {
+            self.advance_all_cues(group_id);
+            return;
+        }
+
+        if segment.pre_wait_secs > 0.0 {
+            let first_child_id = segment.children[0];
+            let first_child_already_running = self
+                .cue_list
+                .find(first_child_id)
+                .map(|cue| cue.is_active())
+                .unwrap_or(false);
+            if first_child_already_running {
+                self.start_all_cues_segment(
+                    group_id,
+                    segment,
+                    fade_in,
+                    fade_out,
+                    segment_index,
+                    segment_count,
+                );
+                return;
+            }
+
+            let wait_started_at = Instant::now();
+            if let Some(cue) = self.cue_list.find_mut(first_child_id) {
+                cue.state = CueState::Waiting;
+                cue.position_secs = 0.0;
+                cue.wait_phase = WaitPhase::Pre;
+                cue.wait_started_at = Some(wait_started_at);
+                cue.wait_duration_secs = segment.pre_wait_secs;
+            }
+            self.pending_triggers.push(PendingTrigger {
+                cue_id: first_child_id,
+                source_cue_id: Some(group_id),
+                fire_at: wait_started_at + Duration::from_secs_f64(segment.pre_wait_secs),
+                action: PendingAction::StartAllCuesSegment,
+            });
+            info!(
+                "All Cues segment waiting for pre-wait: group_id={}, segment={}/{}, first_cue_id={}, cue_count={}, pre_wait={:.3}s",
+                group_id,
+                segment_index,
+                segment_count,
+                first_child_id,
+                segment.children.len(),
+                segment.pre_wait_secs
+            );
+            self.status_msg = format!("⏳ All Cues pre-wait ({:.1}s)", segment.pre_wait_secs);
+            return;
+        }
+
+        self.start_all_cues_segment(
+            group_id,
+            segment,
+            fade_in,
+            fade_out,
+            segment_index,
+            segment_count,
+        );
+    }
+
+    /// Start all Cues in one zero-wait segment. The group scheduler, rather
+    /// than individual child completion, owns the next segment's timing.
+    fn start_all_cues_segment(
+        &mut self,
+        group_id: Uuid,
+        segment: AllCuesSegment,
+        fade_in: f64,
+        fade_out: f64,
+        segment_index: usize,
+        segment_count: usize,
+    ) {
+        let run_is_active = self
+            .active_all_cues
+            .iter()
+            .any(|run| run.group_id == group_id);
+        if !run_is_active {
+            return;
+        }
+
+        info!(
+            "All Cues segment started: group_id={}, segment={}/{}, cue_count={}, pre_wait={:.3}s, post_wait={:.3}s",
+            group_id,
+            segment_index,
+            segment_count,
+            segment.children.len(),
+            segment.pre_wait_secs,
+            segment.post_wait_secs
+        );
+
+        for child_id in &segment.children {
+            let already_running = self
+                .cue_list
+                .find(*child_id)
+                .map(|cue| cue.is_active())
+                .unwrap_or(false);
+            if already_running {
+                continue;
+            }
+
+            self.apply_group_fades(*child_id, fade_in, fade_out);
+            self.trigger_cue_inner_with_pre_wait(*child_id, false);
+        }
+
+        if segment.post_wait_secs > 0.0 {
+            if let Some(last_child_id) = segment.children.last().copied() {
+                self.begin_auto_continue_post_wait(last_child_id);
+                let wait_started_at = self
+                    .cue_list
+                    .find(last_child_id)
+                    .and_then(|cue| cue.wait_started_at)
+                    .unwrap_or_else(Instant::now);
+                self.pending_triggers.push(PendingTrigger {
+                    cue_id: group_id,
+                    source_cue_id: Some(group_id),
+                    fire_at: wait_started_at + Duration::from_secs_f64(segment.post_wait_secs),
+                    action: PendingAction::AdvanceAllCues,
+                });
+                info!(
+                    "All Cues segment waiting for post-wait: group_id={}, segment={}/{}, last_cue_id={}, next_segment={}, post_wait={:.3}s",
+                    group_id,
+                    segment_index,
+                    segment_count,
+                    last_child_id,
+                    segment_index + 1,
+                    segment.post_wait_secs
+                );
+                self.status_msg = format!("⏳ All Cues post-wait ({:.1}s)", segment.post_wait_secs);
+                return;
+            }
+        }
+
+        self.advance_all_cues(group_id);
+    }
+
+    /// Start a segment whose first Cue has just completed its pre-wait.
+    fn start_all_cues_segment_after_pre_wait(&mut self, group_id: Uuid, first_child_id: Uuid) {
+        let segment = self
+            .active_all_cues
+            .iter()
+            .find(|run| run.group_id == group_id)
+            .and_then(|run| {
+                run.segments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, segment)| segment.children.first() == Some(&first_child_id))
+                    .map(|(index, segment)| {
+                        (
+                            segment.clone(),
+                            run.fade_in_secs,
+                            run.fade_out_secs,
+                            index + 1,
+                            run.segments.len(),
+                        )
+                    })
+            });
+
+        if let Some((segment, fade_in, fade_out, segment_index, segment_count)) = segment {
+            if let Some(cue) = self.cue_list.find_mut(first_child_id) {
+                if cue.state == CueState::Waiting && cue.wait_phase == WaitPhase::Pre {
+                    cue.clear_wait_runtime();
+                    cue.state = CueState::Stopped;
+                    cue.position_secs = 0.0;
+                }
+            }
+            self.start_all_cues_segment(
+                group_id,
+                segment,
+                fade_in,
+                fade_out,
+                segment_index,
+                segment_count,
+            );
         }
     }
 
@@ -2297,14 +3012,45 @@ impl TheatreShowCueApp {
             }
         });
 
-        for trig in ready {
-            match trig.action {
-                PendingAction::ExecuteCue => self.execute_cue_now(trig.cue_id),
-                PendingAction::TriggerCue => self.trigger_cue(trig.cue_id),
-                PendingAction::BeginPostWait => self.begin_auto_continue_post_wait(trig.cue_id),
-                PendingAction::ClearWait => self.clear_cue_wait(trig.cue_id),
-                PendingAction::CompleteCue => self.complete_cue(trig.cue_id),
+        if ready.is_empty() {
+            return;
+        }
+
+        // Group only actions with the exact same scheduled deadline. This keeps
+        // simultaneous pre-wait/Auto-Continue actions together without merging
+        // unrelated triggers that merely became overdue in the same slow GUI frame.
+        ready.sort_by_key(|trigger| trigger.fire_at);
+        let mut ready = ready.into_iter().peekable();
+        while let Some(first) = ready.next() {
+            let group_deadline = first.fire_at;
+            self.begin_launch_transaction();
+            self.process_pending_trigger(first);
+
+            while ready
+                .peek()
+                .is_some_and(|next| next.fire_at == group_deadline)
+            {
+                if let Some(trigger) = ready.next() {
+                    self.process_pending_trigger(trigger);
+                }
             }
+            self.end_launch_transaction();
+        }
+    }
+
+    fn process_pending_trigger(&mut self, trigger: PendingTrigger) {
+        match trigger.action {
+            PendingAction::ExecuteCue => self.execute_cue_now(trigger.cue_id),
+            PendingAction::TriggerCue => self.trigger_cue(trigger.cue_id),
+            PendingAction::BeginPostWait => self.begin_auto_continue_post_wait(trigger.cue_id),
+            PendingAction::ClearWait => self.clear_cue_wait(trigger.cue_id),
+            PendingAction::CompleteCue => self.complete_cue(trigger.cue_id),
+            PendingAction::StartAllCuesSegment => {
+                if let Some(group_id) = trigger.source_cue_id {
+                    self.start_all_cues_segment_after_pre_wait(group_id, trigger.cue_id);
+                }
+            }
+            PendingAction::AdvanceAllCues => self.advance_all_cues(trigger.cue_id),
         }
     }
 
@@ -2347,11 +3093,17 @@ impl TheatreShowCueApp {
                 })
                 .collect();
 
+        if due.is_empty() {
+            return;
+        }
+
+        self.begin_launch_transaction();
         for (cue_id, cue_name, fire_key) in due {
             self.time_trigger_last_fired.insert(cue_id, fire_key);
             self.status_msg = format!("⏱ Time trigger: {cue_name}");
             self.trigger_cue(cue_id);
         }
+        self.end_launch_transaction();
     }
 
     // ── Transport actions ────────────────────────────────────────────────────
@@ -2401,6 +3153,7 @@ impl TheatreShowCueApp {
             self.settings.stop_all_fade_secs.max(0.0)
         );
         self.pending_triggers.clear();
+        self.immediate_playlist_advances.clear();
         self.active_playlists.clear();
         self.active_all_cues.clear();
         self.fade_started_at.clear();
@@ -2629,8 +3382,9 @@ impl TheatreShowCueApp {
             path.clone()
         };
 
+        let analysis = analyze_audio_file(&final_path, WAVEFORM_BUCKETS);
         let mut cue = Cue::new_audio(final_path.clone());
-        cue.audio_channels = get_channel_count(&final_path);
+        cue.audio_channels = analysis.channels;
         if cue.audio_channels > 0 {
             let default_route_channels = self
                 .audio
@@ -2641,12 +3395,12 @@ impl TheatreShowCueApp {
                 &default_route_channels,
             );
         }
-        let dur = get_duration(&final_path);
-        if dur > 0.0 {
-            cue.duration_secs = dur;
-            cue.loop_region.end_secs = dur;
+        let duration = analysis.duration_secs;
+        if duration > 0.0 {
+            cue.duration_secs = duration;
+            cue.loop_region.end_secs = duration;
         }
-        cue.waveform = generate_waveform(&final_path, WAVEFORM_BUCKETS);
+        cue.waveform = analysis.waveform.clone();
 
         let name = cue.name.clone();
         info!(
@@ -2914,17 +3668,247 @@ impl TheatreShowCueApp {
         }
     }
 
+    // ── Project-scoped audio routing ─────────────────────────────────────────
+
+    /// Return the active project's routing profile. Legacy projects without
+    /// the new field temporarily inherit workstation defaults until saved.
+    fn current_project_audio_routing(&self) -> ProjectAudioRouting {
+        self.project.audio_routing.clone().unwrap_or_else(|| {
+            ProjectAudioRouting::from_maps(
+                self.settings.output_channel_orders.clone(),
+                self.settings.default_output_pairs.clone(),
+            )
+        })
+    }
+
+    /// Apply the active project's endpoint-specific logical mapping and default
+    /// stereo pairs to the audio engine. Other workstation preferences (aliases,
+    /// trims, device selection and performance) remain in AppSettings.
+    fn apply_project_audio_routing(&mut self) {
+        let routing = self.current_project_audio_routing();
+        self.audio
+            .set_output_channel_orders(routing.output_channel_orders);
+        self.audio
+            .set_default_output_pairs(routing.default_output_pairs);
+    }
+
+    /// Update both the active project and the workstation's template for new
+    /// projects. Opening another project never overwrites that template.
+    fn store_project_output_channel_order(&mut self, key: String, order: Vec<usize>) {
+        self.project
+            .audio_routing
+            .get_or_insert_with(ProjectAudioRouting::default)
+            .output_channel_orders
+            .insert(key.clone(), order.clone());
+        self.settings.output_channel_orders.insert(key, order);
+        self.save_app_settings();
+        self.status_msg =
+            "Logical Output Mapping changed for this project — save the project to keep it."
+                .to_string();
+    }
+
+    fn store_project_default_output_pair(&mut self, key: String, pair: [usize; 2]) {
+        self.project
+            .audio_routing
+            .get_or_insert_with(ProjectAudioRouting::default)
+            .default_output_pairs
+            .insert(key.clone(), pair);
+        self.settings.default_output_pairs.insert(key, pair);
+        self.save_app_settings();
+        self.status_msg =
+            "Default Stereo Pair changed for this project — save the project to keep it."
+                .to_string();
+    }
+
     // ── Сохранение и загрузка проекта ────────────────────────────────────────
 
-    fn save_project(&mut self) {
+    fn commit_cue_edit(&mut self, id: Uuid, field: EditField, new_val: String) {
+        match field {
+            EditField::Number => {
+                if let Some(cue) = self.cue_list.find_mut(id) {
+                    cue.number = new_val.trim().to_string();
+                }
+            }
+            EditField::Name => {
+                if let Some(cue) = self.cue_list.find_mut(id) {
+                    cue.name = new_val;
+                }
+            }
+            EditField::PreWait => {
+                if let Some(cue) = self.cue_list.find_mut(id) {
+                    if let Ok(value) = new_val.trim().parse::<f64>() {
+                        cue.pre_wait_secs = value.max(0.0);
+                    }
+                }
+            }
+            EditField::PostWait => {
+                if let Some(cue) = self.cue_list.find_mut(id) {
+                    if let Ok(value) = new_val.trim().parse::<f64>() {
+                        cue.post_wait_secs = value.max(0.0);
+                    }
+                }
+            }
+            EditField::Duration => {
+                if let Ok(value) = new_val.trim().replace(',', ".").parse::<f64>() {
+                    if value.is_finite() && value >= 0.0 {
+                        if let Some(cue) = self.cue_list.find_mut(id) {
+                            if let CueType::Fade { duration_secs, .. } = &mut cue.cue_type {
+                                *duration_secs = value;
+                                cue.duration_secs = value;
+                                cue.position_secs = cue.position_secs.min(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_pending_edits_before_save(&mut self) {
+        if let Some((id, field, value)) = self.editing.take() {
+            self.commit_cue_edit(id, field, value);
+        }
+        self.editing_focus_pending = false;
+
+        if let Some(project_name) = self.project_name_edit.take() {
+            self.rename_project(project_name);
+        }
+        self.project_name_edit_focus_pending = false;
+    }
+
+    fn project_has_unsaved_changes(&self) -> bool {
+        if self.editing.is_some() || self.project_name_edit.is_some() {
+            return true;
+        }
+        match (
+            self.saved_project_snapshot.as_deref(),
+            serialize_project_snapshot(&self.project, &self.cue_list),
+        ) {
+            (Some(saved), Some(current)) => saved != current.as_slice(),
+            _ => true,
+        }
+    }
+
+    fn mark_project_snapshot_saved(&mut self) {
+        self.project.cue_list = self.cue_list.clone();
+        self.saved_project_snapshot = serialize_project_snapshot(&self.project, &self.cue_list);
+        if self.saved_project_snapshot.is_none() {
+            warn!("Could not serialize the current project snapshot for close confirmation");
+        }
+    }
+
+    fn request_application_close(&mut self, ctx: &Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) || self.close_allowed {
+            return;
+        }
+
+        // A second native close request while the confirmation is open must
+        // not bypass the operator's Save / Don't Save / Cancel decision.
+        if self.close_prompt.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+
+        if self.project_has_unsaved_changes() {
+            // Keep the native window alive until the operator chooses an action.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_prompt = Some(if self.project_path.is_some() {
+                ClosePromptKind::ExistingProject
+            } else {
+                ClosePromptKind::NewProject
+            });
+        } else {
+            // Let the original native close request continue when there is
+            // nothing to save.
+            self.close_allowed = true;
+        }
+    }
+
+    fn show_close_confirmation(&mut self, ctx: &Context) {
+        let Some(kind) = self.close_prompt else {
+            return;
+        };
+
+        let (title, message) = match kind {
+            ClosePromptKind::ExistingProject => (
+                "Save changes to this project?",
+                "The show has unsaved changes. Save them before closing TaSQ?",
+            ),
+            ClosePromptKind::NewProject => (
+                "Save new project?",
+                "The Cue List has unsaved changes. Save the entire project as a bundle before closing TaSQ?",
+            ),
+        };
+
+        let mut action = None;
+        egui::Window::new(title)
+            .id(Id::new("close_save_confirmation"))
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(message);
+                ui.add_space(8.0);
+                // Keep the close actions evenly distributed across the dialog:
+                // Save on the left, Don't Save centered, and Cancel on the right.
+                // Use compact, consistent 6 px padding on all three buttons.
+                ui.spacing_mut().button_padding = egui::vec2(6.0, 6.0);
+                ui.columns(3, |columns| {
+                    columns[0].with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        if ui.button("Save").clicked() {
+                            action = Some(0_u8);
+                        }
+                    });
+                    columns[1].with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        if ui.button("Don't Save").clicked() {
+                            action = Some(1_u8);
+                        }
+                    });
+                    columns[2].with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            action = Some(2_u8);
+                        }
+                    });
+                });
+            });
+
+        match action {
+            Some(0) => {
+                self.commit_pending_edits_before_save();
+                let saved = match kind {
+                    ClosePromptKind::ExistingProject => self.save_project(),
+                    ClosePromptKind::NewProject => self.save_as_bundle(),
+                };
+                if saved {
+                    info!("Close confirmation: project saved successfully; closing application");
+                    self.close_prompt = None;
+                    self.close_allowed = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Some(1) => {
+                info!("Close confirmation: operator discarded unsaved project changes");
+                self.close_prompt = None;
+                self.close_allowed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(2) => {
+                self.close_prompt = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn save_project(&mut self) -> bool {
         // Renaming an already-open project changes its in-memory identity only.
         // Ctrl+S must therefore create a new file instead of overwriting or
         // renaming the file that was originally opened.
         if self.project_needs_save_as {
             self.status_msg =
                 "Project name changed — choose a new project file with Save As".to_string();
-            self.save_as_project();
-            return;
+            return self.save_as_project();
         }
 
         if self.project_path.is_none() {
@@ -2940,7 +3924,7 @@ impl TheatreShowCueApp {
                     self.assets.set_project_path(path.clone());
                     self.project_path = Some(path);
                 }
-                None => return,
+                None => return false,
             }
         }
 
@@ -2967,7 +3951,7 @@ impl TheatreShowCueApp {
                 Err(error) => {
                     self.status_msg = format!("Asset copy error: {error}");
                     error!("Could not copy project asset: {error}");
-                    return;
+                    return false;
                 }
             }
         }
@@ -2983,19 +3967,23 @@ impl TheatreShowCueApp {
                     path.display(),
                     self.cue_list.cues.len()
                 );
+                self.remember_recent_project(&path);
                 self.status_msg = format!("💾 Saved: {}", path.display());
                 self.create_project_backup("save");
+                self.mark_project_snapshot_saved();
+                true
             }
             Err(e) => {
                 self.status_msg = format!("Save error: {e}");
                 error!("{e}");
+                false
             }
         }
     }
 
     /// Save the current project under a new filename. Media references are
     /// preserved; use Save as Bundle to copy media into a portable folder.
-    fn save_as_project(&mut self) {
+    fn save_as_project(&mut self) -> bool {
         let default_name = format!("{}.tsq", self.project.settings.name);
 
         let Some(path) = FileDialog::new()
@@ -3003,7 +3991,7 @@ impl TheatreShowCueApp {
             .set_file_name(&default_name)
             .save_file()
         else {
-            return;
+            return false;
         };
         let path = ensure_project_extension(path);
 
@@ -3016,7 +4004,7 @@ impl TheatreShowCueApp {
             self.status_msg =
                 "The original project file is protected. Choose a different name or location."
                     .to_string();
-            return;
+            return false;
         }
 
         let mut project = self.project.clone();
@@ -3035,55 +4023,63 @@ impl TheatreShowCueApp {
                 self.assets.set_project_path(path.clone());
                 self.report.project_name = self.project.settings.name.clone();
                 self.project_needs_save_as = false;
+                self.remember_recent_project(&path);
                 self.status_msg = format!("💾 Saved as: {}", path.display());
                 self.create_project_backup("save-as");
+                self.mark_project_snapshot_saved();
+                true
             }
             Err(error) => {
                 self.status_msg = format!("Save As error: {error}");
                 error!("Could not save project copy: {error}");
+                false
             }
         }
     }
 
     /// Create a portable bundle folder:
-    /// <parent>/<project>/<project>.tsq + audio/ with relative media paths.
-    fn save_as_bundle(&mut self) {
-        let default_name = self.project.settings.name.clone();
-        let default_file_name = format!("{default_name}.tsq");
-
-        let Some(selected_path) = FileDialog::new()
-            .add_filter("Theatre Show Cue Project Bundle", &["tsq", "clabs"])
-            .set_file_name(&default_file_name)
-            .save_file()
-        else {
-            return;
+    /// <chosen-parent>/<project>/<project>.tsq + audio/ and backup/.
+    /// The user chooses a parent directory; TaSQ creates one self-contained
+    /// project folder inside it instead of asking for a project-file path.
+    fn save_as_bundle(&mut self) -> bool {
+        let Some(bundle_name) = sanitize_project_name(&self.project.settings.name) else {
+            self.status_msg = "Project name cannot be used as a bundle folder name".to_string();
+            return false;
         };
 
-        // The selected filename determines both the bundle folder and project
-        // filename. The selected path itself is a naming/location hint; the
-        // actual project file is created one level deeper.
-        let selected_path = ensure_project_extension(selected_path);
-        let bundle_name = project_name_from_path(&selected_path);
-        let bundle_parent = selected_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let Some(bundle_parent) = FileDialog::new().pick_folder() else {
+            return false;
+        };
+
         let bundle_dir = bundle_parent.join(&bundle_name);
         let bundle_project_path = bundle_dir.join(format!("{bundle_name}.tsq"));
         let audio_dir = bundle_dir.join("audio");
+        let is_current_bundle = self
+            .project_path
+            .as_deref()
+            .is_some_and(|path| paths_refer_to_same_location(path, &bundle_project_path));
 
         if bundle_dir.exists() && !bundle_dir.is_dir() {
             self.status_msg = format!(
                 "Bundle error: destination exists and is not a folder: {}",
                 bundle_dir.display()
             );
-            return;
+            return false;
         }
 
+        if bundle_dir.exists() && !is_current_bundle {
+            self.status_msg = format!(
+                "Bundle folder already exists: {}. Choose another destination or rename the project.",
+                bundle_dir.display()
+            );
+            return false;
+        }
+
+        self.status_msg = format!("Creating project bundle: {}", bundle_dir.display());
         if let Err(error) = std::fs::create_dir_all(&audio_dir) {
             self.status_msg = format!("Bundle error: {error}");
             error!("Could not create bundle directory: {error}");
-            return;
+            return false;
         }
 
         let mut bundle_assets = AssetManager::new();
@@ -3123,7 +4119,7 @@ impl TheatreShowCueApp {
                         Err(error) => {
                             self.status_msg = format!("Bundle audio copy error: {error}");
                             error!("Could not copy bundle audio file: {error}");
-                            return;
+                            return false;
                         }
                     }
                 };
@@ -3158,9 +4154,10 @@ impl TheatreShowCueApp {
                 self.cue_clipboard.clear();
                 self.project = project;
                 self.project_path = Some(bundle_project_path.clone());
-                self.assets.set_project_path(bundle_project_path);
+                self.assets.set_project_path(bundle_project_path.clone());
                 self.report.project_name = self.project.settings.name.clone();
                 self.project_needs_save_as = false;
+                self.remember_recent_project(&bundle_project_path);
                 self.status_msg = format!(
                     "📦 Bundle saved: {} | audio files: {} | missing: {}",
                     bundle_dir.display(),
@@ -3168,10 +4165,13 @@ impl TheatreShowCueApp {
                     missing_count
                 );
                 self.create_project_backup("bundle-save");
+                self.mark_project_snapshot_saved();
+                true
             }
             Err(error) => {
                 self.status_msg = format!("Bundle save error: {error}");
                 error!("Could not save project bundle: {error}");
+                false
             }
         }
     }
@@ -3306,71 +4306,187 @@ impl TheatreShowCueApp {
         self.create_project_backup("periodic");
     }
 
+    fn begin_waveform_generation(&mut self) {
+        self.waveform_generation = self.waveform_manager.begin_generation();
+        self.waveform_pending_cues.clear();
+        self.waveform_scheduled_cues.clear();
+        self.waveform_total_cues = 0;
+        self.waveform_cache_stats_before = audio_analysis_cache_stats();
+    }
+
+    fn queue_waveform_analysis_jobs(&mut self, jobs: Vec<(PathBuf, Vec<Uuid>)>) {
+        for (path, mut cue_ids) in jobs {
+            cue_ids.sort_unstable();
+            cue_ids.dedup();
+            cue_ids.retain(|cue_id| !self.waveform_scheduled_cues.contains(cue_id));
+            if cue_ids.is_empty() {
+                continue;
+            }
+
+            for cue_id in &cue_ids {
+                self.waveform_scheduled_cues.insert(*cue_id);
+                self.waveform_pending_cues.insert(*cue_id);
+            }
+            self.waveform_total_cues = self.waveform_total_cues.saturating_add(cue_ids.len());
+
+            if !self.waveform_manager.submit(
+                self.waveform_generation,
+                path.clone(),
+                cue_ids.clone(),
+                WAVEFORM_BUCKETS,
+            ) {
+                self.waveform_total_cues = self.waveform_total_cues.saturating_sub(cue_ids.len());
+                for cue_id in cue_ids {
+                    self.waveform_pending_cues.remove(&cue_id);
+                    self.waveform_scheduled_cues.remove(&cue_id);
+                }
+                warn!(
+                    "Could not queue background waveform analysis for {:?}",
+                    path
+                );
+            }
+        }
+    }
+
+    fn poll_waveform_analysis(&mut self, ctx: &Context) {
+        while let Some(result) = self.waveform_manager.try_recv() {
+            if result.generation != self.waveform_generation {
+                continue;
+            }
+
+            let mut applied_cues = 0_usize;
+            for cue_id in result.cue_ids {
+                self.waveform_pending_cues.remove(&cue_id);
+
+                let path_matches = self.cue_list.find(cue_id).is_some_and(|cue| {
+                    cue.file_path.is_file()
+                        && paths_refer_to_same_location(&cue.file_path, &result.path)
+                });
+                if !path_matches {
+                    // The operator may have replaced this Cue's media while the
+                    // previous analysis was still running. Let the current path
+                    // be queued by the periodic media scan instead.
+                    self.waveform_scheduled_cues.remove(&cue_id);
+                    continue;
+                }
+
+                let audio = &self.audio;
+                if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                    if !matches!(&cue.cue_type, CueType::Audio) {
+                        continue;
+                    }
+                    if result.analysis.waveform.is_empty()
+                        || result.analysis.duration_secs <= 0.0
+                        || result.analysis.channels == 0
+                    {
+                        warn!(
+                            "Background waveform analysis returned no usable data: cue_id={}, path='{}'",
+                            cue_id,
+                            result.path.display()
+                        );
+                        continue;
+                    }
+
+                    cue.waveform = result.analysis.waveform.clone();
+                    cue.duration_secs = result.analysis.duration_secs;
+                    cue.audio_channels = result.analysis.channels;
+                    if cue.loop_region.end_secs <= 0.0 {
+                        cue.loop_region.end_secs = cue.duration_secs;
+                    } else {
+                        cue.loop_region.end_secs = cue.loop_region.end_secs.min(cue.duration_secs);
+                    }
+                    cue.loop_region.start_secs =
+                        cue.loop_region.start_secs.min(cue.loop_region.end_secs);
+                    cue.start_secs = cue.start_secs.min(cue.duration_secs);
+                    if let Some(end_secs) = cue.end_secs.as_mut() {
+                        *end_secs = (*end_secs).min(cue.duration_secs);
+                    }
+                    ensure_audio_cue_routes(audio, cue);
+                    applied_cues += 1;
+                }
+            }
+
+            if applied_cues > 0 {
+                info!(
+                    "Background waveform analysis applied: path='{}', cues={}, duration={:.3}s, channels={}",
+                    result.path.display(),
+                    applied_cues,
+                    result.analysis.duration_secs,
+                    result.analysis.channels
+                );
+            }
+            ctx.request_repaint();
+        }
+
+        if self.waveform_pending_cues.is_empty() && self.waveform_total_cues > 0 {
+            let after = audio_analysis_cache_stats();
+            info!(
+                "Background waveform generation completed: cues={}, memory_hits={}, memory_misses={}, decodes={}, disk_hits={}, disk_misses={}, disk_writes={}, cache_entries={}, evictions={}",
+                self.waveform_total_cues,
+                after.hits.saturating_sub(self.waveform_cache_stats_before.hits),
+                after.misses.saturating_sub(self.waveform_cache_stats_before.misses),
+                after.decodes.saturating_sub(self.waveform_cache_stats_before.decodes),
+                after.disk_hits.saturating_sub(self.waveform_cache_stats_before.disk_hits),
+                after.disk_misses.saturating_sub(self.waveform_cache_stats_before.disk_misses),
+                after.disk_writes.saturating_sub(self.waveform_cache_stats_before.disk_writes),
+                after.entries,
+                after.evictions.saturating_sub(self.waveform_cache_stats_before.evictions),
+            );
+            self.waveform_total_cues = 0;
+        }
+
+        if !self.waveform_pending_cues.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
     fn poll_audio_file_metadata(&mut self) {
         if self.last_media_scan_at.elapsed() < Duration::from_secs(1) {
             return;
         }
         self.last_media_scan_at = Instant::now();
 
-        for cue in &mut self.cue_list.cues {
+        let mut missing_cues = Vec::new();
+        let mut jobs: HashMap<PathBuf, (PathBuf, Vec<Uuid>)> = HashMap::new();
+
+        for cue in &self.cue_list.cues {
             if !matches!(&cue.cue_type, CueType::Audio) {
                 continue;
             }
 
             if !cue.file_path.is_file() {
-                // Clear stale runtime metadata when media disappears. The
-                // next scan will rebuild it as soon as the file is restored.
-                cue.duration_secs = 0.0;
-                cue.waveform.clear();
+                missing_cues.push(cue.id);
                 continue;
             }
 
             if cue.duration_secs > 0.0 && cue.waveform.len() >= WAVEFORM_BUCKETS.saturating_mul(2) {
                 continue;
             }
-
-            let duration = get_duration(&cue.file_path);
-            if duration <= 0.0 {
+            if self.waveform_scheduled_cues.contains(&cue.id) {
                 continue;
             }
-            let waveform = generate_waveform(&cue.file_path, WAVEFORM_BUCKETS);
-            if waveform.is_empty() {
-                continue;
-            }
-            let channels = get_channel_count(&cue.file_path);
 
-            cue.duration_secs = duration;
-            cue.waveform = waveform;
-            if cue.loop_region.end_secs <= 0.0 {
-                cue.loop_region.end_secs = duration;
-            } else {
-                cue.loop_region.end_secs = cue.loop_region.end_secs.min(duration);
-            }
-            cue.start_secs = cue.start_secs.min(duration);
-            if let Some(end_secs) = cue.end_secs.as_mut() {
-                *end_secs = (*end_secs).min(duration);
-            }
-
-            if channels > 0 {
-                cue.audio_channels = channels;
-                let output_count = self
-                    .audio
-                    .output_channels_for_device(cue.io.output_device.as_deref());
-                let default_route_channels = self
-                    .audio
-                    .default_route_channels_for_source(cue.io.output_device.as_deref(), channels);
-                cue.io.ensure_channel_routes_with_defaults(
-                    channels,
-                    output_count,
-                    &default_route_channels,
-                );
-            }
-
-            info!(
-                "Recovered audio metadata for cue {} from {:?}",
-                cue.id, cue.file_path
-            );
+            let key = waveform_path_key(&cue.file_path);
+            jobs.entry(key)
+                .or_insert_with(|| (cue.file_path.clone(), Vec::new()))
+                .1
+                .push(cue.id);
         }
+
+        for cue_id in missing_cues {
+            if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                cue.duration_secs = 0.0;
+                cue.waveform = std::sync::Arc::from(Vec::<f32>::new());
+            }
+            self.waveform_pending_cues.remove(&cue_id);
+            self.waveform_scheduled_cues.remove(&cue_id);
+        }
+
+        self.queue_waveform_analysis_jobs(
+            jobs.into_values()
+                .map(|(path, cue_ids)| (path, cue_ids))
+                .collect(),
+        );
     }
 
     fn set_audio_cue_file(&mut self, cue_id: Uuid, source_path: PathBuf) {
@@ -3379,9 +4495,10 @@ impl TheatreShowCueApp {
             return;
         }
 
-        let duration = get_duration(&source_path);
-        let waveform = generate_waveform(&source_path, WAVEFORM_BUCKETS);
-        let channels = get_channel_count(&source_path);
+        let analysis = analyze_audio_file(&source_path, WAVEFORM_BUCKETS);
+        let duration = analysis.duration_secs;
+        let waveform = analysis.waveform.clone();
+        let channels = analysis.channels;
         if duration <= 0.0 || waveform.is_empty() {
             self.status_msg = format!("Could not decode audio file: {}", source_path.display());
             return;
@@ -3429,12 +4546,59 @@ impl TheatreShowCueApp {
             cue.waveform = waveform;
             if channels > 0 {
                 cue.audio_channels = channels;
-                let output_count = self
-                    .audio
-                    .output_channels_for_device(cue.io.output_device.as_deref());
-                let default_route_channels = self
-                    .audio
-                    .default_route_channels_for_source(cue.io.output_device.as_deref(), channels);
+                let route_backend = cue
+                    .io
+                    .output_backend
+                    .or_else(|| {
+                        cue.io
+                            .output_device_id
+                            .as_deref()
+                            .and_then(|id| self.audio.device_registry.find_by_id(id))
+                            .map(|endpoint| endpoint.backend)
+                    })
+                    .unwrap_or(self.audio.backend);
+                let route_device_name = cue
+                    .io
+                    .output_device
+                    .clone()
+                    .or_else(|| {
+                        cue.io
+                            .output_device_id
+                            .as_deref()
+                            .and_then(|id| self.audio.device_registry.find_by_id(id))
+                            .filter(|endpoint| endpoint.backend == route_backend)
+                            .map(|endpoint| endpoint.device_name.clone())
+                    })
+                    .unwrap_or_else(|| self.audio.current_device.clone());
+                let registered_route_id =
+                    if cue.io.output_device_id.is_none() && cue.io.output_device.is_some() {
+                        self.audio
+                            .registered_endpoint_id(route_backend, &route_device_name)
+                    } else {
+                        None
+                    };
+                let route_endpoint_id = cue
+                    .io
+                    .output_device_id
+                    .as_deref()
+                    .or(registered_route_id.as_deref())
+                    .or_else(|| {
+                        cue.io
+                            .output_device
+                            .is_none()
+                            .then_some(self.audio.current_device_id.as_str())
+                    });
+                let output_count = self.audio.output_channels_for_endpoint(
+                    route_backend,
+                    route_endpoint_id,
+                    Some(&route_device_name),
+                );
+                let default_route_channels = self.audio.default_route_channels_for_source_endpoint(
+                    route_backend,
+                    route_endpoint_id,
+                    Some(&route_device_name),
+                    channels,
+                );
                 cue.io.ensure_channel_routes_with_defaults(
                     channels,
                     output_count,
@@ -3471,119 +4635,205 @@ impl TheatreShowCueApp {
     }
 
     fn open_project(&mut self) {
-        self.stop_all();
-
         let file = FileDialog::new()
             .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
             .pick_file();
 
         if let Some(path) = file {
-            match Project::load(&path) {
-                Ok(mut proj) => {
-                    let mut cl = proj.cue_list.clone();
-                    if proj.version < 3 {
-                        // Generic conversion of legacy native-index routing to
-                        // logical TaSQ destinations. This occurs only once when
-                        // loading an old project, never when changing Mapping.
-                        for cue in &mut cl.cues {
-                            if !cue_owns_audio_stream(cue) {
-                                continue;
-                            }
-                            let backend = cue.io.output_backend.unwrap_or(self.audio.backend);
-                            let device_name = cue
-                                .io
-                                .output_device
-                                .as_deref()
-                                .unwrap_or(self.audio.current_device.as_str());
-                            let device_key = format!("{}::{}", backend.label(), device_name);
-                            let output_count =
-                                self.audio.output_channels_for_device(Some(device_name));
-                            let order: Vec<usize> = self
-                                .settings
-                                .output_channel_orders
-                                .get(&device_key)
-                                .cloned()
-                                .unwrap_or_else(|| (0..output_count).collect());
-                            cue.io.upgrade_native_routes_to_logical(&order);
-                        }
-                        info!(
-                            "Upgraded project routing schema {} to 3 (logical Cue outputs)",
-                            proj.version
-                        );
-                        proj.version = 3;
-                    }
+            self.open_project_path(path);
+        }
+    }
+
+    fn open_project_path(&mut self, path: PathBuf) {
+        if !path.is_file() {
+            self.status_msg = format!("Project file is unavailable: {}", path.display());
+            warn!(
+                "Project could not be opened because the file is missing: {}",
+                path.display()
+            );
+            return;
+        }
+
+        self.stop_all();
+        match Project::load(&path) {
+            Ok(mut proj) => {
+                let mut cl = proj.cue_list.clone();
+                let migration_output_orders = proj
+                    .audio_routing
+                    .as_ref()
+                    .map(|routing| routing.output_channel_orders.clone())
+                    .unwrap_or_else(|| self.settings.output_channel_orders.clone());
+                if proj.version < 3 {
+                    // Generic conversion of legacy native-index routing to
+                    // logical TaSQ destinations. This occurs only once when
+                    // loading an old project, never when changing Mapping.
                     for cue in &mut cl.cues {
-                        if !cue.file_path.as_os_str().is_empty() {
-                            let detected_channels = get_channel_count(&cue.file_path);
-                            if detected_channels > 0 {
-                                cue.audio_channels = detected_channels;
-                            }
-                            if cue.audio_channels > 0 {
-                                let output_count = self
-                                    .audio
-                                    .output_channels_for_device(cue.io.output_device.as_deref());
-                                let default_route_channels =
-                                    self.audio.default_route_channels_for_source(
-                                        cue.io.output_device.as_deref(),
-                                        cue.audio_channels,
-                                    );
-                                cue.io.ensure_channel_routes_with_defaults(
-                                    cue.audio_channels,
-                                    output_count,
-                                    &default_route_channels,
-                                );
-                            }
-                            if cue.duration_secs == 0.0 {
-                                let d = get_duration(&cue.file_path);
-                                if d > 0.0 {
-                                    cue.duration_secs = d;
-                                }
-                            }
-                            if cue.waveform.len() < WAVEFORM_BUCKETS * 2 {
-                                cue.waveform = generate_waveform(&cue.file_path, WAVEFORM_BUCKETS);
-                            }
+                        if !cue_owns_audio_stream(cue) {
+                            continue;
                         }
+                        let backend = cue
+                            .io
+                            .output_backend
+                            .or_else(|| {
+                                cue.io
+                                    .output_device_id
+                                    .as_deref()
+                                    .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                    .map(|endpoint| endpoint.backend)
+                            })
+                            .unwrap_or(self.audio.backend);
+                        let device_name = cue
+                            .io
+                            .output_device
+                            .as_deref()
+                            .or_else(|| {
+                                cue.io
+                                    .output_device_id
+                                    .as_deref()
+                                    .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                    .filter(|endpoint| endpoint.backend == backend)
+                                    .map(|endpoint| endpoint.device_name.as_str())
+                            })
+                            .unwrap_or(self.audio.current_device.as_str());
+                        let device_key = format!("{}::{}", backend.label(), device_name);
+                        let registered_endpoint_id = if cue.io.output_device_id.is_none() {
+                            self.audio.registered_endpoint_id(backend, device_name)
+                        } else {
+                            None
+                        };
+                        let endpoint_id = cue
+                            .io
+                            .output_device_id
+                            .as_deref()
+                            .or(registered_endpoint_id.as_deref());
+                        let output_count = self.audio.output_channels_for_endpoint(
+                            backend,
+                            endpoint_id,
+                            Some(device_name),
+                        );
+                        let order: Vec<usize> = migration_output_orders
+                            .get(&device_key)
+                            .cloned()
+                            .unwrap_or_else(|| (0..output_count).collect());
+                        cue.io.upgrade_native_routes_to_logical(&order);
+                    }
+                    info!(
+                        "Upgraded project routing schema {} to 3 (logical Cue outputs)",
+                        proj.version
+                    );
+                    proj.version = 3;
+                }
+
+                // Projects created before version 4 did not carry their own
+                // Logical Output Mapping / Default Stereo Pair. Migrate them
+                // once from the current workstation defaults, then persist
+                // the resulting profile on the next project save.
+                let project_audio_routing = proj.audio_routing.clone().unwrap_or_else(|| {
+                    info!(
+                        "Project '{}' has no project-scoped audio routing; importing workstation defaults",
+                        proj.settings.name
+                    );
+                    ProjectAudioRouting::from_maps(
+                        self.settings.output_channel_orders.clone(),
+                        self.settings.default_output_pairs.clone(),
+                    )
+                });
+                proj.audio_routing = Some(project_audio_routing.clone());
+                proj.version = proj.version.max(4);
+                self.audio
+                    .set_output_channel_orders(project_audio_routing.output_channel_orders.clone());
+                self.audio
+                    .set_default_output_pairs(project_audio_routing.default_output_pairs.clone());
+
+                // Waveform and duration analysis is intentionally deferred to
+                // background workers. The Cue List can be installed immediately;
+                // each unique media path is analysed once and shared by its Cues.
+                let mut waveform_jobs: HashMap<PathBuf, (PathBuf, Vec<Uuid>)> = HashMap::new();
+                let mut audio_cue_count = 0_usize;
+
+                for cue in &mut cl.cues {
+                    if !matches!(&cue.cue_type, CueType::Audio)
+                        || cue.file_path.as_os_str().is_empty()
+                    {
+                        continue;
                     }
 
-                    proj.cue_list = cl.clone();
-                    self.cue_list = cl;
-                    self.cue_clipboard.clear();
-                    self.time_trigger_last_fired.clear();
-                    self.project = proj;
-                    let is_backup_project = path
-                        .parent()
-                        .and_then(|parent| parent.file_name())
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
-                    if !is_backup_project {
-                        self.assets.set_project_path(path.clone());
-                        self.project_path = Some(path.clone());
-                        self.project.settings.name = project_name_from_path(&path);
-                    } else {
-                        // Opening a backup is a recovery operation. Keep the
-                        // snapshot untouched and let the user Save As a normal
-                        // project when ready.
-                        self.assets = AssetManager::new();
-                        self.project_path = None;
+                    audio_cue_count += 1;
+                    ensure_audio_cue_routes(&self.audio, cue);
+
+                    if !cue.file_path.is_file() {
+                        warn!(
+                            "Audio media is missing while opening project: cue_id={}, path='{}'",
+                            cue.id,
+                            cue.file_path.display()
+                        );
+                        continue;
                     }
-                    self.project_needs_save_as = false;
-                    self.last_backup_at = Instant::now();
-                    self.last_media_scan_at = Instant::now();
-                    self.report = SessionReport::new(&self.project.settings.name);
-                    self.selected = None;
-                    self.selected_ids.clear();
-                    self.selection_anchor = None;
-                    info!(
-                        "Project opened: path='{}', cues={}",
-                        path.display(),
-                        self.cue_list.cues.len()
-                    );
-                    self.status_msg = format!("📂 Opened: {}", path.display());
+
+                    let key = waveform_path_key(&cue.file_path);
+                    waveform_jobs
+                        .entry(key)
+                        .or_insert_with(|| (cue.file_path.clone(), Vec::new()))
+                        .1
+                        .push(cue.id);
                 }
-                Err(e) => {
-                    self.status_msg = format!("Open error: {e}");
-                    error!("{e}");
+
+                let waveform_job_count = waveform_jobs.len();
+                let waveform_cue_count: usize = waveform_jobs
+                    .values()
+                    .map(|(_, cue_ids)| cue_ids.len())
+                    .sum();
+
+                proj.cue_list = cl.clone();
+                self.cue_list = cl;
+                self.cue_clipboard.clear();
+                self.time_trigger_last_fired.clear();
+                self.project = proj;
+                let is_backup_project = path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
+                if !is_backup_project {
+                    self.assets.set_project_path(path.clone());
+                    self.project_path = Some(path.clone());
+                    self.project.settings.name = project_name_from_path(&path);
+                    self.remember_recent_project(&path);
+                } else {
+                    // Opening a backup is a recovery operation. Keep the
+                    // snapshot untouched and let the user Save As a normal
+                    // project when ready.
+                    self.assets = AssetManager::new();
+                    self.project_path = None;
                 }
+                self.project_needs_save_as = false;
+                self.begin_waveform_generation();
+                self.queue_waveform_analysis_jobs(
+                    waveform_jobs
+                        .into_values()
+                        .map(|(path, cue_ids)| (path, cue_ids))
+                        .collect(),
+                );
+                self.mark_project_snapshot_saved();
+                self.last_backup_at = Instant::now();
+                self.last_media_scan_at = Instant::now();
+                self.report = SessionReport::new(&self.project.settings.name);
+                self.selected = None;
+                self.selected_ids.clear();
+                self.selection_anchor = None;
+                info!(
+                    "Project opened: path='{}', cues={}, audio_cues={}, waveform_jobs={}, queued_waveform_cues={}; analysis continues in background",
+                    path.display(),
+                    self.cue_list.cues.len(),
+                    audio_cue_count,
+                    waveform_job_count,
+                    waveform_cue_count
+                );
+                self.status_msg = format!("📂 Opened: {}", path.display());
+            }
+            Err(e) => {
+                self.status_msg = format!("Open error: {e}");
+                error!("{e}");
             }
         }
     }
@@ -3591,13 +4841,17 @@ impl TheatreShowCueApp {
     fn new_project(&mut self) {
         info!("New project requested");
         self.stop_all();
+        self.begin_waveform_generation();
         self.cue_list = CueList::new("Main");
         self.cue_clipboard.clear();
         self.time_trigger_last_fired.clear();
-        self.project = Project::default();
+        let audio_routing = self.current_project_audio_routing();
+        self.project = Project::with_audio_routing(audio_routing);
+        self.apply_project_audio_routing();
         self.project_path = None;
         self.project_needs_save_as = false;
         self.assets = AssetManager::new();
+        self.mark_project_snapshot_saved();
         self.report = SessionReport::new("Untitled Project");
         self.selected = None;
         self.selected_ids.clear();
@@ -3629,8 +4883,12 @@ impl TheatreShowCueApp {
             }
         }
 
-        for cue_id in finished_cues {
-            self.schedule_cue_completion(cue_id, 0.0);
+        if !finished_cues.is_empty() {
+            self.begin_launch_transaction();
+            for cue_id in finished_cues {
+                self.schedule_cue_completion(cue_id, 0.0);
+            }
+            self.end_launch_transaction();
         }
 
         let now = Instant::now();
@@ -3692,7 +4950,13 @@ impl TheatreShowCueApp {
     }
 
     fn poll_midi(&mut self) {
-        for msg in self.midi.drain() {
+        self.midi_out.poll();
+        let messages = self.midi.drain();
+        if messages.is_empty() {
+            return;
+        }
+        self.begin_launch_transaction();
+        for msg in messages {
             // Settings is modal for Cue List actions. Only an explicit MIDI Learn
             // capture is allowed to consume messages while the window is open.
             if self.settings_open {
@@ -3746,6 +5010,7 @@ impl TheatreShowCueApp {
                 _ => {}
             }
         }
+        self.end_launch_transaction();
     }
 
     /// Handles MIDI learn and persistent command bindings. Channels are stored
@@ -3849,6 +5114,12 @@ impl TheatreShowCueApp {
             return;
         }
         for ev in events {
+            tracing::info!(
+                target: "TaSQ::osc::server",
+                "OSC control dispatched: address='{}', args={:?}",
+                &ev.addr,
+                &ev.args
+            );
             match ev.addr.as_str() {
                 "/go" | "/cue/go" => self.dispatch_app_action(AppAction::Go),
                 "/stop" | "/stop_all" | "/cue/stop" => self.dispatch_app_action(AppAction::StopAll),
@@ -4052,10 +5323,13 @@ impl TheatreShowCueApp {
     // ── Горячие клавиши и Drag-and-drop ──────────────────────────────────────
 
     fn handle_keyboard(&mut self, ctx: &Context) {
-        // The settings window is modal. Keep its explicit hotkey capture active,
-        // but never dispatch normal transport or project shortcuts behind it.
-        if self.settings_open && self.hotkey_capture.is_none() {
-            return;
+        // The settings window is modal. Keep its explicit global hotkey capture
+        // active, but never dispatch Cue or application shortcuts behind it.
+        if self.settings_open {
+            self.cue_hotkey_capture = None;
+            if self.hotkey_capture.is_none() {
+                return;
+            }
         }
 
         // egui reports logical keys for the active keyboard layout and falls
@@ -4076,6 +5350,82 @@ impl TheatreShowCueApp {
                 })
                 .collect()
         });
+
+        // Cue-specific capture has priority over all normal shortcuts.
+        if let Some(cue_id) = self.cue_hotkey_capture {
+            if self.active_panel != Panel::Inspector || self.selected != Some(cue_id) {
+                self.cue_hotkey_capture = None;
+            } else {
+                if let Some((key, physical_key, modifiers)) = key_events.first().copied() {
+                    ctx.input_mut(|input| {
+                        input.consume_key(modifiers, key);
+                    });
+                    self.cue_hotkey_capture = None;
+                    let capture_key = physical_key.unwrap_or(key);
+                    if capture_key == Key::Escape {
+                        self.status_msg = "Cue hotkey assignment cancelled".to_string();
+                    } else if capture_key == Key::Backspace {
+                        if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                            cue.hotkey = None;
+                            self.status_msg = format!("Hotkey cleared for Cue {}", cue.number);
+                            info!("Cue hotkey cleared: id={}, number='{}'", cue.id, cue.number);
+                        }
+                    } else {
+                        let binding = Self::format_hotkey(capture_key, modifiers);
+                        let mut global_conflict = None;
+                        for action in AppAction::ALL {
+                            if self
+                                .settings
+                                .hotkeys
+                                .bindings
+                                .get(action)
+                                .is_some_and(|existing| existing.eq_ignore_ascii_case(&binding))
+                            {
+                                global_conflict = Some(action.label().to_string());
+                                break;
+                            }
+                        }
+                        let reserved_shortcut =
+                            ["Ctrl+Shift+S", "Ctrl+Alt+S", "Ctrl+C", "Ctrl+V", "Ctrl+A"]
+                                .iter()
+                                .any(|reserved| reserved.eq_ignore_ascii_case(&binding));
+                        let cue_conflict = self
+                            .cue_list
+                            .cues
+                            .iter()
+                            .find(|cue| {
+                                cue.id != cue_id
+                                    && cue.hotkey.as_deref().is_some_and(|existing| {
+                                        existing.eq_ignore_ascii_case(&binding)
+                                    })
+                            })
+                            .map(|cue| format!("#{} — {}", cue.number, cue.name));
+
+                        if reserved_shortcut {
+                            self.status_msg = format!(
+                                "{binding} is reserved for a built-in application shortcut"
+                            );
+                        } else if let Some(action_label) = global_conflict {
+                            self.status_msg = format!(
+                                "{binding} is already assigned to the global command {action_label}"
+                            );
+                        } else if let Some(other_cue) = cue_conflict {
+                            self.status_msg =
+                                format!("{binding} is already assigned to Cue {other_cue}");
+                        } else if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                            cue.hotkey = Some(binding.clone());
+                            self.status_msg =
+                                format!("Hotkey {binding} assigned to Cue {}", cue.number);
+                            info!(
+                                "Cue hotkey assigned: id={}, number='{}', name='{}', binding='{}'",
+                                cue.id, cue.number, cue.name, binding
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
 
         // Capture mode has priority over normal application shortcuts.
         if let Some(action) = self.hotkey_capture.clone() {
@@ -4162,6 +5512,52 @@ impl TheatreShowCueApp {
             return;
         }
 
+        for action in AppAction::ALL {
+            let Some(binding) = self.settings.hotkeys.bindings.get(action) else {
+                continue;
+            };
+            if key_events.iter().any(|(key, physical, modifiers)| {
+                Self::format_hotkey(*key, *modifiers).eq_ignore_ascii_case(binding)
+                    || physical
+                        .as_ref()
+                        .map(|physical_key| {
+                            Self::format_hotkey(*physical_key, *modifiers)
+                                .eq_ignore_ascii_case(binding)
+                        })
+                        .unwrap_or(false)
+            }) {
+                self.dispatch_app_action((*action).clone());
+                return;
+            }
+        }
+
+        // Cue hotkeys trigger their Cue directly without changing the operator's
+        // current selection. Text editors retain priority through wants_keyboard_input().
+        let cue_hotkey_match = self.cue_list.cues.iter().find_map(|cue| {
+            let binding = cue.hotkey.as_deref()?;
+            let matched = key_events.iter().any(|(key, physical, modifiers)| {
+                Self::format_hotkey(*key, *modifiers).eq_ignore_ascii_case(binding)
+                    || physical
+                        .as_ref()
+                        .map(|physical_key| {
+                            Self::format_hotkey(*physical_key, *modifiers)
+                                .eq_ignore_ascii_case(binding)
+                        })
+                        .unwrap_or(false)
+            });
+            matched.then_some((cue.id, cue.number.clone(), cue.name.clone()))
+        });
+        if let Some((cue_id, number, name)) = cue_hotkey_match {
+            info!(
+                "Cue hotkey triggered: id={}, number='{}', name='{}'",
+                cue_id, number, name
+            );
+            self.trigger_cue(cue_id);
+            return;
+        }
+
+        // Keep the built-in group-navigation keys available unless a Cue has
+        // explicitly claimed that key combination as its hotkey.
         if let Some(selected_id) = self.selected {
             let selected_is_group = self
                 .cue_list
@@ -4189,25 +5585,6 @@ impl TheatreShowCueApp {
                 }
             }
         }
-
-        for action in AppAction::ALL {
-            let Some(binding) = self.settings.hotkeys.bindings.get(action) else {
-                continue;
-            };
-            if key_events.iter().any(|(key, physical, modifiers)| {
-                Self::format_hotkey(*key, *modifiers).eq_ignore_ascii_case(binding)
-                    || physical
-                        .as_ref()
-                        .map(|physical_key| {
-                            Self::format_hotkey(*physical_key, *modifiers)
-                                .eq_ignore_ascii_case(binding)
-                        })
-                        .unwrap_or(false)
-            }) {
-                self.dispatch_app_action((*action).clone());
-                break;
-            }
-        }
     }
 
     fn format_hotkey(key: Key, modifiers: egui::Modifiers) -> String {
@@ -4226,6 +5603,16 @@ impl TheatreShowCueApp {
             Key::ArrowUp => "Up".to_string(),
             Key::ArrowLeft => "Left".to_string(),
             Key::ArrowRight => "Right".to_string(),
+            Key::Num0 => "0".to_string(),
+            Key::Num1 => "1".to_string(),
+            Key::Num2 => "2".to_string(),
+            Key::Num3 => "3".to_string(),
+            Key::Num4 => "4".to_string(),
+            Key::Num5 => "5".to_string(),
+            Key::Num6 => "6".to_string(),
+            Key::Num7 => "7".to_string(),
+            Key::Num8 => "8".to_string(),
+            Key::Num9 => "9".to_string(),
             _ => format!("{:?}", key),
         };
         parts.push(key_name);
@@ -4246,7 +5633,9 @@ impl TheatreShowCueApp {
             AppAction::SelectPrev => self.select_prev(),
             AppAction::NewProject => self.new_project(),
             AppAction::OpenProject => self.open_project(),
-            AppAction::SaveProject => self.save_project(),
+            AppAction::SaveProject => {
+                self.save_project();
+            }
             AppAction::AddFile => self.add_files(),
             AppAction::DeleteSelected => {
                 let selected_ids = if self.selected_ids.is_empty() {
@@ -4293,10 +5682,26 @@ impl TheatreShowCueApp {
         let previous_backend = self.audio.backend;
         let backend_changed = previous_backend != backend;
         let reinitialize_current = same_endpoint && self.active_output_needs_reopen;
-        let performance = AudioPerformanceSettings {
+        let performance_key =
+            AudioEngine::output_device_settings_key_for_backend(backend, device_name);
+        let legacy_performance = AudioPerformanceSettings {
             sample_rate: self.settings.audio_sample_rate,
             buffer_size_frames: self.settings.audio_buffer_size_frames,
         };
+        let mut performance = AudioPerformanceSettings::for_backend(
+            backend,
+            self.settings
+                .audio_performance_settings_by_device
+                .get(&performance_key)
+                .copied()
+                .unwrap_or_else(|| {
+                    if same_endpoint {
+                        legacy_performance
+                    } else {
+                        AudioPerformanceSettings::default()
+                    }
+                }),
+        );
         info!(
             "Audio endpoint switch requested: {} — '{}' -> {} — '{}'",
             previous_backend.short_label(),
@@ -4334,8 +5739,7 @@ impl TheatreShowCueApp {
                             AudioPerformanceSettings::default(),
                         ) {
                             Ok(engine) => {
-                                self.settings.audio_sample_rate = None;
-                                self.settings.audio_buffer_size_frames = None;
+                                performance = AudioPerformanceSettings::default();
                                 engine
                             }
                             Err(fallback_error) => {
@@ -4365,8 +5769,15 @@ impl TheatreShowCueApp {
                 };
 
             replacement.set_output_channel_names(self.settings.output_channel_names.clone());
-            replacement.set_default_output_pairs(self.settings.default_output_pairs.clone());
-            replacement.set_output_channel_orders(self.settings.output_channel_orders.clone());
+            replacement.set_endpoint_preferences(
+                self.settings.audio_performance_settings_by_device.clone(),
+                self.settings.output_channel_settings_by_device.clone(),
+            );
+            let project_audio_routing = self.current_project_audio_routing();
+            replacement
+                .set_default_output_pairs(project_audio_routing.default_output_pairs.clone());
+            replacement
+                .set_output_channel_orders(project_audio_routing.output_channel_orders.clone());
 
             let backend_devices = replacement.output_devices.clone();
             for device in &backend_devices {
@@ -4407,7 +5818,8 @@ impl TheatreShowCueApp {
                 }
             }
         } else if reinitialize_current {
-            self.stop_all();
+            // The manager restarts only this endpoint worker; other devices
+            // must remain untouched during manual recovery.
             if let Err(error) = self.audio.reconfigure_output(performance) {
                 self.status_msg = format!(
                     "Could not apply audio performance settings to {} — {}: {}",
@@ -4416,7 +5828,7 @@ impl TheatreShowCueApp {
                     error
                 );
                 warn!("{}", self.status_msg);
-                self.active_output_needs_reopen = false;
+                self.active_output_needs_reopen = true;
                 return false;
             }
         } else if let Err(error) =
@@ -4446,8 +5858,7 @@ impl TheatreShowCueApp {
                     self.active_output_needs_reopen = false;
                     return false;
                 }
-                self.settings.audio_sample_rate = None;
-                self.settings.audio_buffer_size_frames = None;
+                performance = AudioPerformanceSettings::default();
             } else {
                 self.status_msg = format!(
                     "Could not switch to {} — {}: {}",
@@ -4496,28 +5907,81 @@ impl TheatreShowCueApp {
         self.settings.audio_backend = backend;
         self.settings.audio_output_device = Some(active_device_name.clone());
         self.settings.audio_output_device_id = Some(self.audio.current_device_id.clone());
+        let active_performance_key =
+            AudioEngine::output_device_settings_key_for_backend(backend, &active_device_name);
+        self.settings
+            .audio_performance_settings_by_device
+            .insert(active_performance_key, performance);
+        self.settings.audio_sample_rate = performance.sample_rate;
+        self.settings.audio_buffer_size_frames = performance.buffer_size_frames;
         self.settings.output_channels = self.audio.output_channel_settings();
 
         let selected_key = self.audio.output_device_settings_key(&active_device_name);
         self.settings
             .output_channel_settings_by_device
             .insert(selected_key, self.settings.output_channels.clone());
+        self.audio.set_endpoint_preferences(
+            self.settings.audio_performance_settings_by_device.clone(),
+            self.settings.output_channel_settings_by_device.clone(),
+        );
 
-        // Rebuild defaults only for cues that use the active backend or the
-        // global default. Routes pinned to another backend are preserved for Stage 4.
+        // Keep Cue destinations logical and endpoint-specific. Switching the
+        // global device must not rewrite routes belonging to other workers.
         for cue in &mut self.cue_list.cues {
             if !matches!(&cue.cue_type, CueType::Audio) || cue.audio_channels == 0 {
                 continue;
             }
-            let cue_backend = cue.io.output_backend.unwrap_or(backend);
-            if cue.io.output_device.is_some() && cue_backend != backend {
-                continue;
-            }
-            let output_count = self
-                .audio
-                .output_channels_for_device(cue.io.output_device.as_deref());
-            let default_route_channels = self.audio.default_route_channels_for_source(
-                cue.io.output_device.as_deref(),
+            let cue_backend = cue
+                .io
+                .output_backend
+                .or_else(|| {
+                    cue.io
+                        .output_device_id
+                        .as_deref()
+                        .and_then(|id| self.audio.device_registry.find_by_id(id))
+                        .map(|endpoint| endpoint.backend)
+                })
+                .unwrap_or(backend);
+            let route_device_name = cue
+                .io
+                .output_device
+                .clone()
+                .or_else(|| {
+                    cue.io
+                        .output_device_id
+                        .as_deref()
+                        .and_then(|id| self.audio.device_registry.find_by_id(id))
+                        .filter(|endpoint| endpoint.backend == cue_backend)
+                        .map(|endpoint| endpoint.device_name.clone())
+                })
+                .unwrap_or_else(|| self.audio.current_device.clone());
+            let registered_route_id =
+                if cue.io.output_device_id.is_none() && cue.io.output_device.is_some() {
+                    self.audio
+                        .registered_endpoint_id(cue_backend, &route_device_name)
+                } else {
+                    None
+                };
+            let route_endpoint_id = cue
+                .io
+                .output_device_id
+                .as_deref()
+                .or(registered_route_id.as_deref())
+                .or_else(|| {
+                    cue.io
+                        .output_device
+                        .is_none()
+                        .then_some(self.audio.current_device_id.as_str())
+                });
+            let output_count = self.audio.output_channels_for_endpoint(
+                cue_backend,
+                route_endpoint_id,
+                Some(&route_device_name),
+            );
+            let default_route_channels = self.audio.default_route_channels_for_source_endpoint(
+                cue_backend,
+                route_endpoint_id,
+                Some(&route_device_name),
                 cue.audio_channels,
             );
             cue.io.ensure_channel_routes_with_defaults(
@@ -4556,6 +6020,11 @@ impl TheatreShowCueApp {
             self.status_msg = format!("Settings save error: {error}");
             warn!("Could not save app settings: {error}");
         }
+    }
+
+    fn remember_recent_project(&mut self, path: &Path) {
+        remember_recent_project_path(&mut self.settings.recent_projects, path);
+        self.save_app_settings();
     }
 
     fn apply_osc_settings(&mut self) {
@@ -4643,7 +6112,7 @@ impl TheatreShowCueApp {
                         ui.label(
                             RichText::new("Choose a contrast preset or customize the window and text colors.")
                                 .color(Theme::text_dim())
-                                .size(11.0),
+                                .size(Theme::scaled_font_size(11.0)),
                         );
                         ui.add_space(8.0);
 
@@ -4683,7 +6152,50 @@ impl TheatreShowCueApp {
                                 "Liquid Glass uses translucent, rounded surfaces; Material uses flatter, crisp controls. True backdrop blur is not available in the current egui renderer.",
                             )
                             .color(Theme::text_dim())
-                            .size(10.5),
+                            .size(Theme::scaled_font_size(10.5)),
+                        );
+
+                        ui.separator();
+                        ui.label("Text & Cue List size");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Scale:");
+                            for preset in UiScalePreset::ALL {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.settings.appearance.ui_scale,
+                                        *preset,
+                                        preset.label(),
+                                    )
+                                    .changed()
+                                {
+                                    appearance_changed = true;
+                                }
+                            }
+                        });
+                        if self.settings.appearance.ui_scale == UiScalePreset::Custom {
+                            ui.horizontal(|ui| {
+                                ui.label("Custom scale:");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.settings.appearance.custom_ui_scale_percent,
+                                            75..=150,
+                                        )
+                                        .suffix("%")
+                                        .show_value(true),
+                                    )
+                                    .changed()
+                                {
+                                    appearance_changed = true;
+                                }
+                            });
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Changes text and Cue List event row height only. Custom scale range: 75–150%. Toolbar icons, buttons, faders and control dimensions stay unchanged.",
+                            )
+                            .color(Theme::text_dim())
+                            .size(Theme::scaled_font_size(10.5)),
                         );
 
                         if self.settings.appearance.preset == ThemePreset::Custom {
@@ -4716,8 +6228,13 @@ impl TheatreShowCueApp {
                             );
                             appearance_changed |= edit_rgb_color(
                                 ui,
-                                "Toolbar and standard button color",
+                                "Standard button color",
                                 &mut self.settings.appearance.button_color,
+                            );
+                            appearance_changed |= edit_rgb_color(
+                                ui,
+                                "Upper toolbar button background",
+                                &mut self.settings.appearance.toolbar_button_color,
                             );
                             appearance_changed |= edit_rgb_color(
                                 ui,
@@ -4726,7 +6243,7 @@ impl TheatreShowCueApp {
                             );
                             appearance_changed |= edit_rgb_color(
                                 ui,
-                                "Input field background",
+                                "Editable fields and dropdown background",
                                 &mut self.settings.appearance.input_color,
                             );
                             appearance_changed |= edit_rgb_color(
@@ -4745,10 +6262,113 @@ impl TheatreShowCueApp {
                                 &mut self.settings.appearance.pause_button_color,
                             );
                             ui.label(
-                                RichText::new("Custom colors include toolbar buttons, group outlines, text inputs, transport controls, panels, text and the loop region.")
+                                RichText::new("Editable fields include text boxes, dB/time values, DragValue controls and dropdown selectors. Their text automatically switches to black or white for contrast with the selected background. Toolbar SVG glyphs do the same against their button background.")
                                     .color(Theme::text_dim())
-                                    .size(11.0),
+                                    .size(Theme::scaled_font_size(11.0)),
                             );
+                            ui.separator();
+                            ui.label("Custom toolbar icons");
+                            ui.label(
+                                RichText::new(
+                                    "Choose any supplied SVG icon for each action, or load your own PNG, JPG or WebP image. Built-in SVG glyphs are tinted for contrast against the selected toolbar button background; imported image files keep their original colors.",
+                                )
+                                .color(Theme::text_dim())
+                                .size(Theme::scaled_font_size(10.5)),
+                            );
+
+                            for (role, role_label) in TOOLBAR_ICON_ROLES {
+                                let current = self
+                                    .settings
+                                    .appearance
+                                    .icon_overrides
+                                    .get(*role)
+                                    .cloned();
+                                let mut selected = current.clone();
+                                let current_label = match &current {
+                                    None => "Theme default".to_string(),
+                                    Some(IconOverride::Builtin(key)) => BUILTIN_ICON_KEYS
+                                        .iter()
+                                        .find(|(known, _)| *known == key.as_str())
+                                        .map(|(_, label)| (*label).to_string())
+                                        .unwrap_or_else(|| "Theme default".to_string()),
+                                    Some(IconOverride::CustomFile(path)) => format!(
+                                        "Custom: {}",
+                                        Path::new(path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .unwrap_or("image")
+                                    ),
+                                };
+                                let mut choose_file = false;
+                                let mut reset_icon = false;
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([150.0, 22.0], egui::Label::new(*role_label));
+                                    Theme::input_scope(ui, |ui| {
+                                        egui::ComboBox::from_id_salt(format!("custom_icon_choice_{role}"))
+                                        .width(150.0)
+                                        .selected_text(current_label)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut selected,
+                                                None,
+                                                "Theme default",
+                                            );
+                                            for (builtin_key, builtin_label) in BUILTIN_ICON_KEYS {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    Some(IconOverride::Builtin((*builtin_key).to_string())),
+                                                    *builtin_label,
+                                                );
+                                            }
+                                        });
+                                    });
+                                    if ui.small_button("Choose file…").clicked() {
+                                        choose_file = true;
+                                    }
+                                    if current.is_some() && ui.small_button("Reset").clicked() {
+                                        reset_icon = true;
+                                    }
+                                });
+
+                                if reset_icon {
+                                    self.settings.appearance.icon_overrides.remove(*role);
+                                    appearance_changed = true;
+                                } else if selected != current {
+                                    match selected {
+                                        Some(choice) => {
+                                            self.settings
+                                                .appearance
+                                                .icon_overrides
+                                                .insert((*role).to_string(), choice);
+                                        }
+                                        None => {
+                                            self.settings.appearance.icon_overrides.remove(*role);
+                                        }
+                                    }
+                                    appearance_changed = true;
+                                }
+
+                                if choose_file {
+                                    if let Some(source) = FileDialog::new()
+                                        .add_filter("Image files", &["png", "jpg", "jpeg", "webp"])
+                                        .pick_file()
+                                    {
+                                        match import_custom_icon(&source, role) {
+                                            Ok(stored_path) => {
+                                                self.settings.appearance.icon_overrides.insert(
+                                                    (*role).to_string(),
+                                                    IconOverride::CustomFile(stored_path),
+                                                );
+                                                appearance_changed = true;
+                                            }
+                                            Err(error) => {
+                                                self.status_msg = format!("Custom icon error: {error}");
+                                                warn!("{}", self.status_msg);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             ui.add_space(4.0);
                             let description = match self.settings.appearance.preset {
@@ -4757,7 +6377,7 @@ impl TheatreShowCueApp {
                                 ThemePreset::Black => "Near-black interface with bright text for dark rooms and OLED displays.",
                                 ThemePreset::Custom => "Custom color palette.",
                             };
-                            ui.label(RichText::new(description).color(Theme::text_dim()).size(11.0));
+                            ui.label(RichText::new(description).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
                         }
 
                         if appearance_changed {
@@ -4772,7 +6392,7 @@ impl TheatreShowCueApp {
                                 "Choose the output endpoint together with its driver. The driver is selected automatically from the device entry.",
                             )
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
 
                         let selected_endpoint_label = self
@@ -4790,7 +6410,8 @@ impl TheatreShowCueApp {
                         let mut selected_endpoint = None;
                         ui.horizontal(|ui| {
                             ui.label("Output device");
-                            egui::ComboBox::from_id_salt("settings_output_endpoint")
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt("settings_output_endpoint")
                                 .width(390.0)
                                 .selected_text(&selected_endpoint_label)
                                 .show_ui(ui, |ui| {
@@ -4804,6 +6425,7 @@ impl TheatreShowCueApp {
                                         });
                                     }
                                 });
+                            });
                             if ui.button("Refresh devices").clicked() {
                                 self.device_registry_monitor.request_refresh();
                                 self.status_msg = "WASAPI/DirectSound device scan requested".to_string();
@@ -4825,17 +6447,17 @@ impl TheatreShowCueApp {
                                 last_scan
                             ))
                             .color(Theme::text_dim())
-                            .size(10.5),
+                            .size(Theme::scaled_font_size(10.5)),
                         );
                         for error in self.audio.device_registry.last_errors() {
                             ui.colored_label(egui::Color32::YELLOW, error);
                         }
                         ui.label(
                             RichText::new(
-                                "WASAPI/DirectSound are checked every 5 seconds. The ASIO driver inventory is loaded at startup and is not re-enumerated while the app is running, to avoid reinitializing vendor drivers. Restart the app after installing/removing ASIO drivers.",
+                                "Windows endpoint notifications trigger immediate WASAPI/DirectSound refreshes; a 60-second fallback scan catches missed notifications. ASIO inventory is not re-enumerated while streams may be active: active ASIO streams are monitored through native error callbacks and callback-progress checks. Restart TaSQ after installing/removing ASIO drivers.",
                             )
                             .color(Theme::text_dim())
-                            .size(10.0),
+                            .size(Theme::scaled_font_size(10.0)),
                         );
 
                         if let Some(endpoint) = selected_endpoint {
@@ -4857,134 +6479,189 @@ impl TheatreShowCueApp {
                         ui.heading("Audio performance");
                         ui.label(
                             RichText::new(
-                                "Sample rate and the backend-specific buffer target are applied by reopening the active output. Smaller targets can reduce queued latency but may cause dropouts; the actual callback period depends on the backend.",
+                                "WASAPI and DirectSound preferences are saved separately for each endpoint. ASIO always follows the rate and hardware block size currently selected by its driver control panel.",
                             )
                             .color(Theme::text_dim())
-                            .size(10.5),
+                            .size(Theme::scaled_font_size(10.5)),
                         );
 
-                        let previous_sample_rate = self.settings.audio_sample_rate;
-                        let previous_buffer_size = self.settings.audio_buffer_size_frames;
-                        let mut selected_sample_rate = previous_sample_rate;
-                        let mut selected_buffer_size = previous_buffer_size;
-                        let mut sample_rates = self.audio.supported_sample_rates.clone();
-                        if let Some(rate) = selected_sample_rate {
-                            if !sample_rates.contains(&rate) {
-                                sample_rates.push(rate);
-                                sample_rates.sort_unstable();
+                        if self.audio.backend == AudioBackend::Asio {
+                            ui.horizontal(|ui| {
+                                ui.label("Sample rate");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Driver-controlled · {} Hz",
+                                        self.audio.current_sample_rate
+                                    ))
+                                    .strong()
+                                    .color(Theme::text()),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Buffer size");
+                                ui.label(
+                                    RichText::new("Driver-controlled")
+                                        .strong()
+                                        .color(Theme::text()),
+                                );
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "ASIO clock and hardware block size are owned by the sound-card driver. TaSQ opens the stream using the current driver settings and does not request an override. Change them in the device's native ASIO control panel, then reopen the endpoint if required.",
+                                )
+                                .color(Theme::text_dim())
+                                .size(Theme::scaled_font_size(10.5)),
+                            );
+                        } else {
+                            let performance_settings_key =
+                                AudioEngine::output_device_settings_key_for_backend(
+                                    self.audio.backend,
+                                    &output,
+                                );
+                            let previous_performance = self
+                                .settings
+                                .audio_performance_settings_by_device
+                                .get(&performance_settings_key)
+                                .copied()
+                                .unwrap_or(self.audio.performance_settings);
+                            let previous_sample_rate = previous_performance.sample_rate;
+                            let previous_buffer_size = previous_performance.buffer_size_frames;
+                            let mut selected_sample_rate = previous_sample_rate;
+                            let mut selected_buffer_size = previous_buffer_size;
+                            let mut sample_rates = self.audio.supported_sample_rates.clone();
+                            if let Some(rate) = selected_sample_rate {
+                                if !sample_rates.contains(&rate) {
+                                    sample_rates.push(rate);
+                                    sample_rates.sort_unstable();
+                                }
                             }
-                        }
-                        let mut buffer_sizes = self.audio.supported_buffer_sizes.clone();
-                        // DirectSound has a fixed set of TaSQ queue targets;
-                        // ASIO values must be supported by the driver. WASAPI
-                        // Shared accepts app-requested ring-buffer capacities.
-                        selected_buffer_size = normalize_buffer_selection(
-                            self.audio.backend,
-                            selected_buffer_size,
-                            &buffer_sizes,
-                        );
-                        if let Some(frames) = selected_buffer_size {
-                            if !buffer_sizes.contains(&frames) {
-                                buffer_sizes.push(frames);
-                                buffer_sizes.sort_unstable();
+                            let mut buffer_sizes = self.audio.supported_buffer_sizes.clone();
+                            // DirectSound has a fixed set of TaSQ queue targets;
+                            // ASIO values must be supported by the driver. WASAPI
+                            // Shared accepts app-requested ring-buffer capacities.
+                            selected_buffer_size = normalize_buffer_selection(
+                                self.audio.backend,
+                                selected_buffer_size,
+                                &buffer_sizes,
+                            );
+                            if let Some(frames) = selected_buffer_size {
+                                if !buffer_sizes.contains(&frames) {
+                                    buffer_sizes.push(frames);
+                                    buffer_sizes.sort_unstable();
+                                }
                             }
-                        }
 
-                        ui.horizontal(|ui| {
-                            ui.label("Sample rate");
-                            let rate_label = selected_sample_rate
-                                .map(|rate| format!("{} Hz", rate))
-                                .unwrap_or_else(|| {
-                                    format!("Auto ({} Hz)", self.audio.current_sample_rate)
-                                });
-                            egui::ComboBox::from_id_salt("global_audio_sample_rate")
-                                .width(190.0)
-                                .selected_text(rate_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut selected_sample_rate,
-                                        None,
-                                        format!("Auto ({} Hz)", self.audio.current_sample_rate),
-                                    );
-                                    for rate in &sample_rates {
+                            ui.horizontal(|ui| {
+                                ui.label("Sample rate");
+                                let rate_label = selected_sample_rate
+                                    .map(|rate| format!("{} Hz", rate))
+                                    .unwrap_or_else(|| {
+                                        format!("Auto ({} Hz)", self.audio.current_sample_rate)
+                                    });
+                                Theme::input_scope(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("global_audio_sample_rate")
+                                    .width(190.0)
+                                    .selected_text(rate_label)
+                                    .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut selected_sample_rate,
-                                            Some(*rate),
-                                            format!("{} Hz", rate),
+                                            None,
+                                            format!("Auto ({} Hz)", self.audio.current_sample_rate),
                                         );
-                                    }
+                                        for rate in &sample_rates {
+                                            ui.selectable_value(
+                                                &mut selected_sample_rate,
+                                                Some(*rate),
+                                                format!("{} Hz", rate),
+                                            );
+                                        }
+                                    });
                                 });
-                        });
+                            });
 
-                        ui.horizontal(|ui| {
-                            ui.label("Buffer size");
-                            let default_buffer_label = match self.audio.backend {
-                                AudioBackend::DirectSound => {
-                                    let ms = 4_096.0 * 1_000.0
-                                        / self.audio.current_sample_rate.max(1) as f64;
-                                    format!("Auto (4096 frames / {:.1} ms)", ms)
-                                }
-                                AudioBackend::Wasapi => {
-                                    "Automatic (Windows shared-mode default)".to_string()
-                                }
-                                AudioBackend::Asio => {
-                                    "Automatic (ASIO driver default)".to_string()
-                                }
-                            };
-                            let buffer_label = selected_buffer_size
-                                .map(|frames| {
-                                    let rate = selected_sample_rate.unwrap_or(self.audio.current_sample_rate).max(1);
-                                    let ms = frames as f64 * 1_000.0 / rate as f64;
-                                    format!("{} frames / {:.1} ms", frames, ms)
-                                })
-                                .unwrap_or_else(|| default_buffer_label.clone());
-                            egui::ComboBox::from_id_salt("global_audio_buffer_size")
-                                .width(240.0)
-                                .selected_text(buffer_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut selected_buffer_size,
-                                        None,
-                                        default_buffer_label,
-                                    );
-                                    for frames in &buffer_sizes {
+                            ui.horizontal(|ui| {
+                                ui.label("Buffer size");
+                                let default_buffer_label = match self.audio.backend {
+                                    AudioBackend::DirectSound => {
+                                        let ms = 4_096.0 * 1_000.0
+                                            / self.audio.current_sample_rate.max(1) as f64;
+                                        format!("Auto (4096 frames / {:.1} ms)", ms)
+                                    }
+                                    AudioBackend::Wasapi => {
+                                        "Automatic (Windows shared-mode default)".to_string()
+                                    }
+                                    AudioBackend::Asio => {
+                                        "Automatic (ASIO driver default)".to_string()
+                                    }
+                                };
+                                let buffer_label = selected_buffer_size
+                                    .map(|frames| {
                                         let rate = selected_sample_rate.unwrap_or(self.audio.current_sample_rate).max(1);
-                                        let ms = *frames as f64 * 1_000.0 / rate as f64;
+                                        let ms = frames as f64 * 1_000.0 / rate as f64;
+                                        format!("{} frames / {:.1} ms", frames, ms)
+                                    })
+                                    .unwrap_or_else(|| default_buffer_label.clone());
+                                Theme::input_scope(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("global_audio_buffer_size")
+                                    .width(240.0)
+                                    .selected_text(buffer_label)
+                                    .show_ui(ui, |ui| {
                                         ui.selectable_value(
                                             &mut selected_buffer_size,
-                                            Some(*frames),
-                                            format!("{} frames / {:.1} ms", frames, ms),
+                                            None,
+                                            default_buffer_label,
                                         );
-                                    }
+                                        for frames in &buffer_sizes {
+                                            let rate = selected_sample_rate.unwrap_or(self.audio.current_sample_rate).max(1);
+                                            let ms = *frames as f64 * 1_000.0 / rate as f64;
+                                            ui.selectable_value(
+                                                &mut selected_buffer_size,
+                                                Some(*frames),
+                                                format!("{} frames / {:.1} ms", frames, ms),
+                                            );
+                                        }
+                                    });
                                 });
-                        });
+                            });
 
-                        ui.label(
-                            RichText::new(match self.audio.backend {
-                                AudioBackend::Asio => "ASIO: the driver owns the hardware block size. TaSQ shows only sizes reported by the driver; use its control panel for other values.",
-                                AudioBackend::Wasapi => "WASAPI Shared: this requests the shared ring-buffer capacity. Windows still controls the callback period, so actual timing and latency may differ.",
-                                AudioBackend::DirectSound => "DirectSound: this controls TaSQ's queued-audio safety window. Larger queues improve stability but increase latency.",
-                            })
-                            .color(Theme::text_dim())
-                            .size(10.0),
-                        );
+                            ui.label(
+                                RichText::new(match self.audio.backend {
+                                    AudioBackend::Asio => "ASIO: the driver owns the hardware block size. TaSQ shows only sizes reported by the driver; use its control panel for other values.",
+                                    AudioBackend::Wasapi => "WASAPI Shared: this requests the shared ring-buffer capacity. Windows still controls the callback period, so actual timing and latency may differ.",
+                                    AudioBackend::DirectSound => "DirectSound: this controls TaSQ's queued-audio safety window. Larger queues improve stability but increase latency.",
+                                })
+                                .color(Theme::text_dim())
+                                .size(Theme::scaled_font_size(10.0)),
+                            );
 
-                        if selected_sample_rate != previous_sample_rate
-                            || selected_buffer_size != previous_buffer_size
-                        {
-                            self.settings.audio_sample_rate = selected_sample_rate;
-                            self.settings.audio_buffer_size_frames = selected_buffer_size;
-                            let backend = self.audio.backend;
-                            let device_name = self.audio.current_device.clone();
-                            let endpoint_id = self.audio.current_device_id.clone();
-                            self.active_output_needs_reopen = true;
-                            if self.switch_audio_endpoint(backend, &device_name, &endpoint_id) {
-                                self.save_app_settings();
-                            } else {
-                                self.settings.audio_sample_rate = previous_sample_rate;
-                                self.settings.audio_buffer_size_frames = previous_buffer_size;
-                                self.save_app_settings();
+                            if selected_sample_rate != previous_sample_rate
+                                || selected_buffer_size != previous_buffer_size
+                            {
+                                let requested_performance = AudioPerformanceSettings {
+                                    sample_rate: selected_sample_rate,
+                                    buffer_size_frames: selected_buffer_size,
+                                };
+                                self.settings
+                                    .audio_performance_settings_by_device
+                                    .insert(performance_settings_key.clone(), requested_performance);
+                                self.settings.audio_sample_rate = selected_sample_rate;
+                                self.settings.audio_buffer_size_frames = selected_buffer_size;
+                                let backend = self.audio.backend;
+                                let device_name = self.audio.current_device.clone();
+                                let endpoint_id = self.audio.current_device_id.clone();
+                                self.active_output_needs_reopen = true;
+                                if self.switch_audio_endpoint(backend, &device_name, &endpoint_id) {
+                                    self.save_app_settings();
+                                } else {
+                                    self.settings
+                                        .audio_performance_settings_by_device
+                                        .insert(performance_settings_key, previous_performance);
+                                    self.settings.audio_sample_rate = previous_sample_rate;
+                                    self.settings.audio_buffer_size_frames = previous_buffer_size;
+                                    self.save_app_settings();
+                                }
                             }
+
                         }
 
                         let supported_layouts = self.audio.output_channel_layouts_for_device(Some(&output));
@@ -5014,15 +6691,6 @@ impl TheatreShowCueApp {
                         output_names.resize(output_count, String::new());
                         let mut output_names_changed = false;
                         let mut output_names_commit = false;
-                        let channel_options: Vec<(usize, String)> = (0..output_count)
-                            .map(|index| {
-                                (
-                                    index,
-                                    self.audio.output_channel_label(Some(&output), index),
-                                )
-                            })
-                            .collect();
-
                         // Logical Theatre Show Cue output slots map to native driver
                         // channels only at playback; stored Cue routes are never rewritten.
                         let mut output_order = self.audio.output_channel_display_order(Some(&output));
@@ -5034,7 +6702,7 @@ impl TheatreShowCueApp {
                                     "Map TaSQ Output 1, 2, 3... to native driver channels. Test and Cue playback use this same map. Existing Cue routing and Default Stereo Pair never change when this map changes.",
                                 )
                                 .color(Theme::text_dim())
-                                .size(11.0),
+                                .size(Theme::scaled_font_size(11.0)),
                             );
                             for logical_index in 0..output_count {
                                 let selected_native = output_order
@@ -5047,7 +6715,8 @@ impl TheatreShowCueApp {
                                         egui::Label::new(format!("TaSQ Output {}", logical_index + 1)),
                                     );
                                     let mut next_native = selected_native;
-                                    egui::ComboBox::from_id_salt((
+                                    Theme::input_scope(ui, |ui| {
+                                        egui::ComboBox::from_id_salt((
                                         "logical_output_channel_map",
                                         output.clone(),
                                         logical_index,
@@ -5072,6 +6741,7 @@ impl TheatreShowCueApp {
                                                 label,
                                             );
                                         }
+                                    });
                                     });
                                     if next_native != selected_native {
                                         let previous_native = selected_native;
@@ -5101,7 +6771,7 @@ impl TheatreShowCueApp {
                                 output_order.clone(),
                             );
                             let settings_key = self.audio.output_device_settings_key(&output);
-                            self.settings.output_channel_orders.insert(
+                            self.store_project_output_channel_order(
                                 settings_key,
                                 output_order.clone(),
                             );
@@ -5110,6 +6780,7 @@ impl TheatreShowCueApp {
                             for cue in &self.cue_list.cues {
                                 if cue_owns_audio_stream(cue)
                                     && cue.is_active()
+                                    && self.cue_output_backend(cue) == self.audio.backend
                                     && cue_uses_output_endpoint(
                                         cue,
                                         self.audio.backend,
@@ -5117,25 +6788,60 @@ impl TheatreShowCueApp {
                                         &self.audio.current_device_id,
                                     )
                                 {
-                                    let device = cue.io.output_device.as_deref();
+                                    let route_backend = self.cue_output_backend(cue);
+                                    let route_device_name = cue
+                                        .io
+                                        .output_device
+                                        .clone()
+                                        .or_else(|| {
+                                            cue.io
+                                                .output_device_id
+                                                .as_deref()
+                                                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                                .filter(|endpoint| endpoint.backend == route_backend)
+                                                .map(|endpoint| endpoint.device_name.clone())
+                                        })
+                                        .unwrap_or_else(|| self.audio.current_device.clone());
+                                    let registered_route_id = if cue.io.output_device_id.is_none()
+                                        && cue.io.output_device.is_some()
+                                    {
+                                        self.audio.registered_endpoint_id(
+                                            route_backend,
+                                            &route_device_name,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    let route_endpoint_id = cue
+                                        .io
+                                        .output_device_id
+                                        .as_deref()
+                                        .or(registered_route_id.as_deref())
+                                        .or_else(|| {
+                                            cue.io.output_device.is_none()
+                                                .then_some(self.audio.current_device_id.as_str())
+                                        });
                                     self.audio.send(AudioCommand::SetRouting {
                                         id: cue.id,
-                                        routes: self.audio.cue_routes_for_device(
-                                            device,
+                                        routes: self.audio.cue_routes_for_endpoint(
+                                            route_backend,
+                                            route_endpoint_id,
+                                            Some(&route_device_name),
                                             &cue.io.channel_routes,
                                         ),
                                     });
                                     self.audio.send(AudioCommand::SetOutputGains {
                                         id: cue.id,
-                                        gains_db: self.audio.cue_gains_for_device(
-                                            device,
+                                        gains_db: self.audio.cue_gains_for_endpoint(
+                                            route_backend,
+                                            route_endpoint_id,
+                                            Some(&route_device_name),
                                             &cue.io.output_gains_db,
                                         ),
                                     });
                                 }
                             }
                             info!("Logical output mapping changed for '{}': {:?} -> {:?}; existing Cue assignments and default stereo pair remain unchanged", output, previous_output_order, output_order);
-                            self.save_app_settings();
                         }
 
                         ui.add_space(6.0);
@@ -5147,7 +6853,7 @@ impl TheatreShowCueApp {
                                 "Rows use TaSQ logical output order. Driver channel names are shown as reported (or via user aliases). Test and Cue playback resolve the same native channel.",
                             )
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
                         for (logical_index, index) in output_order.iter().copied().enumerate() {
                             let Some(setting) = output_settings.get_mut(index) else {
@@ -5172,14 +6878,17 @@ impl TheatreShowCueApp {
                                             index,
                                         ))
                                         .color(Theme::text_dim())
-                                        .size(11.0),
+                                        .size(Theme::scaled_font_size(11.0)),
                                     ),
                                 );
-                                let name_response = ui.add_sized(
-                                    [132.0, 26.0],
-                                    egui::TextEdit::singleline(&mut output_names[index])
-                                        .hint_text("Custom alias"),
-                                );
+                                let name_response = Theme::input_scope(ui, |ui| {
+                                    ui.add_sized(
+                                        [132.0, 26.0],
+                                        egui::TextEdit::singleline(&mut output_names[index])
+                                            .hint_text("Custom alias"),
+                                    )
+                                })
+                                .inner;
                                 output_names_changed |= name_response.changed();
                                 output_names_commit |= name_response.lost_focus()
                                     || (name_response.has_focus()
@@ -5227,7 +6936,7 @@ impl TheatreShowCueApp {
                                         detected_left, detected_right
                                     ))
                                     .color(Theme::text_dim())
-                                    .size(11.0),
+                                    .size(Theme::scaled_font_size(11.0)),
                                 );
                                 if current_pair != detected_logical_pair
                                     && ui.small_button("Use detected pair").clicked()
@@ -5236,10 +6945,10 @@ impl TheatreShowCueApp {
                                         .set_default_output_pair_for_device(&output, detected_logical_pair);
                                     let settings_key =
                                         self.audio.output_device_settings_key(&output);
-                                    self.settings
-                                        .default_output_pairs
-                                        .insert(settings_key, detected_logical_pair);
-                                    self.save_app_settings();
+                                    self.store_project_default_output_pair(
+                                        settings_key,
+                                        detected_logical_pair,
+                                    );
                                 }
                             });
                         }
@@ -5253,6 +6962,10 @@ impl TheatreShowCueApp {
                             if output == self.audio.current_device {
                                 self.settings.output_channels = output_settings;
                             }
+                            self.audio.set_endpoint_preferences(
+                                self.settings.audio_performance_settings_by_device.clone(),
+                                self.settings.output_channel_settings_by_device.clone(),
+                            );
                             self.save_app_settings();
                         }
                         if output_names_changed {
@@ -5295,7 +7008,8 @@ impl TheatreShowCueApp {
                                 }
                             }
                             ui.add_sized([18.0, 26.0], egui::Label::new("L"));
-                            egui::ComboBox::from_id_salt((
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt((
                                 "default_output_left",
                                 output.clone(),
                             ))
@@ -5313,8 +7027,10 @@ impl TheatreShowCueApp {
                                         .changed();
                                 }
                             });
+                            });
                             ui.add_sized([18.0, 26.0], egui::Label::new("R"));
-                            egui::ComboBox::from_id_salt((
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt((
                                 "default_output_right",
                                 output.clone(),
                             ))
@@ -5332,6 +7048,7 @@ impl TheatreShowCueApp {
                                         .changed();
                                 }
                             });
+                            });
                         });
                         if default_pair_changed {
                             if output_count > 1 && default_pair[0] == default_pair[1] {
@@ -5341,10 +7058,7 @@ impl TheatreShowCueApp {
                                 .set_default_output_pair_for_device(&output, default_pair);
                             let settings_key =
                                 self.audio.output_device_settings_key(&output);
-                            self.settings
-                                .default_output_pairs
-                                .insert(settings_key, default_pair);
-                            self.save_app_settings();
+                            self.store_project_default_output_pair(settings_key, default_pair);
                         }
                         if default_pair != [0, 1] {
                             ui.colored_label(
@@ -5352,19 +7066,19 @@ impl TheatreShowCueApp {
                                 "Default Stereo Pair is applied only to newly imported Audio Cues; existing Cue routes are not modified.",
                             );
                         }
-
                         ui.label(
                             RichText::new(
-                                "I/O Routing can save a backend/device route for each Cue. Until Stage 4, a Cue must use the active backend; ASIO Cues must also use the one currently active ASIO driver.",
+                                "Logical Output Mapping and Default Stereo Pair are stored with this project. Save the .tsq after changing them; new projects inherit the currently active routing profile.",
                             )
                             .color(Theme::text_dim())
-                            .size(10.5),
+                            .size(Theme::scaled_font_size(10.5)),
                         );
 
                         let mut input = self.audio.current_input_device.clone();
                         ui.horizontal(|ui| {
                             ui.label("Input device");
-                            egui::ComboBox::from_id_salt("settings_input_device")
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt("settings_input_device")
                                 .width(340.0)
                                 .selected_text(&input)
                                 .show_ui(ui, |ui| {
@@ -5377,21 +7091,32 @@ impl TheatreShowCueApp {
                                         }
                                     }
                                 });
+                            });
                         });
                         ui.label(RichText::new(
                             "The selected output device and its driver channel count are global for the application.",
-                        ).color(Theme::text_dim()).size(11.0));
+                        ).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
 
                     }
                     SettingsTab::Osc => {
                         ui.heading("Open Sound Control");
                         ui.horizontal(|ui| {
                             ui.label("Listen port");
-                            ui.add(egui::DragValue::new(&mut self.settings.osc_listen_port).range(1..=65535));
+                            Theme::input_scope(ui, |ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.settings.osc_listen_port)
+                                        .range(1..=65535),
+                                );
+                            });
                         });
                         ui.horizontal(|ui| {
                             ui.label("Send address");
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.osc_send_addr).desired_width(280.0));
+                            Theme::input_scope(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings.osc_send_addr)
+                                        .desired_width(280.0),
+                                );
+                            });
                         });
                         if ui.button("Apply OSC settings").clicked() {
                             self.apply_osc_settings();
@@ -5457,7 +7182,7 @@ impl TheatreShowCueApp {
                         ui.label(
                             RichText::new("Choose Learn beside a command, then press a button on your MIDI controller. Note On and CC button press/release messages are supported.")
                                 .color(Theme::text_dim())
-                                .size(11.0),
+                                .size(Theme::scaled_font_size(11.0)),
                         );
                         if let Some(action) = self.midi_learn_action.clone() {
                             ui.horizontal(|ui| {
@@ -5513,7 +7238,7 @@ impl TheatreShowCueApp {
                                         ui.label(
                                             RichText::new(binding_text)
                                                 .color(Theme::text_dim())
-                                                .size(10.5),
+                                                .size(Theme::scaled_font_size(10.5)),
                                         );
                                         ui.horizontal(|ui| {
                                             if ui.button(if is_learning { "Listening…" } else { "Learn" }).clicked() {
@@ -5539,7 +7264,8 @@ impl TheatreShowCueApp {
                             ui.label("MIDI input");
                             let input_label = self.midi.current_port.clone()
                                 .unwrap_or_else(|| "No input selected".to_string());
-                            egui::ComboBox::from_id_salt("settings_midi_input")
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt("settings_midi_input")
                                 .width(320.0)
                                 .selected_text(input_label)
                                 .show_ui(ui, |ui| {
@@ -5552,12 +7278,14 @@ impl TheatreShowCueApp {
                                         }
                                     }
                                 });
+                            });
                         });
                         ui.horizontal(|ui| {
                             ui.label("MIDI output");
                             let output_label = self.midi_out.current_port.clone()
                                 .unwrap_or_else(|| "No output selected".to_string());
-                            egui::ComboBox::from_id_salt("settings_midi_output")
+                            Theme::input_scope(ui, |ui| {
+                                egui::ComboBox::from_id_salt("settings_midi_output")
                                 .width(320.0)
                                 .selected_text(output_label)
                                 .show_ui(ui, |ui| {
@@ -5569,6 +7297,7 @@ impl TheatreShowCueApp {
                                         }
                                     }
                                 });
+                            });
                         });
                         if ui.button("Refresh MIDI ports").clicked() {
                             self.midi.refresh_and_connect(self.settings.midi_input_port.as_deref());
@@ -5585,7 +7314,7 @@ impl TheatreShowCueApp {
                             ui.label("seconds");
                         });
                         ui.label(RichText::new("0.0 s stops immediately. A longer value fades active audio cues before stopping them.")
-                            .color(Theme::text_dim()).size(11.0));
+                            .color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
                         if ui.button("Save playback settings").clicked() {
                             self.save_app_settings();
                         }
@@ -5597,21 +7326,24 @@ impl TheatreShowCueApp {
                                 "Theatre Show Cue creates a lightweight event snapshot after every successful project save.",
                             )
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
                         ui.add_space(8.0);
 
                         let interval_changed = ui
                             .horizontal(|ui| {
                                 ui.label("Automatic backup interval");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut self.settings.backup_interval_minutes,
+                                Theme::input_scope(ui, |ui| {
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.settings.backup_interval_minutes,
+                                        )
+                                        .range(0..=240)
+                                        .speed(1)
+                                        .suffix(" min"),
                                     )
-                                    .range(0..=240)
-                                    .speed(1)
-                                    .suffix(" min"),
-                                )
+                                })
+                                .inner
                                 .changed()
                             })
                             .inner;
@@ -5619,12 +7351,12 @@ impl TheatreShowCueApp {
                         ui.label(
                             RichText::new("0 disables timed backups; backups after manual saves remain enabled.")
                                 .color(Theme::text_dim())
-                                .size(11.0),
+                                .size(Theme::scaled_font_size(11.0)),
                         );
                         ui.label(
                             RichText::new("The backup folder stores event/project data only, not audio media. Theatre Show Cue keeps the 10 newest snapshots and removes the oldest automatically.")
                                 .color(Theme::text_dim())
-                                .size(11.0),
+                                .size(Theme::scaled_font_size(11.0)),
                         );
 
                         if interval_changed {
@@ -5639,7 +7371,7 @@ impl TheatreShowCueApp {
                                 "Audio diagnostics and application behaviour are written to separate files. You can export them as one ZIP archive and send it to the developer.",
                             )
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
 
                         let current_log_directory = crate::diagnostics::active_log_directory()
@@ -5653,11 +7385,13 @@ impl TheatreShowCueApp {
                         let mut selected_log_directory: Option<PathBuf> = None;
                         ui.horizontal(|ui| {
                             ui.label("Save logs to");
-                            ui.add_sized(
-                                [430.0, 26.0],
-                                egui::TextEdit::singleline(&mut displayed_log_directory)
-                                    .interactive(false),
-                            );
+                            Theme::input_scope(ui, |ui| {
+                                ui.add_sized(
+                                    [430.0, 26.0],
+                                    egui::TextEdit::singleline(&mut displayed_log_directory)
+                                        .interactive(false),
+                                );
+                            });
                             if ui.button("Browse…").clicked() {
                                 if let Some(path) = FileDialog::new()
                                     .set_directory(&current_log_directory)
@@ -5755,20 +7489,20 @@ impl TheatreShowCueApp {
                         });
 
                         match crate::diagnostics::diagnostic_file_counts(&current_log_directory) {
-                            Ok((audio_count, application_count, report_count)) => {
+                            Ok((audio_count, midi_count, osc_count, application_count, report_count)) => {
                                 ui.label(
                                     RichText::new(format!(
-                                        "Current folder: {audio_count}/30 audio logs · {application_count}/30 application logs · {report_count}/30 diagnostic reports"
+                                        "Current folder: {audio_count}/30 audio · {midi_count}/30 MIDI · {osc_count}/30 OSC · {application_count}/30 application logs · {report_count}/30 reports"
                                     ))
                                     .color(Theme::text_dim())
-                                    .size(11.0),
+                                    .size(Theme::scaled_font_size(11.0)),
                                 );
                             }
                             Err(error) => {
                                 ui.label(
                                     RichText::new(format!("Could not read log folder: {error}"))
                                         .color(Theme::text_dim())
-                                        .size(11.0),
+                                        .size(Theme::scaled_font_size(11.0)),
                                 );
                             }
                         }
@@ -5778,7 +7512,7 @@ impl TheatreShowCueApp {
                                 "Automatic cleanup keeps the newest 30 files of each type. Only Theatre Show Cue diagnostic files are removed; unrelated files are never deleted. The export contains logs and the diagnostic report, not audio media or project files.",
                             )
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
 
                     }
@@ -5788,6 +7522,7 @@ impl TheatreShowCueApp {
         self.settings_open = is_open;
         if !is_open {
             self.hotkey_capture = None;
+            self.cue_hotkey_capture = None;
             self.midi_learn_action = None;
         }
     }
@@ -5812,13 +7547,13 @@ impl TheatreShowCueApp {
                             ui.label(
                                 RichText::new("Drop audio files to add them to the project")
                                     .color(Theme::text())
-                                    .size(18.0)
+                                    .size(Theme::scaled_font_size(18.0))
                                     .strong(),
                             );
                             ui.label(
                                 RichText::new("WAV · MP3 · FLAC · OGG · AIFF · M4A")
                                     .color(Theme::text_dim())
-                                    .size(12.0),
+                                    .size(Theme::scaled_font_size(12.0)),
                             );
                         });
                     });
@@ -5877,6 +7612,9 @@ impl TheatreShowCueApp {
     // ── Верхнее меню ─────────────────────────────────────────────────────────
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let recent_projects = self.settings.recent_projects.clone();
+        let mut open_recent_path: Option<PathBuf> = None;
+
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("New project    Ctrl+N").clicked() {
@@ -5887,6 +7625,43 @@ impl TheatreShowCueApp {
                     self.open_project();
                     ui.close_menu();
                 }
+                ui.menu_button("Open Recent", |ui| {
+                    // Keep recent project names on a single line; reveal the full path only on hover.
+                    ui.set_min_width(260.0);
+                    ui.set_max_width(360.0);
+
+                    if recent_projects.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No recent projects"));
+                    } else {
+                        for recent_path in &recent_projects {
+                            let path = PathBuf::from(recent_path);
+                            let label = recent_project_menu_label(&path);
+                            if path.is_file() {
+                                if ui
+                                    .add(egui::Button::new(label).truncate())
+                                    .on_hover_text(recent_project_hover_path(&path))
+                                    .clicked()
+                                {
+                                    open_recent_path = Some(path);
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(
+                                        RichText::new(format!("{label}  (missing)"))
+                                            .color(Theme::text_dim()),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "Project file not found: {}",
+                                    recent_project_hover_path(&path)
+                                ));
+                            }
+                        }
+                    }
+                });
                 if ui.button("Save           Ctrl+S").clicked() {
                     self.save_project();
                     ui.close_menu();
@@ -5910,7 +7685,7 @@ impl TheatreShowCueApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Export report…").clicked() {
+                if ui.button("Export session report…").clicked() {
                     if let Some(dir) = FileDialog::new().pick_folder() {
                         self.report.finish();
                         match self.report.save(&dir) {
@@ -6007,7 +7782,7 @@ impl TheatreShowCueApp {
                     self.active_panel = Panel::Trim;
                     ui.close_menu();
                 }
-                if ui.button("Session Report").clicked() {
+                if ui.button("Audio Log").clicked() {
                     self.active_panel = Panel::Report;
                     ui.close_menu();
                 }
@@ -6020,6 +7795,10 @@ impl TheatreShowCueApp {
                 }
             });
         });
+
+        if let Some(path) = open_recent_path {
+            self.open_project_path(path);
+        }
     }
 
     // ── Нижняя панель (Inspector / Waveform / Playback / I/O Routing / MIDI) ──
@@ -6047,22 +7826,126 @@ impl TheatreShowCueApp {
             self.active_panel = Panel::Inspector;
         }
 
+        let tab_icon_context = ui.ctx().clone();
+        let tab_icon_appearance = self.settings.appearance.clone();
+        let tab_icon_color = Theme::text();
+        let tab_inspector_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "settings",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_waveform_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "audio",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_playback_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "play",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_routing_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "audio",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_trim_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "audio",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_midi_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "midi",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+        let tab_report_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "notes",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
+
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.active_panel, Panel::Inspector, "⚙ Inspector");
+            if icon_selectable_label(
+                ui,
+                tab_inspector_icon,
+                "Inspector",
+                self.active_panel == Panel::Inspector,
+            )
+            .clicked()
+            {
+                self.active_panel = Panel::Inspector;
+            }
             if selected_is_audio {
-                ui.selectable_value(
-                    &mut self.active_panel,
-                    Panel::Waveform,
-                    "🌊 Waveform & Region/Loop",
-                );
-                ui.selectable_value(&mut self.active_panel, Panel::Playback, "🎚 Playback");
-                ui.selectable_value(&mut self.active_panel, Panel::IoRouting, "🔌 I/O Routing");
-                ui.selectable_value(&mut self.active_panel, Panel::Trim, "🎛 Trim");
+                if icon_selectable_label(
+                    ui,
+                    tab_waveform_icon,
+                    "Waveform & Region/Loop",
+                    self.active_panel == Panel::Waveform,
+                )
+                .clicked()
+                {
+                    self.active_panel = Panel::Waveform;
+                }
+                if icon_selectable_label(
+                    ui,
+                    tab_playback_icon,
+                    "Playback",
+                    self.active_panel == Panel::Playback,
+                )
+                .clicked()
+                {
+                    self.active_panel = Panel::Playback;
+                }
+                if icon_selectable_label(
+                    ui,
+                    tab_routing_icon,
+                    "I/O Routing",
+                    self.active_panel == Panel::IoRouting,
+                )
+                .clicked()
+                {
+                    self.active_panel = Panel::IoRouting;
+                }
+                if icon_selectable_label(
+                    ui,
+                    tab_trim_icon,
+                    "Trim",
+                    self.active_panel == Panel::Trim,
+                )
+                .clicked()
+                {
+                    self.active_panel = Panel::Trim;
+                }
             }
-            if selected_is_midi {
-                ui.selectable_value(&mut self.active_panel, Panel::Midi, "🎹 MIDI Settings");
+            if selected_is_midi
+                && icon_selectable_label(
+                    ui,
+                    tab_midi_icon,
+                    "MIDI Settings",
+                    self.active_panel == Panel::Midi,
+                )
+                .clicked()
+            {
+                self.active_panel = Panel::Midi;
             }
-            ui.selectable_value(&mut self.active_panel, Panel::Report, "📋 Report");
+            if icon_selectable_label(
+                ui,
+                tab_report_icon,
+                "Audio Log",
+                self.active_panel == Panel::Report,
+            )
+            .clicked()
+            {
+                self.active_panel = Panel::Report;
+            }
         });
         ui.separator();
 
@@ -6112,13 +7995,34 @@ impl TheatreShowCueApp {
                             .collect();
 
                         if let Some(id) = self.selected {
-                            let mut inspector_action = None;
-                            if let Some(cue) = self.cue_list.find_mut(id) {
-                                inspector_action =
-                                    Inspector::show_inspector(ui, cue, &cue_targets, &all_cues);
-                            }
-                            if let Some(InspectorAction::SetAudioFile(path)) = inspector_action {
-                                self.set_audio_cue_file(id, path);
+                            let capturing_hotkey = self.cue_hotkey_capture == Some(id);
+                            let inspector_action = self.cue_list.find_mut(id).and_then(|cue| {
+                                Inspector::show_inspector(
+                                    ui,
+                                    cue,
+                                    &cue_targets,
+                                    &all_cues,
+                                    capturing_hotkey,
+                                )
+                            });
+                            match inspector_action {
+                                Some(InspectorAction::SetAudioFile(path)) => {
+                                    self.cue_hotkey_capture = None;
+                                    self.set_audio_cue_file(id, path);
+                                }
+                                Some(InspectorAction::CaptureCueHotkey) => {
+                                    self.cue_hotkey_capture = Some(id);
+                                    self.status_msg = "Press a key combination for this Cue; Esc cancels".to_string();
+                                }
+                                Some(InspectorAction::ClearCueHotkey) => {
+                                    self.cue_hotkey_capture = None;
+                                    if let Some(cue) = self.cue_list.find_mut(id) {
+                                        cue.hotkey = None;
+                                        self.status_msg = format!("Hotkey cleared for Cue {}", cue.number);
+                                        info!("Cue hotkey cleared: id={}, number='{}'", cue.id, cue.number);
+                                    }
+                                }
+                                None => {}
                             }
                         } else {
                             ui.label(
@@ -6277,14 +8181,42 @@ impl TheatreShowCueApp {
                                             identity_changed || *previous_backend != route_backend
                                         },
                                     );
+                                    let route_device_name = cue
+                                        .io
+                                        .output_device
+                                        .clone()
+                                        .or_else(|| {
+                                            cue.io
+                                                .output_device_id
+                                                .as_deref()
+                                                .and_then(|id| self.audio.device_registry.find_by_id(id))
+                                                .filter(|endpoint| endpoint.backend == route_backend)
+                                                .map(|endpoint| endpoint.device_name.clone())
+                                        })
+                                        .unwrap_or_else(|| self.audio.current_device.clone());
+                                    let registered_route_id = if cue.io.output_device_id.is_none()
+                                        && cue.io.output_device.is_some()
+                                    {
+                                        self.audio.registered_endpoint_id(
+                                            route_backend,
+                                            &route_device_name,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    let route_endpoint_id = cue
+                                        .io
+                                        .output_device_id
+                                        .clone()
+                                        .or(registered_route_id);
                                     (
                                         cue.io.channel_routes.clone(),
                                         cue.io.output_gains_db.clone(),
                                         cue.volume * self.master_vol,
                                         endpoint_changed,
-                                        cue.io.output_device.is_some()
-                                            && route_backend != self.audio.backend,
                                         route_backend,
+                                        route_endpoint_id,
+                                        route_device_name,
                                         cue.name.clone(),
                                     )
                                 });
@@ -6293,36 +8225,36 @@ impl TheatreShowCueApp {
                                     output_gains_db,
                                     volume,
                                     endpoint_changed,
-                                    cross_backend_route,
                                     route_backend,
+                                    route_endpoint_id,
+                                    route_device_name,
                                     cue_name,
                                 )) = cue_update
                                 {
                                     if endpoint_changed {
                                         self.stop_target_and_descendants(id);
-                                        self.status_msg = if cross_backend_route {
-                                            format!(
-                                                "Cue '{}' is assigned to {}. It will play after Stage 4 enables cross-backend workers.",
-                                                cue_name,
-                                                route_backend.short_label()
-                                            )
-                                        } else {
-                                            format!(
-                                                "Cue '{}' stopped because its output endpoint changed. Press GO to play through the new endpoint.",
-                                                cue_name
-                                            )
-                                        };
+                                        self.status_msg = format!(
+                                            "Cue '{}' stopped because its output endpoint changed. Press GO to play through {} — {}.",
+                                            cue_name,
+                                            route_backend.short_label(),
+                                            route_device_name
+                                        );
                                     }
-                                    let device_name = self.cue_list.find(id)
-                                        .and_then(|cue| cue.io.output_device.as_deref());
                                     self.audio.send(AudioCommand::SetRouting {
                                         id,
-                                        routes: self.audio.cue_routes_for_device(device_name, &routes),
+                                        routes: self.audio.cue_routes_for_endpoint(
+                                            route_backend,
+                                            route_endpoint_id.as_deref(),
+                                            Some(&route_device_name),
+                                            &routes,
+                                        ),
                                     });
                                     self.audio.send(AudioCommand::SetOutputGains {
                                         id,
-                                        gains_db: self.audio.cue_gains_for_device(
-                                            device_name,
+                                        gains_db: self.audio.cue_gains_for_endpoint(
+                                            route_backend,
+                                            route_endpoint_id.as_deref(),
+                                            Some(&route_device_name),
                                             &output_gains_db,
                                         ),
                                     });
@@ -6346,14 +8278,19 @@ impl TheatreShowCueApp {
 
                         if trim_changed {
                             if let Some(id) = selected_id {
-                                if let Some((routes, volume)) = self.cue_list.find(id).map(|cue| {
-                                    (cue.io.channel_routes.clone(), cue.volume * self.master_vol)
-                                }) {
-                                    let device_name = self.cue_list.find(id)
-                                        .and_then(|cue| cue.io.output_device.as_deref());
+                                if let Some(cue) = self.cue_list.find(id).cloned() {
+                                    let (route_backend, route_endpoint_id, route_device_name, _) =
+                                        self.cue_output_endpoint_context(&cue);
+                                    let routes = cue.io.channel_routes.clone();
+                                    let volume = cue.volume * self.master_vol;
                                     self.audio.send(AudioCommand::SetRouting {
                                         id,
-                                        routes: self.audio.cue_routes_for_device(device_name, &routes),
+                                        routes: self.audio.cue_routes_for_endpoint(
+                                            route_backend,
+                                            route_endpoint_id.as_deref(),
+                                            Some(&route_device_name),
+                                            &routes,
+                                        ),
                                     });
                                     // The Trim tab's master strip controls the cue's
                                     // actual playback level, so propagate it live just
@@ -6373,18 +8310,7 @@ impl TheatreShowCueApp {
                     }
 
                     Panel::Report => {
-                        let text = self.report.to_text_summary();
-                        let report_width = ui.available_width();
-                        ui.set_width(report_width);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(Theme::text_dim()),
-                            )
-                            .wrap(),
-                        );
+                        self.audio_log_viewer.show(ui);
                     }
                 }
             });
@@ -6393,9 +8319,12 @@ impl TheatreShowCueApp {
 
 impl eframe::App for TheatreShowCueApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let gui_update_started = Instant::now();
+        self.cpu_monitor.update();
         // Re-apply our palette during update as well as at startup. This keeps
         // egui's native-window defaults from overriding custom text colors on Windows.
         Theme::apply(ctx, &self.settings.appearance);
+        self.request_application_close(ctx);
 
         if !self.startup_frame_logged {
             info!("Theatre Show Cue GUI reached its first frame");
@@ -6424,6 +8353,19 @@ impl eframe::App for TheatreShowCueApp {
         while let Some(scan) = self.device_registry_monitor.try_recv() {
             let changes = self.audio.device_registry.apply_scan(scan);
             if changes.changed() {
+                self.audio.update_device_registry();
+
+                // Stable IDs remain authoritative; refresh only the saved display
+                // name/backend metadata when a device driver renames an endpoint.
+                for cue in &mut self.cue_list.cues {
+                    if let Some(endpoint_id) = cue.io.output_device_id.as_deref() {
+                        if let Some(endpoint) = self.audio.device_registry.find_by_id(endpoint_id) {
+                            cue.io.output_device = Some(endpoint.device_name.clone());
+                            cue.io.output_backend = Some(endpoint.backend);
+                        }
+                    }
+                }
+
                 info!(
                     "Audio device registry changed: +{} new, {} reconnected, {} disconnected, {} renamed",
                     changes.added,
@@ -6438,9 +8380,8 @@ impl eframe::App for TheatreShowCueApp {
                     .is_some();
                 if !active_endpoint_available && !self.active_output_needs_reopen {
                     self.active_output_needs_reopen = true;
-                    self.stop_all();
                     let message = format!(
-                        "Active audio endpoint {} — '{}' was disconnected. Playback was stopped; reconnect it and select it again to reopen the stream.",
+                        "Active audio endpoint {} — '{}' was disconnected. Cues on this endpoint will stop; other audio devices continue.",
                         self.audio.backend.short_label(),
                         self.audio.current_device
                     );
@@ -6448,7 +8389,7 @@ impl eframe::App for TheatreShowCueApp {
                     warn!("{}", message);
                 } else if active_endpoint_available && self.active_output_needs_reopen {
                     self.status_msg = format!(
-                        "{} — '{}' reconnected. Select it in Audio Settings to reopen the output stream.",
+                        "{} — '{}' reconnected. Restoring its audio worker; playback will not restart automatically.",
                         self.audio.backend.short_label(),
                         self.audio.current_device
                     );
@@ -6461,19 +8402,125 @@ impl eframe::App for TheatreShowCueApp {
             }
         }
 
+        for event in self.audio.drain_worker_manager_events() {
+            match event {
+                AudioWorkerManagerEvent::OutputMeter { peak } => {
+                    let peak = if peak.is_finite() { peak.max(0.0) } else { 0.0 };
+                    // Fast attack, gradual release keeps the meter readable between 10 Hz updates.
+                    self.output_meter_peak = peak.max(self.output_meter_peak * 0.82);
+                }
+                AudioWorkerManagerEvent::EndpointLost {
+                    backend,
+                    endpoint_id,
+                    device_name,
+                    is_global,
+                    affected_cues,
+                } => {
+                    if is_global
+                        && backend == self.audio.backend
+                        && endpoint_id == self.audio.current_device_id
+                    {
+                        self.active_output_needs_reopen = true;
+                    }
+                    let message = if affected_cues > 0 {
+                        format!(
+                            "{} — '{}' disconnected. {} Cue(s) were stopped; routing was preserved. Reconnect the device and press GO to resume.",
+                            backend.short_label(),
+                            device_name,
+                            affected_cues
+                        )
+                    } else {
+                        format!(
+                            "{} — '{}' disconnected. Other audio devices continue unaffected.",
+                            backend.short_label(),
+                            device_name
+                        )
+                    };
+                    info!(
+                        "GUI received endpoint-lost event: {} [{}], global={}, affected_cues={}",
+                        device_name, endpoint_id, is_global, affected_cues
+                    );
+                    self.status_msg = message;
+                }
+                AudioWorkerManagerEvent::EndpointRecovered {
+                    metadata,
+                    is_global,
+                } => {
+                    if is_global
+                        && metadata.backend == self.audio.backend
+                        && metadata.current_device_id == self.audio.current_device_id
+                    {
+                        self.audio.apply_recovered_worker_metadata(&metadata);
+                        self.active_output_needs_reopen = false;
+                    }
+                    self.status_msg = format!(
+                        "{} — '{}' is back online. Affected Cues are stopped and ready; press GO to play.",
+                        metadata.backend.short_label(),
+                        metadata.current_device
+                    );
+                    info!(
+                        "GUI received endpoint-recovered event: {} [{}], global={}",
+                        metadata.current_device, metadata.current_device_id, is_global
+                    );
+                }
+                AudioWorkerManagerEvent::EndpointRecoveryFailed {
+                    backend,
+                    endpoint_id,
+                    device_name,
+                    is_global,
+                    error,
+                    retry_scheduled,
+                } => {
+                    if is_global
+                        && backend == self.audio.backend
+                        && endpoint_id == self.audio.current_device_id
+                    {
+                        self.active_output_needs_reopen = true;
+                    }
+                    let recovery_status = if retry_scheduled {
+                        "TaSQ will continue its scheduled recovery checks and will create a Worker only when the endpoint is available. Affected Cues will not resume by themselves."
+                    } else {
+                        "Automatic recovery has stopped after the configured attempt limit. Reconnect the device or press GO to start a new recovery cycle."
+                    };
+                    let recovery_headline = if error.starts_with("Audio Worker health failure:") {
+                        "Audio Worker stopped"
+                    } else {
+                        "Could not restore"
+                    };
+                    self.status_msg = format!(
+                        "{} {} — '{}'. {} {}",
+                        recovery_headline,
+                        backend.short_label(),
+                        device_name,
+                        recovery_status,
+                        error
+                    );
+                    warn!(
+                        "GUI received endpoint-recovery-failed event: {} [{}], global={}: {}",
+                        device_name, endpoint_id, is_global, error
+                    );
+                }
+            }
+        }
+
         self.poll_pending_triggers();
         self.poll_time_triggers();
         self.poll_audio();
         self.poll_wait_progress();
         self.poll_midi();
         self.poll_osc();
+        self.poll_waveform_analysis(ctx);
         self.poll_audio_file_metadata();
         self.poll_periodic_backup();
         self.handle_keyboard(ctx);
         self.handle_drop(ctx);
 
-        if self.cue_list.active_count() > 0 || !self.pending_triggers.is_empty() {
+        if !self.waveform_pending_cues.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.cue_list.active_count() > 0 || !self.pending_triggers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(30));
+        } else if self.output_meter_peak > 0.0001 {
+            ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.cue_list.cues.iter().any(|cue| {
             cue.time_trigger_enabled
                 && !matches!(&cue.cue_type, CueType::Comment { .. })
@@ -6524,8 +8571,19 @@ impl eframe::App for TheatreShowCueApp {
                     ui.label(
                         egui::RichText::new(&self.status_msg)
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                     );
+                    if !self.waveform_pending_cues.is_empty() {
+                        let total = self
+                            .waveform_total_cues
+                            .max(self.waveform_pending_cues.len());
+                        let completed = total.saturating_sub(self.waveform_pending_cues.len());
+                        ui.add(
+                            egui::ProgressBar::new(completed as f32 / total.max(1) as f32)
+                                .desired_width(150.0)
+                                .text(format!("Waveforms {completed}/{total}")),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!(
@@ -6536,7 +8594,7 @@ impl eframe::App for TheatreShowCueApp {
                                 self.audio.current_input_device
                             ))
                             .color(Theme::text_dim())
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                         );
                     });
                 });
@@ -6552,10 +8610,19 @@ impl eframe::App for TheatreShowCueApp {
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!self.settings_open, |ui| {
                     let active = self.cue_list.active_count();
+                    let total = self.cue_list.cues.len();
+                    let output_peak = self.output_meter_peak;
+                    let cpu_usage = self.cpu_monitor.usage_percent();
                     let prev_master = self.master_vol;
+                    let transport_appearance = self.settings.appearance.clone();
                     let action = TransportBar::show(
                         ui,
+                        &mut self.icons,
+                        &transport_appearance,
                         active,
+                        total,
+                        output_peak,
+                        cpu_usage,
                         &mut self.master_vol,
                         &mut self.bottom_panel_visible,
                     );
@@ -6687,13 +8754,17 @@ impl eframe::App for TheatreShowCueApp {
                             ui.label(egui::RichText::new(&cue.name).strong().color(Theme::text()));
                             ui.add_space(4.0);
                             let notes_width = ui.available_width();
-                            ui.add(
-                                egui::TextEdit::multiline(&mut cue.notes)
-                                    .font(egui::FontId::proportional(16.0))
-                                    .desired_width(notes_width)
-                                    .desired_rows(12)
-                                    .hint_text("Notes for selected event…"),
-                            );
+                            Theme::input_scope(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut cue.notes)
+                                        .font(egui::FontId::proportional(Theme::scaled_font_size(
+                                            16.0,
+                                        )))
+                                        .desired_width(notes_width)
+                                        .desired_rows(12)
+                                        .hint_text("Notes for selected event…"),
+                                );
+                            });
                         } else {
                             ui.label("Select an event to edit its notes.");
                         }
@@ -6748,11 +8819,16 @@ impl eframe::App for TheatreShowCueApp {
                                     let mut rename_cancel = false;
 
                                     if let Some(edit_name) = self.project_name_edit.as_mut() {
-                                        let response = ui.add(
-                                            egui::TextEdit::singleline(edit_name)
-                                                .desired_width(190.0)
-                                                .font(egui::FontId::proportional(14.0)),
-                                        );
+                                        let response = Theme::input_scope(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(edit_name)
+                                                    .desired_width(190.0)
+                                                    .font(egui::FontId::proportional(
+                                                        Theme::scaled_font_size(14.0),
+                                                    )),
+                                            )
+                                        })
+                                        .inner;
                                         if self.project_name_edit_focus_pending {
                                             response.request_focus();
                                             self.project_name_edit_focus_pending = false;
@@ -6774,7 +8850,7 @@ impl eframe::App for TheatreShowCueApp {
                                             egui::Label::new(
                                                 egui::RichText::new(title.clone())
                                                     .color(Theme::text())
-                                                    .size(14.0),
+                                                    .size(Theme::scaled_font_size(14.0)),
                                             )
                                             .sense(egui::Sense::click()),
                                         );
@@ -6822,7 +8898,7 @@ impl eframe::App for TheatreShowCueApp {
                                                 ))
                                                 .strong()
                                                 .color(Theme::text())
-                                                .size(13.0),
+                                                .size(Theme::scaled_font_size(13.0)),
                                             ),
                                         )
                                         .on_hover_text(name.as_str());
@@ -6831,7 +8907,7 @@ impl eframe::App for TheatreShowCueApp {
                                             egui::Label::new(
                                                 egui::RichText::new(cue_type)
                                                     .color(Theme::text_dim())
-                                                    .size(11.0),
+                                                    .size(Theme::scaled_font_size(11.0)),
                                             ),
                                         );
                                     } else {
@@ -6840,7 +8916,7 @@ impl eframe::App for TheatreShowCueApp {
                                             egui::Label::new(
                                                 egui::RichText::new("No event selected")
                                                     .color(Theme::text_dim())
-                                                    .size(12.0),
+                                                    .size(Theme::scaled_font_size(12.0)),
                                             ),
                                         );
                                         ui.add_sized([70.0, 20.0], egui::Label::new(""));
@@ -6848,61 +8924,172 @@ impl eframe::App for TheatreShowCueApp {
                                 });
 
                                 ui.add_space(3.0);
+                                let icon_context = ui.ctx().clone();
+                                let icon_appearance = self.settings.appearance.clone();
+                                let (button_fill, button_icon_color) =
+                                    toolbar_icon_colors(&icon_appearance);
+                                let button_border = Theme::border();
+                                let icon_audio = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "audio",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded audio SVG");
+                                let icon_play = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "play",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded play SVG");
+                                let icon_pause = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "pause",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded pause SVG");
+                                let icon_stop = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "stop",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded stop SVG");
+                                let icon_fade = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "fade",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded fade SVG");
+                                let icon_midi = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "midi",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded MIDI SVG");
+                                let icon_osc = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "osc",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded OSC SVG");
+                                let icon_group = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "group",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded group SVG");
+                                let icon_comment = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "comment",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded comment SVG");
+                                let icon_notes = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "notes",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded notes SVG");
+                                let icon_settings = self
+                                    .icons
+                                    .texture_id_for_color(
+                                        &icon_context,
+                                        "settings",
+                                        &icon_appearance,
+                                        button_icon_color,
+                                    )
+                                    .expect("embedded settings SVG");
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     ui.add_space(8.0);
-                                    // Keep the event creation controls distinct.
-                                    // The previous 47 px buttons visually ran together
-                                    // on narrower windows; 42 px is a 10% reduction.
-                                    let button_size = [42.0, 42.0];
-                                    let button_fill = Theme::button_bg();
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("🔊").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add audio file(s)")
-                                        .clicked()
+                                    // 42x42 clickable surface with a 38x38 SVG glyph.
+                                    let button_size = egui::vec2(42.0, 42.0);
+                                    if icon_button(
+                                        ui,
+                                        icon_audio,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add audio file(s)")
+                                    .clicked()
                                     {
                                         self.add_files();
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("▶").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Play cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_play,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Play cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Play { target_id: None });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("⏸").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Pause cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_pause,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Pause cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Pause { target_id: None });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("⏹").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Stop cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_stop,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Stop cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Stop { target_id: None });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("↗").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Fade cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_fade,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Fade cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Fade {
                                             target_id: None,
@@ -6914,13 +9101,15 @@ impl eframe::App for TheatreShowCueApp {
                                             custom_fade_points: vec![[0.0, 0.0], [1.0, 1.0]],
                                         });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("🎹").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add MIDI cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_midi,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add MIDI cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Midi {
                                             channel: 1,
@@ -6931,26 +9120,30 @@ impl eframe::App for TheatreShowCueApp {
                                             raw_hex: "90 3C 64".to_string(),
                                         });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("📡").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add OSC cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_osc,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add OSC cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Osc {
                                             address: "/tasq/event".to_string(),
                                             args: Vec::new(),
                                         });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("📁").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Group cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_group,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Group cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Group {
                                             mode: GroupMode::Normal,
@@ -6959,13 +9152,15 @@ impl eframe::App for TheatreShowCueApp {
                                             fade_out_secs: 0.0,
                                         });
                                     }
-                                    if ui
-                                        .add_sized(
-                                            button_size,
-                                            egui::Button::new("💬").fill(button_fill),
-                                        )
-                                        .on_hover_text("Add Comment cue")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_comment,
+                                        button_size,
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Add Comment cue")
+                                    .clicked()
                                     {
                                         self.add_typed_cue(CueType::Comment {
                                             text: String::new(),
@@ -6976,12 +9171,14 @@ impl eframe::App for TheatreShowCueApp {
                                     let notes_width = (ui.available_width() - 120.0).max(120.0);
                                     if let Some(selected_id) = self.selected {
                                         if let Some(cue) = self.cue_list.find_mut(selected_id) {
-                                            ui.add_sized(
-                                                [notes_width, 47.0],
-                                                egui::TextEdit::multiline(&mut cue.notes)
-                                                    .desired_rows(2)
-                                                    .hint_text("Notes for selected event…"),
-                                            );
+                                            Theme::input_scope(ui, |ui| {
+                                                ui.add_sized(
+                                                    [notes_width, 47.0],
+                                                    egui::TextEdit::multiline(&mut cue.notes)
+                                                        .desired_rows(2)
+                                                        .hint_text("Notes for selected event…"),
+                                                );
+                                            });
                                         } else {
                                             ui.add_sized(
                                                 [notes_width, 47.0],
@@ -7005,23 +9202,27 @@ impl eframe::App for TheatreShowCueApp {
                                         );
                                     }
 
-                                    if ui
-                                        .add_sized(
-                                            [42.0, 42.0],
-                                            egui::Button::new("📝").fill(button_fill),
-                                        )
-                                        .on_hover_text("Notes sidebar")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_notes,
+                                        egui::vec2(42.0, 42.0),
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Notes sidebar")
+                                    .clicked()
                                     {
                                         self.notes_sidebar_open = !self.notes_sidebar_open;
                                     }
-                                    if ui
-                                        .add_sized(
-                                            [42.0, 42.0],
-                                            egui::Button::new("⚙").fill(button_fill),
-                                        )
-                                        .on_hover_text("Settings")
-                                        .clicked()
+                                    if icon_button(
+                                        ui,
+                                        icon_settings,
+                                        egui::vec2(42.0, 42.0),
+                                        button_fill,
+                                        button_border,
+                                    )
+                                    .on_hover_text("Settings")
+                                    .clicked()
                                     {
                                         self.settings_open = true;
                                     }
@@ -7034,10 +9235,14 @@ impl eframe::App for TheatreShowCueApp {
                             let interactions_enabled = !self.bottom_panel_resize_active
                                 && !self.bottom_panel_resize_release_guard;
                             let output_issues = self.cue_output_issues_for_table();
+                            let cue_icon_appearance = self.settings.appearance.clone();
+                            let cue_icons = &mut self.icons;
                             let action = ui
                                 .add_enabled_ui(interactions_enabled, |ui| {
                                     CueTable::show(
                                         ui,
+                                        cue_icons,
+                                        &cue_icon_appearance,
                                         &mut self.cue_list.cues,
                                         &output_issues,
                                         &mut self.selected,
@@ -7121,54 +9326,7 @@ impl eframe::App for TheatreShowCueApp {
                                         self.editing_focus_pending = true;
                                     }
                                     CueTableAction::EditConfirm(id, field, new_val) => {
-                                        match field {
-                                            EditField::Number => {
-                                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                                    cue.number = new_val.trim().to_string();
-                                                }
-                                            }
-                                            EditField::Name => {
-                                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                                    cue.name = new_val;
-                                                }
-                                            }
-                                            EditField::PreWait => {
-                                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                                    if let Ok(v) = new_val.trim().parse::<f64>() {
-                                                        cue.pre_wait_secs = v.max(0.0);
-                                                    }
-                                                }
-                                            }
-                                            EditField::PostWait => {
-                                                if let Some(cue) = self.cue_list.find_mut(id) {
-                                                    if let Ok(v) = new_val.trim().parse::<f64>() {
-                                                        cue.post_wait_secs = v.max(0.0);
-                                                    }
-                                                }
-                                            }
-                                            EditField::Duration => {
-                                                if let Ok(value) =
-                                                    new_val.trim().replace(',', ".").parse::<f64>()
-                                                {
-                                                    if value.is_finite() && value >= 0.0 {
-                                                        if let Some(cue) =
-                                                            self.cue_list.find_mut(id)
-                                                        {
-                                                            if let CueType::Fade {
-                                                                duration_secs,
-                                                                ..
-                                                            } = &mut cue.cue_type
-                                                            {
-                                                                *duration_secs = value;
-                                                                cue.duration_secs = value;
-                                                                cue.position_secs =
-                                                                    cue.position_secs.min(value);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        self.commit_cue_edit(id, field, new_val);
                                         self.editing = None;
                                         self.editing_focus_pending = false;
                                     }
@@ -7243,6 +9401,20 @@ impl eframe::App for TheatreShowCueApp {
             });
         self.show_settings_window(ctx);
         self.show_drop_overlay(ctx);
+        self.show_close_confirmation(ctx);
+
+        let gui_update_elapsed = gui_update_started.elapsed();
+        if gui_update_elapsed >= Duration::from_millis(33)
+            && SLOW_GUI_UPDATE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % 30 == 0
+        {
+            warn!(
+                "GUI update exceeded 30 FPS frame budget: {:.2} ms; cues={}, active_cues={}, pending_triggers={}",
+                gui_update_elapsed.as_secs_f64() * 1_000.0,
+                self.cue_list.cues.len(),
+                self.cue_list.active_count(),
+                self.pending_triggers.len()
+            );
+        }
     }
 }
 
@@ -7379,6 +9551,87 @@ mod normal_group_tests {
 }
 
 #[cfg(test)]
+mod all_cues_timing_tests {
+    use super::build_all_cues_segments;
+    use crate::cue::{Cue, CueList, CueType};
+
+    #[test]
+    fn all_cues_splits_at_pre_and_post_wait_boundaries() {
+        let mut cue_list = CueList::new("All Cues timing test");
+        let mut ids = Vec::new();
+
+        for index in 0..15 {
+            let mut cue = Cue::new_typed(CueType::Audio);
+            if index == 2 {
+                cue.pre_wait_secs = 3.0;
+            }
+            if index == 7 {
+                cue.post_wait_secs = 4.0;
+            }
+            ids.push(cue.id);
+            cue_list.add(cue);
+        }
+
+        let segments = build_all_cues_segments(&cue_list, &ids);
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].children.as_slice(), &ids[0..2]);
+        assert_eq!(segments[0].pre_wait_secs, 0.0);
+        assert_eq!(segments[0].post_wait_secs, 0.0);
+
+        assert_eq!(segments[1].children.as_slice(), &ids[2..8]);
+        assert_eq!(segments[1].pre_wait_secs, 3.0);
+        assert_eq!(segments[1].post_wait_secs, 4.0);
+
+        assert_eq!(segments[2].children.as_slice(), &ids[8..15]);
+        assert_eq!(segments[2].pre_wait_secs, 0.0);
+        assert_eq!(segments[2].post_wait_secs, 0.0);
+    }
+
+    #[test]
+    fn all_zero_wait_children_remain_one_simultaneous_segment() {
+        let mut cue_list = CueList::new("All Cues zero-wait test");
+        let mut ids = Vec::new();
+
+        for _ in 0..20 {
+            let cue = Cue::new_typed(CueType::Audio);
+            ids.push(cue.id);
+            cue_list.add(cue);
+        }
+
+        let segments = build_all_cues_segments(&cue_list, &ids);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].children.as_slice(), ids.as_slice());
+        assert_eq!(segments[0].pre_wait_secs, 0.0);
+        assert_eq!(segments[0].post_wait_secs, 0.0);
+    }
+
+    #[test]
+    fn consecutive_post_and_pre_waits_remain_separate_barriers() {
+        let mut cue_list = CueList::new("All Cues adjacent waits test");
+        let mut first = Cue::new_typed(CueType::Audio);
+        first.post_wait_secs = 4.0;
+        let mut second = Cue::new_typed(CueType::Audio);
+        second.pre_wait_secs = 3.0;
+        let third = Cue::new_typed(CueType::Audio);
+        let ids = vec![first.id, second.id, third.id];
+
+        cue_list.add(first);
+        cue_list.add(second);
+        cue_list.add(third);
+
+        let segments = build_all_cues_segments(&cue_list, &ids);
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].children.as_slice(), &ids[0..1]);
+        assert_eq!(segments[0].post_wait_secs, 4.0);
+        assert_eq!(segments[1].children.as_slice(), &ids[1..3]);
+        assert_eq!(segments[1].pre_wait_secs, 3.0);
+    }
+}
+
+#[cfg(test)]
 mod audio_output_mapping_tests {
     use super::{cue_uses_output_endpoint, normalize_buffer_selection};
     use crate::config::AudioBackend;
@@ -7437,6 +9690,21 @@ mod audio_output_mapping_tests {
     }
 
     #[test]
+    fn stable_endpoint_id_wins_over_a_matching_display_name() {
+        let mut cue = Cue::new_typed(CueType::Audio);
+        cue.io.output_backend = Some(AudioBackend::Asio);
+        cue.io.output_device = Some("TASCAM US-366".to_string());
+        cue.io.output_device_id = Some("asio:old-device".to_string());
+
+        assert!(!cue_uses_output_endpoint(
+            &cue,
+            AudioBackend::Asio,
+            "TASCAM US-366",
+            "asio:new-device"
+        ));
+    }
+
+    #[test]
     fn explicit_cue_route_matches_stable_endpoint_identity() {
         let mut cue = Cue::new_typed(CueType::Audio);
         cue.io.output_backend = Some(AudioBackend::Asio);
@@ -7455,5 +9723,126 @@ mod audio_output_mapping_tests {
             "US-322 / US-366",
             "asio:tascam"
         ));
+    }
+}
+
+#[cfg(test)]
+mod recent_project_tests {
+    use super::{
+        recent_project_hover_path, recent_project_menu_label, remember_recent_project_path,
+        MAX_RECENT_PROJECTS,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn recent_projects_are_deduplicated_most_recent_first_and_capped_at_fifteen() {
+        let mut recent = Vec::new();
+        for index in 0..20 {
+            let path = PathBuf::from(format!("project-{index}.tsq"));
+            remember_recent_project_path(&mut recent, &path);
+        }
+
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent.first().map(String::as_str), Some("project-19.tsq"));
+        assert_eq!(recent.last().map(String::as_str), Some("project-5.tsq"));
+
+        remember_recent_project_path(&mut recent, Path::new("project-10.tsq"));
+        assert_eq!(recent.len(), MAX_RECENT_PROJECTS);
+        assert_eq!(recent.first().map(String::as_str), Some("project-10.tsq"));
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|path| path.as_str() == "project-10.tsq")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_project_label_shows_only_the_filename() {
+        let label = recent_project_menu_label(Path::new("D:/Shows/Tour/Opening.tsq"));
+        assert_eq!(label, "Opening.tsq");
+        assert!(!label.contains("Tour"));
+        assert!(!label.contains("Shows"));
+    }
+
+    #[test]
+    fn recent_project_hover_path_hides_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\Users\Ira\Desktop\Opening.tsq");
+        assert_eq!(
+            recent_project_hover_path(path),
+            r"C:\Users\Ira\Desktop\Opening.tsq"
+        );
+    }
+
+    #[test]
+    fn recent_project_hover_path_formats_verbatim_unc_prefix() {
+        let path = Path::new(r"\\?\UNC\server\shows\Opening.tsq");
+        assert_eq!(
+            recent_project_hover_path(path),
+            r"\\server\shows\Opening.tsq"
+        );
+    }
+
+    #[test]
+    fn recent_project_hover_path_keeps_normal_paths_unchanged() {
+        let path = Path::new(r"D:\Shows\Opening.tsq");
+        assert_eq!(recent_project_hover_path(path), r"D:\Shows\Opening.tsq");
+    }
+}
+
+#[cfg(test)]
+mod project_close_snapshot_tests {
+    use super::serialize_project_snapshot;
+    use crate::cue::{Cue, CueList, CueState, CueType};
+    use crate::project::save_load::Project;
+
+    #[test]
+    fn runtime_playback_state_does_not_mark_project_dirty() {
+        let mut cue_list = CueList::new("Main");
+        let cue = Cue::new_typed(CueType::Audio);
+        cue_list.add(cue);
+
+        let project = Project::default();
+        let saved = serialize_project_snapshot(&project, &cue_list)
+            .expect("initial project snapshot serializes");
+
+        let mut changed_runtime = cue_list.clone();
+        changed_runtime.cues[0].state = CueState::Playing;
+        changed_runtime.cues[0].position_secs = 12.5;
+        let current = serialize_project_snapshot(&project, &changed_runtime)
+            .expect("runtime project snapshot serializes");
+
+        assert_eq!(saved, current);
+    }
+
+    #[test]
+    fn cue_edits_are_detected_by_project_snapshot() {
+        let mut cue_list = CueList::new("Main");
+        cue_list.add(Cue::new_typed(CueType::Audio));
+        let project = Project::default();
+        let saved = serialize_project_snapshot(&project, &cue_list)
+            .expect("initial project snapshot serializes");
+
+        cue_list.cues[0].name = "Changed cue name".to_string();
+        let current = serialize_project_snapshot(&project, &cue_list)
+            .expect("edited project snapshot serializes");
+
+        assert_ne!(saved, current);
+    }
+
+    #[test]
+    fn project_settings_edits_are_detected_by_project_snapshot() {
+        let cue_list = CueList::new("Main");
+        let project = Project::default();
+        let saved = serialize_project_snapshot(&project, &cue_list)
+            .expect("initial project snapshot serializes");
+
+        let mut changed_project = project.clone();
+        changed_project.settings.author = "Stage Manager".to_string();
+        let current = serialize_project_snapshot(&changed_project, &cue_list)
+            .expect("edited project snapshot serializes");
+
+        assert_ne!(saved, current);
     }
 }

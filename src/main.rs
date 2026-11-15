@@ -1,7 +1,7 @@
 // Theatre Show Cue — Professional Audio Cue Player
 // Entry point
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
 
 use eframe::egui;
 use tracing_subscriber::EnvFilter;
@@ -14,16 +14,22 @@ mod diagnostics;
 mod export;
 mod midi;
 mod osc;
+mod performance;
 mod project;
 mod ui;
 
 fn main() -> anyhow::Result<()> {
-    // A short-lived helper mode used to query native ASIO channel names.
-    // It runs before tracing/GUI initialization and writes its result to a
-    // temporary JSON file consumed by the parent Theatre Show Cue process.
+    let args: Vec<String> = std::env::args().collect();
+    // The audio worker is a child mode on every supported target. It runs
+    // before GUI/logging initialization and reserves stdout for JSON-lines IPC.
+    if args.get(1).map(String::as_str) == Some("--tasq-audio-worker") {
+        return audio::worker::run_worker_child_stdio();
+    }
+
+    // A short-lived Windows helper mode used to query native ASIO channel names.
+    // It writes its result to a temporary JSON file consumed by the parent process.
     #[cfg(target_os = "windows")]
     {
-        let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("--tasq-asio-probe") {
             let driver_index = args
                 .get(2)
@@ -58,7 +64,10 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true) // ← перенесли сюда
-            .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/TaSQ.png"))
+                    .expect("embedded TaSQ window icon must be a valid PNG"),
+            ),
         ..Default::default()
     };
 

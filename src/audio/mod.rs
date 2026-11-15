@@ -12,3 +12,4 @@ pub mod waveform;
 
 #[cfg(target_os = "windows")]
 pub(crate) mod asio_probe;
+pub mod worker;

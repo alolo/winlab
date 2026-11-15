@@ -1,7 +1,6 @@
 // src/ui/inspector.rs — вкладки нижней панели: Inspector, Playback, I/O Routing и MIDI
 
 use crate::audio::engine::AudioEngine;
-use crate::config::AudioBackend;
 use crate::cue::{
     shared_stereo_output_destinations, ContinueMode, Cue, CueColor, CueType, FadeCurve, GroupMode,
     MidiMessageKind, OscCueArg,
@@ -10,14 +9,47 @@ use crate::midi::input::MidiOutputManager;
 use crate::ui::theme::Theme;
 use egui::*;
 use rfd::FileDialog;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub struct Inspector;
 
+fn display_path_for_inspector(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    if let Some(unc_path) = display.strip_prefix(r"\\?\UNC\") {
+        normalize_display_separators(&format!(r"\\{unc_path}"), true)
+    } else if let Some(normal_path) = display.strip_prefix(r"\\?\") {
+        normalize_display_separators(normal_path, false)
+    } else {
+        normalize_display_separators(&display, display.starts_with(r"\\"))
+    }
+}
+
+fn normalize_display_separators(path: &str, preserve_unc_prefix: bool) -> String {
+    let mut normalized = String::with_capacity(path.len());
+    let mut previous_was_separator = false;
+
+    for character in path.chars() {
+        if character == '\\' {
+            let is_unc_prefix = preserve_unc_prefix && normalized.len() < 2;
+            if previous_was_separator && !is_unc_prefix {
+                continue;
+            }
+            previous_was_separator = true;
+        } else {
+            previous_was_separator = false;
+        }
+        normalized.push(character);
+    }
+
+    normalized
+}
+
 #[derive(Debug, Clone)]
 pub enum InspectorAction {
     SetAudioFile(PathBuf),
+    CaptureCueHotkey,
+    ClearCueHotkey,
 }
 
 impl Inspector {
@@ -27,6 +59,7 @@ impl Inspector {
         cue: &mut Cue,
         cue_targets: &[(Uuid, String, Option<std::path::PathBuf>)],
         all_cues: &[(Uuid, String)],
+        capturing_hotkey: bool,
     ) -> Option<InspectorAction> {
         let mut action = None;
         ui.columns(3, |cols| {
@@ -39,13 +72,15 @@ impl Inspector {
                             ui.add(TextEdit::singleline(&mut cue.name).desired_width(180.0));
                         });
                         Self::field(ui, "Color", |ui| {
-                            egui::ComboBox::from_id_salt("inspector_color")
+
+                                egui::ComboBox::from_id_salt("inspector_color")
                                 .selected_text(cue.color.label())
                                 .show_ui(ui, |ui| {
                                     for c in CueColor::ALL {
                                         ui.selectable_value(&mut cue.color, *c, c.label());
                                     }
                                 });
+
                         });
                         Self::field(ui, "Notes", |ui| {
                             ui.add(
@@ -75,7 +110,8 @@ impl Inspector {
                             );
                         });
                         Self::field(ui, "Continue", |ui| {
-                            egui::ComboBox::from_id_salt("inspector_continue")
+
+                                egui::ComboBox::from_id_salt("inspector_continue")
                                 .selected_text(cue.continue_mode.label())
                                 .show_ui(ui, |ui| {
                                     for m in ContinueMode::ALL {
@@ -86,22 +122,28 @@ impl Inspector {
                                         );
                                     }
                                 });
+
                         });
                         Self::field(ui, "Hotkey", |ui| {
-                            let mut hk = cue.hotkey.clone().unwrap_or_default();
-                            if ui
-                                .add(
-                                    TextEdit::singleline(&mut hk)
-                                        .hint_text("e.g. F1, 1, Q")
-                                        .desired_width(100.0),
-                                )
-                                .changed()
-                            {
-                                cue.hotkey = if hk.trim().is_empty() {
-                                    None
+                            ui.horizontal(|ui| {
+                                let button_label = if capturing_hotkey {
+                                    "Press a key…"
                                 } else {
-                                    Some(hk.trim().to_uppercase())
+                                    cue.hotkey.as_deref().unwrap_or("Assign…")
                                 };
+                                if ui.button(button_label).clicked() {
+                                    action = Some(InspectorAction::CaptureCueHotkey);
+                                }
+                                if cue.hotkey.is_some() && ui.small_button("Clear").clicked() {
+                                    action = Some(InspectorAction::ClearCueHotkey);
+                                }
+                            });
+                            if capturing_hotkey {
+                                ui.label(
+                                    RichText::new("Press a key combination · Esc to cancel · Backspace to clear")
+                                        .color(Theme::text_dim())
+                                        .size(Theme::scaled_font_size(10.5)),
+                                );
                             }
                         });
                     });
@@ -115,7 +157,7 @@ impl Inspector {
                                 let fname = if cue.file_path.as_os_str().is_empty() {
                                     "No audio file assigned".to_string()
                                 } else {
-                                    cue.file_path.to_string_lossy().to_string()
+                                    display_path_for_inspector(&cue.file_path)
                                 };
                                 ui.label(
                                     RichText::new(fname)
@@ -124,7 +166,7 @@ impl Inspector {
                                         } else {
                                             egui::Color32::from_rgb(235, 85, 85)
                                         })
-                                        .size(11.0),
+                                        .size(Theme::scaled_font_size(11.0)),
                                 )
                                 .on_hover_text(if file_exists {
                                     "Audio file is available"
@@ -188,13 +230,15 @@ impl Inspector {
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Duration:");
-                                    ui.add(
-                                        DragValue::new(duration_secs)
-                                            .range(0.05..=600.0)
-                                            .speed(0.1)
-                                            .fixed_decimals(1)
-                                            .suffix(" s"),
-                                    );
+                                    Theme::input_scope(ui, |ui| {
+                                        ui.add(
+                                            DragValue::new(duration_secs)
+                                                .range(0.05..=600.0)
+                                                .speed(0.1)
+                                                .fixed_decimals(1)
+                                                .suffix(" s"),
+                                        );
+                                    });
                                 });
 
                                 let mut clear_target_level = false;
@@ -204,10 +248,17 @@ impl Inspector {
                                     if target_volume.is_some() {
                                         if let Some(level) = target_volume.as_mut() {
                                             let mut db = vol_to_db(*level);
-                                            if ui.add(DragValue::new(&mut db)
-                                                .range(-60.0..=6.0)
-                                                .speed(0.1)
-                                                .suffix(" dB")).changed() {
+                                            if Theme::input_scope(ui, |ui| {
+                                                ui.add(
+                                                    DragValue::new(&mut db)
+                                                        .range(-60.0..=6.0)
+                                                        .speed(0.1)
+                                                        .suffix(" dB"),
+                                                )
+                                            })
+                                            .inner
+                                            .changed()
+                                            {
                                                 *level = db_to_vol(db);
                                             }
                                         }
@@ -222,7 +273,7 @@ impl Inspector {
                                         "Follow target volume (0 dB if muted)"
                                     } else {
                                         default_label
-                                    }).color(Theme::text_dim()).size(10.5));
+                                    }).color(Theme::text_dim()).size(Theme::scaled_font_size(10.5)));
                                         set_target_level = ui.small_button("Set level").clicked();
                                     }
                                 });
@@ -234,7 +285,8 @@ impl Inspector {
 
                                 ui.horizontal(|ui| {
                                     ui.label("Fade curve:");
-                                    egui::ComboBox::from_id_salt(("cue_fade_curve", cue_id))
+                                    Theme::input_scope(ui, |ui| {
+                                        egui::ComboBox::from_id_salt(("cue_fade_curve", cue_id))
                                         .selected_text(match fade_curve {
                                             FadeCurve::Linear => "Linear",
                                             FadeCurve::SCurve => "S-Curve",
@@ -249,6 +301,7 @@ impl Inspector {
                                             ui.selectable_value(fade_curve, FadeCurve::Exponential, "Exponential");
                                             ui.selectable_value(fade_curve, FadeCurve::Custom, "Custom");
                                         });
+                                    });
                                 });
                                 if *fade_curve == FadeCurve::Custom {
                                     if custom_fade_points.len() < 2 {
@@ -266,13 +319,15 @@ impl Inspector {
 CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     ui.horizontal(|ui| {
         ui.label("Mode:");
-        egui::ComboBox::from_id_salt("group_mode")
+        Theme::input_scope(ui, |ui| {
+            egui::ComboBox::from_id_salt("group_mode")
             .selected_text(mode.label())
             .show_ui(ui, |ui| {
                 for m in GroupMode::ALL {
                     ui.selectable_value(mode, m.clone(), m.label());
                 }
             });
+        });
     });
 
     match mode {
@@ -280,39 +335,63 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             ui.label(RichText::new(
                 "Normal: triggers only the first child, then follows \
                  auto-continue/auto-follow chain of children."
-            ).color(Theme::text_dim()).size(11.0));
+            ).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
         }
         GroupMode::Playlist => {
             ui.label(RichText::new(
                 "Playlist: plays children sequentially. Each child waits for its pre-wait, playback completion, and post-wait."
-            ).color(Theme::text_dim()).size(11.0));
+            ).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Group Fade In:");
-                ui.add(DragValue::new(fade_in_secs).range(0.0..=60.0)
-                    .speed(0.05).suffix(" s"));
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(fade_in_secs)
+                            .range(0.0..=60.0)
+                            .speed(0.05)
+                            .suffix(" s"),
+                    );
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Group Fade Out:");
-                ui.add(DragValue::new(fade_out_secs).range(0.0..=60.0)
-                    .speed(0.05).suffix(" s"));
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(fade_out_secs)
+                            .range(0.0..=60.0)
+                            .speed(0.05)
+                            .suffix(" s"),
+                    );
+                });
             });
         }
         GroupMode::AllCues => {
             ui.label(RichText::new(
                 "All Cues: starts every child simultaneously. Each child observes its own pre-wait; the group completes after all children and their post-waits."
-            ).color(Theme::text_dim()).size(11.0));
+            ).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Group Fade In:");
-                ui.add(DragValue::new(fade_in_secs).range(0.0..=60.0)
-                    .speed(0.05).suffix(" s"));
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(fade_in_secs)
+                            .range(0.0..=60.0)
+                            .speed(0.05)
+                            .suffix(" s"),
+                    );
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Group Fade Out:");
-                ui.add(DragValue::new(fade_out_secs).range(0.0..=60.0)
-                    .speed(0.05).suffix(" s"));
+                Theme::input_scope(ui, |ui| {
+                    ui.add(
+                        DragValue::new(fade_out_secs)
+                            .range(0.0..=60.0)
+                            .speed(0.05)
+                            .suffix(" s"),
+                    );
+                });
             });
         }
     }
@@ -321,7 +400,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
     ui.label(RichText::new(format!(
         "Children: {} (drag cues onto the group row in the table to add, or use context menu)",
         children.len()
-    )).color(Theme::accent()).size(11.0));
+    )).color(Theme::accent()).size(Theme::scaled_font_size(11.0)));
 
     // Список детей только для справки (без чекбоксов)
     egui::ScrollArea::vertical()
@@ -332,7 +411,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             if *cid == cue_id { continue; }
             if children.contains(cid) {
                 ui.label(RichText::new(format!("  • {}", clabel))
-                    .color(Theme::text_dim()).size(11.0));
+                    .color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
             }
         }
     });
@@ -342,7 +421,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 ui.label(
                                     RichText::new("Switch to the '🎹 MIDI' tab to configure MIDI parameters and raw hex code.")
                                         .color(Theme::accent())
-                                        .size(11.5),
+                                        .size(Theme::scaled_font_size(11.5)),
                                 );
                             }
 
@@ -350,17 +429,19 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 ui.label(
                                     RichText::new("Comment cues are passive markers. GO skips them without triggering an event.")
                                         .color(Theme::text_dim())
-                                        .size(11.0),
+                                        .size(Theme::scaled_font_size(11.0)),
                                 );
                                 ui.add_space(6.0);
                                 ui.label(RichText::new("Comment text").color(Theme::accent()).strong());
                                 let comment_width = ui.available_width();
-                                ui.add(
-                                    TextEdit::multiline(text)
-                                        .desired_width(comment_width)
-                                        .desired_rows(6)
-                                        .hint_text("Write a stage direction, reminder or show note…"),
-                                );
+                                Theme::input_scope(ui, |ui| {
+                                    ui.add(
+                                        TextEdit::multiline(text)
+                                            .desired_width(comment_width)
+                                            .desired_rows(6)
+                                            .hint_text("Write a stage direction, reminder or show note…"),
+                                    );
+                                });
                             }
 
                             CueType::Osc { address, args } => {
@@ -377,7 +458,8 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 for (index, arg) in args.iter_mut().enumerate() {
                                     ui.push_id(("osc_arg", cue_id, index), |ui| {
                                         ui.horizontal(|ui| {
-                                            egui::ComboBox::from_id_salt("osc_arg_type")
+                                            Theme::input_scope(ui, |ui| {
+                                                egui::ComboBox::from_id_salt("osc_arg_type")
                                                 .width(86.0)
                                                 .selected_text(arg.label())
                                                 .show_ui(ui, |ui| {
@@ -394,11 +476,22 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                                         *arg = OscCueArg::Bool(true);
                                                     }
                                                 });
+                                            });
                                             match arg {
-                                                OscCueArg::Int(value) => { ui.add(DragValue::new(value)); }
-                                                OscCueArg::Float(value) => { ui.add(DragValue::new(value).speed(0.05)); }
+                                                OscCueArg::Int(value) => {
+                                                    Theme::input_scope(ui, |ui| {
+                                                        ui.add(DragValue::new(value));
+                                                    });
+                                                }
+                                                OscCueArg::Float(value) => {
+                                                    Theme::input_scope(ui, |ui| {
+                                                        ui.add(DragValue::new(value).speed(0.05));
+                                                    });
+                                                }
                                                 OscCueArg::String(value) => {
-                                                    ui.add(TextEdit::singleline(value).desired_width(110.0));
+                                                    Theme::input_scope(ui, |ui| {
+                                                        ui.add(TextEdit::singleline(value).desired_width(110.0));
+                                                    });
                                                 }
                                                 OscCueArg::Bool(value) => { ui.checkbox(value, "True"); }
                                             }
@@ -420,7 +513,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                 ui.label(
                                     RichText::new("The event sends this OSC message through the configured global send address.")
                                         .color(Theme::text_dim())
-                                        .size(10.5),
+                                        .size(Theme::scaled_font_size(10.5)),
                                 );
                             }
                         }
@@ -437,18 +530,20 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut cue.time_trigger_enabled, "Daily");
                                 ui.label("Local time:");
-                                ui.add(
-                                    TextEdit::singleline(&mut cue.time_trigger_time)
-                                        .desired_width(86.0)
-                                        .hint_text("HH:MM"),
-                                );
+                                Theme::input_scope(ui, |ui| {
+                                    ui.add(
+                                        TextEdit::singleline(&mut cue.time_trigger_time)
+                                            .desired_width(86.0)
+                                            .hint_text("HH:MM"),
+                                    );
+                                });
                             });
                         });
                         if is_comment {
                             ui.label(
                                 RichText::new("Comment cues cannot be started by a time trigger.")
                                     .color(Theme::text_dim())
-                                    .size(10.5),
+                                    .size(Theme::scaled_font_size(10.5)),
                             );
                         } else if chrono::NaiveTime::parse_from_str(
                             &cue.time_trigger_time,
@@ -473,7 +568,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     "Trigger is disabled."
                                 })
                                 .color(Theme::text_dim())
-                                .size(10.5),
+                                .size(Theme::scaled_font_size(10.5)),
                             );
                         }
                     });
@@ -496,30 +591,32 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         ui.label(
             RichText::new("Target Cue / Group:")
                 .color(Theme::text_dim())
-                .size(11.0),
+                .size(Theme::scaled_font_size(11.0)),
         );
-        egui::ComboBox::from_id_salt("target_cue_or_group")
-            .width(240.0)
-            .selected_text(selected_label)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(target_id.is_none(), "None / All Active")
-                    .clicked()
-                {
-                    *target_id = None;
-                }
-                for (tid, label, file_path) in cue_targets {
+        Theme::input_scope(ui, |ui| {
+            egui::ComboBox::from_id_salt("target_cue_or_group")
+                .width(240.0)
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(*target_id == Some(*tid), label)
+                        .selectable_label(target_id.is_none(), "None / All Active")
                         .clicked()
                     {
-                        *target_id = Some(*tid);
-                        if let Some(path) = file_path {
-                            *cue_file_path = path.clone();
+                        *target_id = None;
+                    }
+                    for (tid, label, file_path) in cue_targets {
+                        if ui
+                            .selectable_label(*target_id == Some(*tid), label)
+                            .clicked()
+                        {
+                            *target_id = Some(*tid);
+                            if let Some(path) = file_path {
+                                *cue_file_path = path.clone();
+                            }
                         }
                     }
-                }
-            });
+                });
+        });
     }
 
     /// Вкладка 2: Playback
@@ -566,7 +663,8 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 });
 
                 Self::field(ui, "Fade Curve", |ui| {
-                    egui::ComboBox::from_id_salt("playback_fade_curve")
+
+                        egui::ComboBox::from_id_salt("playback_fade_curve")
                         .selected_text(format!("{:?}", cue.fade_curve))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut cue.fade_curve, FadeCurve::Linear, "Linear");
@@ -583,6 +681,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             );
                             ui.selectable_value(&mut cue.fade_curve, FadeCurve::Custom, "Custom");
                         });
+
                 });
 
                 if cue.fade_curve == FadeCurve::Custom {
@@ -667,7 +766,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 ui.label(
                     RichText::new("Speed: 0.1× steps · Pitch: semitones + fine cents. Waveform automation is edited in the Waveform tab.")
                         .color(Theme::text_dim())
-                        .size(10.5),
+                        .size(Theme::scaled_font_size(10.5)),
                 );
             });
         });
@@ -765,39 +864,42 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
 
         ui.horizontal(|ui| {
             ui.label("Output device");
-            egui::ComboBox::from_id_salt(("cue_output_device", cue_id))
-                .width(350.0)
-                .selected_text(&selected_endpoint_label)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(
-                            selected_device.is_none(),
-                            format!("Global default ({})", global_device),
-                        )
-                        .clicked()
-                    {
-                        selected_device = None;
-                        selected_backend = None;
-                        selected_device_id = None;
-                    }
+            Theme::input_scope(ui, |ui| {
+                egui::ComboBox::from_id_salt(("cue_output_device", cue_id))
+                    .width(350.0)
+                    .selected_text(&selected_endpoint_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                selected_device.is_none(),
+                                format!("Global default ({})", global_device),
+                            )
+                            .clicked()
+                        {
+                            selected_device = None;
+                            selected_backend = None;
+                            selected_device_id = None;
+                        }
 
-                    for endpoint in audio.device_registry.endpoints().to_vec() {
-                        let selected = selected_device_id.as_deref() == Some(endpoint.id.as_str())
-                            || (selected_device_id.is_none()
-                                && selected_device.as_deref()
-                                    == Some(endpoint.device_name.as_str())
-                                && selected_backend == Some(endpoint.backend));
-                        let label = endpoint.label();
-                        ui.add_enabled_ui(endpoint.is_available(), |ui| {
-                            let response = ui.selectable_label(selected, label);
-                            if response.clicked() {
-                                selected_device = Some(endpoint.device_name.clone());
-                                selected_backend = Some(endpoint.backend);
-                                selected_device_id = Some(endpoint.id.clone());
-                            }
-                        });
-                    }
-                });
+                        for endpoint in audio.device_registry.endpoints().to_vec() {
+                            let selected = selected_device_id.as_deref()
+                                == Some(endpoint.id.as_str())
+                                || (selected_device_id.is_none()
+                                    && selected_device.as_deref()
+                                        == Some(endpoint.device_name.as_str())
+                                    && selected_backend == Some(endpoint.backend));
+                            let label = endpoint.label();
+                            ui.add_enabled_ui(endpoint.is_available(), |ui| {
+                                let response = ui.selectable_label(selected, label);
+                                if response.clicked() {
+                                    selected_device = Some(endpoint.device_name.clone());
+                                    selected_backend = Some(endpoint.backend);
+                                    selected_device_id = Some(endpoint.id.clone());
+                                }
+                            });
+                        }
+                    });
+            });
         });
 
         if let Some(endpoint_id) = selected_device_id.as_deref() {
@@ -835,7 +937,17 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         }
 
         if let Some(device_name) = cue.io.output_device.as_deref() {
-            let route_backend = cue.io.output_backend.unwrap_or(audio.backend);
+            let route_backend = cue
+                .io
+                .output_backend
+                .or_else(|| {
+                    cue.io
+                        .output_device_id
+                        .as_deref()
+                        .and_then(|id| audio.device_registry.find_by_id(id))
+                        .map(|endpoint| endpoint.backend)
+                })
+                .unwrap_or(audio.backend);
             if !audio.registered_endpoint_available(
                 route_backend,
                 cue.io.output_device_id.as_deref(),
@@ -851,41 +963,75 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 );
                 return changed;
             }
-            if route_backend != audio.backend {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    format!(
-                        "This route is saved as {} — {}. Switch the global output to this backend to edit its channel matrix. Simultaneous cross-backend playback becomes available in Stage 4.",
-                        route_backend.short_label(),
-                        device_name
-                    ),
-                );
-                return changed;
-            }
-            if route_backend == AudioBackend::Asio && device_name != audio.current_device.as_str() {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    format!(
-                        "This route is saved as ASIO — {}. Only one ASIO driver can be active in this process. Switch the global output to this device to edit its matrix and play; simultaneous ASIO drivers arrive in Stage 4.",
-                        device_name
-                    ),
-                );
-                return changed;
-            }
         }
 
+        let route_backend = cue
+            .io
+            .output_backend
+            .or_else(|| {
+                cue.io
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| audio.device_registry.find_by_id(id))
+                    .map(|endpoint| endpoint.backend)
+            })
+            .unwrap_or(audio.backend);
+        let route_device_name = cue
+            .io
+            .output_device
+            .clone()
+            .or_else(|| {
+                cue.io
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| audio.device_registry.find_by_id(id))
+                    .filter(|endpoint| endpoint.backend == route_backend)
+                    .map(|endpoint| endpoint.device_name.clone())
+            })
+            .unwrap_or_else(|| audio.current_device.clone());
+        let registered_route_id =
+            if cue.io.output_device_id.is_none() && cue.io.output_device.is_some() {
+                audio.registered_endpoint_id(route_backend, &route_device_name)
+            } else {
+                None
+            };
+        let route_endpoint_id = cue
+            .io
+            .output_device_id
+            .clone()
+            .or(registered_route_id)
+            .or_else(|| {
+                cue.io
+                    .output_device
+                    .is_none()
+                    .then(|| audio.current_device_id.clone())
+            });
         let output_channels = audio
-            .output_channels_for_device(cue.io.output_device.as_deref())
+            .output_channels_for_endpoint(
+                route_backend,
+                route_endpoint_id.as_deref(),
+                Some(&route_device_name),
+            )
             .max(1);
         let input_channels = cue.audio_channels;
-        let default_route_channels = audio
-            .default_route_channels_for_source(cue.io.output_device.as_deref(), input_channels);
+        let default_route_channels = audio.default_route_channels_for_source_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
+            input_channels,
+        );
+        let routes_before_endpoint_validation = cue.io.channel_routes.clone();
         cue.io.ensure_channel_routes_with_defaults(
             input_channels,
             output_channels,
             &default_route_channels,
         );
-        let output_order = audio.output_channel_display_order(cue.io.output_device.as_deref());
+        changed |= cue.io.channel_routes != routes_before_endpoint_validation;
+        let output_order = audio.output_channel_display_order_for_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
+        );
 
         let format = match input_channels {
             1 => "Mono",
@@ -906,7 +1052,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             ui.label(
                 RichText::new("Select one or more source channels for each output.")
                     .color(Theme::text_dim())
-                    .size(10.5),
+                    .size(Theme::scaled_font_size(10.5)),
             );
         });
         ui.add_space(6.0);
@@ -942,12 +1088,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     Label::new(
                                         RichText::new("All source channels")
                                             .color(Theme::text_dim())
-                                            .size(9.5),
+                                            .size(Theme::scaled_font_size(9.5)),
                                     )
                                     .wrap(),
                                 );
                                 ui.label(
-                                    RichText::new("Cue trim").color(Theme::text_dim()).size(9.5),
+                                    RichText::new("Cue trim")
+                                        .color(Theme::text_dim())
+                                        .size(Theme::scaled_font_size(9.5)),
                                 );
                                 let mut master_db = vol_to_db(cue.volume);
                                 let slider = Slider::new(&mut master_db, -60.0..=6.0)
@@ -1011,19 +1159,21 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     ui.add_sized(
                                         [108.0, 28.0],
                                         Label::new(
-                                            RichText::new(audio.output_channel_label(
-                                                cue.io.output_device.as_deref(),
+                                            RichText::new(audio.output_channel_label_for_endpoint(
+                                                route_backend,
+                                                route_endpoint_id.as_deref(),
+                                                Some(&route_device_name),
                                                 output_index,
                                             ))
                                             .color(Theme::text_dim())
-                                            .size(9.5),
+                                            .size(Theme::scaled_font_size(9.5)),
                                         )
                                         .wrap(),
                                     );
                                     ui.label(
                                         RichText::new("Cue trim")
                                             .color(Theme::text_dim())
-                                            .size(9.5),
+                                            .size(Theme::scaled_font_size(9.5)),
                                     );
                                     let output_slider = Slider::new(output_gain_db, -60.0..=18.0)
                                         .vertical()
@@ -1107,8 +1257,10 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                             format!(
                                 "Output {} ({})",
                                 *index + 1,
-                                audio.output_channel_label(
-                                    cue.io.output_device.as_deref(),
+                                audio.output_channel_label_for_endpoint(
+                                    route_backend,
+                                    route_endpoint_id.as_deref(),
+                                    Some(&route_device_name),
                                     output_order.get(*index).copied().unwrap_or(*index),
                                 )
                             )
@@ -1170,11 +1322,60 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         }
 
         let input_channels = cue.audio_channels;
+        let route_backend = cue
+            .io
+            .output_backend
+            .or_else(|| {
+                cue.io
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| audio.device_registry.find_by_id(id))
+                    .map(|endpoint| endpoint.backend)
+            })
+            .unwrap_or(audio.backend);
+        let route_device_name = cue
+            .io
+            .output_device
+            .clone()
+            .or_else(|| {
+                cue.io
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| audio.device_registry.find_by_id(id))
+                    .filter(|endpoint| endpoint.backend == route_backend)
+                    .map(|endpoint| endpoint.device_name.clone())
+            })
+            .unwrap_or_else(|| audio.current_device.clone());
+        let registered_route_id =
+            if cue.io.output_device_id.is_none() && cue.io.output_device.is_some() {
+                audio.registered_endpoint_id(route_backend, &route_device_name)
+            } else {
+                None
+            };
+        let route_endpoint_id = cue
+            .io
+            .output_device_id
+            .clone()
+            .or(registered_route_id)
+            .or_else(|| {
+                cue.io
+                    .output_device
+                    .is_none()
+                    .then(|| audio.current_device_id.clone())
+            });
         let output_channels = audio
-            .output_channels_for_device(cue.io.output_device.as_deref())
+            .output_channels_for_endpoint(
+                route_backend,
+                route_endpoint_id.as_deref(),
+                Some(&route_device_name),
+            )
             .max(1);
-        let default_routes = audio
-            .default_route_channels_for_source(cue.io.output_device.as_deref(), input_channels);
+        let default_routes = audio.default_route_channels_for_source_endpoint(
+            route_backend,
+            route_endpoint_id.as_deref(),
+            Some(&route_device_name),
+            input_channels,
+        );
         let previous_routes = cue.io.channel_routes.clone();
         cue.io.ensure_channel_routes_with_defaults(
             input_channels,
@@ -1200,7 +1401,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     "Adjust the master level and each source channel before output routing.",
                 )
                 .color(Theme::text_dim())
-                .size(10.5),
+                .size(Theme::scaled_font_size(10.5)),
             );
         });
         ui.add_space(6.0);
@@ -1227,12 +1428,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                     Label::new(
                                         RichText::new("All source channels")
                                             .color(Theme::text_dim())
-                                            .size(9.5),
+                                            .size(Theme::scaled_font_size(9.5)),
                                     )
                                     .wrap(),
                                 );
                                 ui.label(
-                                    RichText::new("Cue trim").color(Theme::text_dim()).size(9.5),
+                                    RichText::new("Cue trim")
+                                        .color(Theme::text_dim())
+                                        .size(Theme::scaled_font_size(9.5)),
                                 );
                                 let mut master_db = vol_to_db(cue.volume);
                                 let master_slider = Slider::new(&mut master_db, -60.0..=6.0)
@@ -1297,14 +1500,14 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                                         Label::new(
                                             RichText::new(source_label.clone())
                                                 .color(Theme::text_dim())
-                                                .size(9.5),
+                                                .size(Theme::scaled_font_size(9.5)),
                                         )
                                         .wrap(),
                                     );
                                     ui.label(
                                         RichText::new("Input trim")
                                             .color(Theme::text_dim())
-                                            .size(9.5),
+                                            .size(Theme::scaled_font_size(9.5)),
                                     );
                                     let source_slider =
                                         Slider::new(&mut route.gain_db, -60.0..=18.0)
@@ -1504,16 +1707,18 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                         "Enter raw MIDI bytes in Hex (e.g. 90 3C 7F or F0 7F 7F 06 02 F7):",
                     )
                     .color(Theme::text_dim())
-                    .size(11.0),
+                    .size(Theme::scaled_font_size(11.0)),
                 );
-                if ui
-                    .add(
+                if Theme::input_scope(ui, |ui| {
+                    ui.add(
                         TextEdit::multiline(raw_hex)
                             .font(TextStyle::Monospace)
                             .desired_width(260.0)
                             .desired_rows(2),
                     )
-                    .changed()
+                })
+                .inner
+                .changed()
                 {
                     let parsed = MidiMessageKind::parse_hex(raw_hex);
                     if matches!(message, MidiMessageKind::Raw(_)) {
@@ -1532,7 +1737,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     ui.label(
                         RichText::new(format!("Compiled bytes: {:02X?}", bytes_to_send))
                             .monospace()
-                            .size(11.0)
+                            .size(Theme::scaled_font_size(11.0))
                             .color(Theme::accent()),
                     );
                     if ui.button("🎹 Send MIDI Now").clicked() {
@@ -1572,7 +1777,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         ui.label(
             RichText::new("Draw the fade curve by dragging inside the graph")
                 .color(Theme::text_dim())
-                .size(11.0),
+                .size(Theme::scaled_font_size(11.0)),
         );
 
         let (rect, response) = ui.allocate_exact_size(vec2(300.0, 118.0), Sense::drag());
@@ -1647,7 +1852,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             ui.label(
                 RichText::new(format!("{} control points", points.len()))
                     .color(Theme::text_dim())
-                    .size(10.0),
+                    .size(Theme::scaled_font_size(10.0)),
             );
             if ui.small_button("Reset linear").clicked() {
                 *points = vec![[0.0, 0.0], [1.0, 1.0]];
@@ -1659,7 +1864,7 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         ui.label(
             RichText::new(title)
                 .color(Theme::accent())
-                .size(11.5)
+                .size(Theme::scaled_font_size(11.5))
                 .strong(),
         );
         ui.indent(title, |ui| {
@@ -1706,6 +1911,8 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
 
     /// Editable dB readout. Click to type a value; Enter or focus loss commits it.
     /// `sync_text` refreshes the edit buffer after the adjacent fader is moved.
+    /// When the field is not focused, it also follows external value changes
+    /// from other inspector tabs without overwriting text currently being edited.
     fn gain_db_input(
         ui: &mut Ui,
         id: Id,
@@ -1724,13 +1931,20 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
             .ctx()
             .data(|data| data.get_temp::<String>(text_id))
             .unwrap_or_else(|| format!("{:+.1}", *value));
-        let response = ui.add_sized(
-            [62.0, 22.0],
-            TextEdit::singleline(&mut text)
-                .desired_width(62.0)
-                .font(FontId::monospace(10.0)),
+        let response = Theme::input_scope(ui, |ui| {
+            ui.add_sized(
+                [62.0, 22.0],
+                TextEdit::singleline(&mut text)
+                    .desired_width(62.0)
+                    .font(FontId::monospace(Theme::scaled_font_size(10.0))),
+            )
+        })
+        .inner;
+        ui.label(
+            RichText::new("dB")
+                .size(Theme::scaled_font_size(10.0))
+                .color(Theme::text_dim()),
         );
-        ui.label(RichText::new("dB").size(10.0).color(Theme::text_dim()));
 
         let mut changed = false;
         let commit = response.lost_focus()
@@ -1745,6 +1959,11 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                 }
             }
             text = format!("{:+.1}", *value);
+        } else if sync_text || !response.has_focus() {
+            // The underlying gain can also change in another tab (for example,
+            // Playback). Keep the cached dB editor synchronized whenever the
+            // operator is not actively editing it, not only when this fader moves.
+            text = format!("{:+.1}", *value);
         }
         ui.ctx().data_mut(|data| data.insert_temp(text_id, text));
         changed
@@ -1754,9 +1973,13 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [76.0, 20.0],
-                Label::new(RichText::new(label).color(Theme::text_dim()).size(11.0)),
+                Label::new(
+                    RichText::new(label)
+                        .color(Theme::text_dim())
+                        .size(Theme::scaled_font_size(11.0)),
+                ),
             );
-            content(ui);
+            Theme::input_scope(ui, content);
         });
     }
 }
@@ -1774,5 +1997,35 @@ fn db_to_vol(db: f32) -> f32 {
         0.0
     } else {
         10f32.powf(db / 20.0)
+    }
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::display_path_for_inspector;
+    use std::path::Path;
+
+    #[test]
+    fn hides_extended_length_prefix_for_drive_paths() {
+        assert_eq!(
+            display_path_for_inspector(Path::new(r"\\?\C:\Users\Alexey\audio.wav")),
+            r"C:\Users\Alexey\audio.wav"
+        );
+    }
+
+    #[test]
+    fn collapses_repeated_separators_in_display_only() {
+        assert_eq!(
+            display_path_for_inspector(Path::new(r"\\?\C:\Users\\Alexey\\audio.wav")),
+            r"C:\Users\Alexey\audio.wav"
+        );
+    }
+
+    #[test]
+    fn converts_extended_unc_paths_to_normal_unc_display() {
+        assert_eq!(
+            display_path_for_inspector(Path::new(r"\\?\UNC\server\share\audio.wav")),
+            r"\\server\share\audio.wav"
+        );
     }
 }

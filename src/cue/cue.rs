@@ -3,6 +3,7 @@
 use egui::Color32;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -77,23 +78,24 @@ impl CueType {
         }
     }
 
+    /// Built-in SVG key used by the Cue List type column.
     pub fn icon(&self) -> &'static str {
         match self {
-            CueType::Audio => "🔊",
-            CueType::Pause { .. } => "⏸",
-            CueType::Play { .. } => "▶",
-            CueType::Stop { .. } => "⏹",
+            CueType::Audio => "audio",
+            CueType::Pause { .. } => "pause",
+            CueType::Play { .. } => "play",
+            CueType::Stop { .. } => "stop",
             CueType::Fade { fade_in, .. } => {
                 if *fade_in {
-                    "↗"
+                    "fadeIn"
                 } else {
-                    "↘"
+                    "fadeOut"
                 }
             }
-            CueType::Midi { .. } => "🎹",
-            CueType::Osc { .. } => "📡",
-            CueType::Comment { .. } => "💬",
-            CueType::Group { .. } => "📁",
+            CueType::Midi { .. } => "midi",
+            CueType::Osc { .. } => "osc",
+            CueType::Comment { .. } => "comment",
+            CueType::Group { .. } => "group",
         }
     }
 }
@@ -484,7 +486,11 @@ impl IoRouting {
     }
 
     /// Create missing routes using logical TaSQ output indices.
-    /// Existing user-configured routes are deliberately left untouched.
+    /// Existing valid user-configured routes are deliberately left untouched.
+    ///
+    /// If a stereo Cue's saved destinations no longer exist on the selected
+    /// endpoint, reset both sides to that endpoint's Default Stereo Pair before
+    /// the general route sanitizer can clamp them onto the same output.
     pub fn ensure_channel_routes_with_defaults(
         &mut self,
         input_channels: usize,
@@ -493,7 +499,44 @@ impl IoRouting {
     ) {
         let existing_routes = self.channel_routes.len();
         let output_channels = output_channels.max(1);
+
+        let default_stereo_pair = default_output_channels.get(0..2).filter(|pair| {
+            output_channels >= 2
+                && pair[0] < output_channels
+                && pair[1] < output_channels
+                && pair[0] != pair[1]
+        });
+
+        let stereo_route_is_out_of_range = input_channels == 2
+            && default_stereo_pair.is_some()
+            && self.channel_routes.iter().take(2).any(|route| {
+                if route.output_channels.is_empty() {
+                    route.output_channel >= output_channels
+                } else {
+                    route
+                        .output_channels
+                        .iter()
+                        .any(|destination| *destination >= output_channels)
+                }
+            });
+
         self.ensure_channel_routes(input_channels, output_channels);
+
+        if stereo_route_is_out_of_range {
+            if let Some(pair) = default_stereo_pair {
+                for (source_index, &output_index) in pair.iter().enumerate() {
+                    if let Some(route) = self.channel_routes.get_mut(source_index) {
+                        route.output_channel = output_index;
+                        route.output_channels = if route.active {
+                            vec![output_index]
+                        } else {
+                            Vec::new()
+                        };
+                    }
+                }
+                return;
+            }
+        }
 
         for source_index in existing_routes..self.channel_routes.len() {
             if let Some(output_index) = default_output_channels.get(source_index) {
@@ -693,6 +736,10 @@ impl Default for TimePitchSettings {
     }
 }
 
+fn empty_waveform() -> Arc<[f32]> {
+    Arc::from(Vec::<f32>::new())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cue {
     pub id: Uuid,
@@ -746,8 +793,8 @@ pub struct Cue {
     pub time_trigger_enabled: bool,
     #[serde(default = "default_time_trigger_time")]
     pub time_trigger_time: String,
-    #[serde(skip)]
-    pub waveform: Vec<f32>,
+    #[serde(skip_serializing, skip_deserializing, default = "empty_waveform")]
+    pub waveform: Arc<[f32]>,
     #[serde(skip)]
     pub duration_secs: f64,
 }
@@ -793,7 +840,7 @@ impl Cue {
             hotkey: None,
             time_trigger_enabled: false,
             time_trigger_time: default_time_trigger_time(),
-            waveform: vec![],
+            waveform: empty_waveform(),
             duration_secs: 0.0,
         }
     }
@@ -834,7 +881,7 @@ impl Cue {
             hotkey: None,
             time_trigger_enabled: false,
             time_trigger_time: default_time_trigger_time(),
-            waveform: vec![],
+            waveform: empty_waveform(),
             duration_secs: 0.0,
         }
     }
@@ -909,7 +956,7 @@ mod fade_status_tests {
         });
 
         assert_eq!(cue.cue_type.label(), "Comment");
-        assert_eq!(cue.cue_type.icon(), "💬");
+        assert_eq!(cue.cue_type.icon(), "comment");
         assert_eq!(cue.effective_duration(), 0.0);
         assert_eq!(cue.continue_mode, ContinueMode::Nothing);
     }
@@ -1006,6 +1053,174 @@ mod fade_status_tests {
         assert_eq!(routing.channel_routes[1].output_channel, 5);
         assert_eq!(routing.channel_routes[1].output_channels, vec![5]);
         assert_eq!(routing.output_gains_db, vec![0.0; 6]);
+    }
+
+    #[test]
+    fn stereo_routes_outside_selected_endpoint_reset_to_default_stereo_pair() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 4,
+                output_channels: vec![4],
+                gain_db: -3.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: false,
+                output_channel: 5,
+                output_channels: vec![5],
+                gain_db: -6.0,
+            },
+        ];
+
+        // The new endpoint only has four outputs; its configured default pair is 2/3.
+        routing.ensure_channel_routes_with_defaults(2, 4, &[2, 3]);
+
+        assert_eq!(routing.channel_routes[0].output_channel, 2);
+        assert_eq!(routing.channel_routes[0].output_channels, vec![2]);
+        assert_eq!(routing.channel_routes[1].output_channel, 3);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![3]);
+
+        // Reset destinations only; preserve the Cue's channel controls.
+        assert_eq!(routing.channel_routes[0].gain_db, -3.0);
+        assert_eq!(routing.channel_routes[1].gain_db, -6.0);
+        assert!(routing.channel_routes[0].active);
+        assert!(routing.channel_routes[1].active);
+        assert!(routing.channel_routes[0].master_enabled);
+        assert!(!routing.channel_routes[1].master_enabled);
+    }
+
+    #[test]
+    fn stereo_route_5_6_switching_to_two_channel_endpoint_uses_left_right_outputs() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 4,
+                output_channels: vec![4],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 5,
+                output_channels: vec![5],
+                gain_db: 0.0,
+            },
+        ];
+
+        routing.ensure_channel_routes_with_defaults(2, 2, &[0, 1]);
+
+        assert_eq!(routing.channel_routes[0].output_channels, vec![0]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![1]);
+        assert_ne!(
+            routing.channel_routes[0].output_channels,
+            routing.channel_routes[1].output_channels
+        );
+    }
+
+    #[test]
+    fn one_invalid_stereo_destination_resets_both_sides_to_default_pair() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 0,
+                output_channels: vec![0],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 5,
+                output_channels: vec![1, 5],
+                gain_db: 0.0,
+            },
+        ];
+
+        routing.ensure_channel_routes_with_defaults(2, 4, &[2, 3]);
+
+        assert_eq!(routing.channel_routes[0].output_channels, vec![2]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![3]);
+    }
+
+    #[test]
+    fn valid_stereo_routes_are_preserved_when_switching_to_another_endpoint() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 0,
+                output_channels: vec![0, 2],
+                gain_db: -1.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 1,
+                output_channels: vec![1, 3],
+                gain_db: -2.0,
+            },
+        ];
+        let original = routing.channel_routes.clone();
+
+        routing.ensure_channel_routes_with_defaults(2, 4, &[2, 3]);
+
+        assert_eq!(routing.channel_routes, original);
+    }
+
+    #[test]
+    fn multichannel_routes_are_not_automatically_reduced_to_default_stereo_pair() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = (0..6)
+            .map(|channel| ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: channel,
+                output_channels: vec![channel],
+                gain_db: 0.0,
+            })
+            .collect();
+
+        routing.ensure_channel_routes_with_defaults(6, 4, &[2, 3]);
+
+        // Multichannel-to-stereo downmix is a separate routing decision.
+        // This fallback is intentionally limited to stereo source files.
+        assert_eq!(routing.channel_routes[0].output_channels, vec![0]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![1]);
+        assert_eq!(routing.channel_routes[2].output_channels, vec![2]);
+        assert_eq!(routing.channel_routes[3].output_channels, vec![3]);
+    }
+
+    #[test]
+    fn mono_endpoint_does_not_claim_to_have_a_default_stereo_pair() {
+        let mut routing = IoRouting::default();
+        routing.channel_routes = vec![
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 4,
+                output_channels: vec![4],
+                gain_db: 0.0,
+            },
+            ChannelRoute {
+                active: true,
+                master_enabled: true,
+                output_channel: 5,
+                output_channels: vec![5],
+                gain_db: 0.0,
+            },
+        ];
+
+        routing.ensure_channel_routes_with_defaults(2, 1, &[0, 0]);
+
+        assert_eq!(routing.channel_routes[0].output_channels, vec![0]);
+        assert_eq!(routing.channel_routes[1].output_channels, vec![0]);
     }
 
     #[test]

@@ -1,11 +1,16 @@
 // src/ui/cue_table.rs
 #![allow(float_literal_f32_fallback)]
+use crate::config::AppearanceSettings;
 use crate::cue::{ContinueMode, Cue, CueColor, CueState, CueType, WaitPhase};
+use crate::ui::icons::IconManager;
 use crate::ui::theme::Theme;
 use egui::*;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+static SLOW_CUE_TABLE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
@@ -41,6 +46,16 @@ pub fn visible_navigation_cue_ids(cues: &[Cue], expanded_groups: &HashSet<Uuid>)
 }
 
 fn build_display_order(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<(usize, u8)> {
+    // Cue IDs are stable and unique in valid projects. Keep the first index for
+    // malformed duplicate IDs so lookup behaviour matches the previous `.find()`.
+    let index_by_id: HashMap<Uuid, usize> = cues.iter().enumerate().fold(
+        HashMap::with_capacity(cues.len()),
+        |mut index, (position, cue)| {
+            index.entry(cue.id).or_insert(position);
+            index
+        },
+    );
+
     let child_ids: HashSet<Uuid> = cues
         .iter()
         .filter_map(|cue| match &cue.cue_type {
@@ -50,20 +65,26 @@ fn build_display_order(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<(us
         .flatten()
         .collect();
 
-    let mut order = Vec::new();
-    let mut visible_visited = HashSet::new();
-    let mut structurally_reachable = HashSet::new();
+    let mut order = Vec::with_capacity(cues.len());
+    let mut visible_visited = HashSet::with_capacity(cues.len());
+    let mut structurally_reachable = HashSet::with_capacity(cues.len());
 
     // First walk all real roots. Structural reachability is tracked separately
     // from visibility: children of a collapsed group are intentionally hidden,
     // not orphaned, and must never be appended by the fallback pass below.
     for (index, cue) in cues.iter().enumerate() {
         if !child_ids.contains(&cue.id) {
-            collect_structural_reachability(cues, cue.id, &mut structurally_reachable);
+            collect_structural_reachability(
+                cues,
+                &index_by_id,
+                cue.id,
+                &mut structurally_reachable,
+            );
             if visible_visited.insert(cue.id) {
                 order.push((index, 0));
                 append_group_children(
                     cues,
+                    &index_by_id,
                     cue.id,
                     1,
                     expanded_groups,
@@ -78,11 +99,17 @@ fn build_display_order(cues: &[Cue], expanded_groups: &HashSet<Uuid>) -> Vec<(us
     // reachable, but each component gets only one visible fallback root.
     for (index, cue) in cues.iter().enumerate() {
         if !structurally_reachable.contains(&cue.id) {
-            collect_structural_reachability(cues, cue.id, &mut structurally_reachable);
+            collect_structural_reachability(
+                cues,
+                &index_by_id,
+                cue.id,
+                &mut structurally_reachable,
+            );
             if visible_visited.insert(cue.id) {
                 order.push((index, 0));
                 append_group_children(
                     cues,
+                    &index_by_id,
                     cue.id,
                     1,
                     expanded_groups,
@@ -118,14 +145,19 @@ fn build_sibling_locations(cues: &[Cue]) -> HashMap<Uuid, (Option<Uuid>, usize)>
     locations
 }
 
-fn collect_structural_reachability(cues: &[Cue], cue_id: Uuid, reachable: &mut HashSet<Uuid>) {
+fn collect_structural_reachability(
+    cues: &[Cue],
+    index_by_id: &HashMap<Uuid, usize>,
+    cue_id: Uuid,
+    reachable: &mut HashSet<Uuid>,
+) {
     if !reachable.insert(cue_id) {
         return;
     }
-    if let Some(cue) = cues.iter().find(|cue| cue.id == cue_id) {
+    if let Some(cue) = index_by_id.get(&cue_id).and_then(|index| cues.get(*index)) {
         if let CueType::Group { children, .. } = &cue.cue_type {
             for child_id in children {
-                collect_structural_reachability(cues, *child_id, reachable);
+                collect_structural_reachability(cues, index_by_id, *child_id, reachable);
             }
         }
     }
@@ -133,6 +165,7 @@ fn collect_structural_reachability(cues: &[Cue], cue_id: Uuid, reachable: &mut H
 
 fn append_group_children(
     cues: &[Cue],
+    index_by_id: &HashMap<Uuid, usize>,
     group_id: Uuid,
     depth: u8,
     expanded_groups: &HashSet<Uuid>,
@@ -142,7 +175,10 @@ fn append_group_children(
     if !expanded_groups.contains(&group_id) {
         return;
     }
-    let Some(group) = cues.iter().find(|cue| cue.id == group_id) else {
+    let Some(group_index) = index_by_id.get(&group_id).copied() else {
+        return;
+    };
+    let Some(group) = cues.get(group_index) else {
         return;
     };
     let CueType::Group { children, .. } = &group.cue_type else {
@@ -152,10 +188,11 @@ fn append_group_children(
         if !visited.insert(*child_id) {
             continue;
         }
-        if let Some(index) = cues.iter().position(|cue| cue.id == *child_id) {
+        if let Some(index) = index_by_id.get(child_id).copied() {
             order.push((index, depth));
             append_group_children(
                 cues,
+                index_by_id,
                 *child_id,
                 depth.saturating_add(1),
                 expanded_groups,
@@ -213,6 +250,8 @@ struct CueDragState {
 impl CueTable {
     pub fn show(
         ui: &mut Ui,
+        icons: &mut IconManager,
+        appearance: &AppearanceSettings,
         cues: &mut Vec<Cue>,
         output_issues: &HashMap<Uuid, String>,
         selected: &mut Option<Uuid>,
@@ -225,6 +264,8 @@ impl CueTable {
         scroll_to_cue: Option<Uuid>,
         interactions_enabled: bool,
     ) -> Option<CueTableAction> {
+        let cue_table_started = Instant::now();
+        let cue_count = cues.len();
         let mut action = None;
 
         let cue_names: std::collections::HashMap<Uuid, String> = cues
@@ -247,7 +288,7 @@ impl CueTable {
             .map(|cue| cue.id)
             .collect();
 
-        let row_h = 28.0_f32;
+        let row_h = Theme::scaled_event_size(28.0_f32);
         // The 26 px gutter is shared by header and rows: 18 px for the group
         // disclosure slot, 5 px for the color strip, and 3 px breathing room.
         // The old Status column (saved width index 7) is merged into Duration;
@@ -325,8 +366,12 @@ impl CueTable {
             for (index, label) in labels.iter().enumerate() {
                 let label_response = ui.add_sized(
                     [display_widths[index].max(0.0), 22.0],
-                    Label::new(RichText::new(*label).color(Theme::text_dim()).size(11.0))
-                        .truncate(),
+                    Label::new(
+                        RichText::new(*label)
+                            .color(Theme::text_dim())
+                            .size(Theme::scaled_font_size(11.0)),
+                    )
+                    .truncate(),
                 );
                 if index + 1 < labels.len() {
                     resize_boundaries.push((
@@ -667,10 +712,13 @@ impl CueTable {
                             matches!(editing, Some((id, EditField::Number, _)) if *id == cue.id);
                         if is_editing_number {
                             if let Some((_, _, ref mut buf)) = editing {
-                                let response = ui.add_sized(
-                                    [display_widths[0], row_h - 4.0],
-                                    TextEdit::singleline(buf).font(TextStyle::Monospace),
-                                );
+                                let response = Theme::input_scope(ui, |ui| {
+                                    ui.add_sized(
+                                        [display_widths[0], row_h - 4.0],
+                                        TextEdit::singleline(buf).font(TextStyle::Monospace),
+                                    )
+                                })
+                                .inner;
                                 cue_number_rect = response.rect;
                                 if *editing_focus_pending {
                                     response.request_focus();
@@ -695,7 +743,7 @@ impl CueTable {
                                     RichText::new(&cue.number)
                                         .color(Theme::accent())
                                         .monospace()
-                                        .size(12.0),
+                                        .size(Theme::scaled_font_size(12.0)),
                                 )
                                 .truncate()
                                 .selectable(false)
@@ -704,20 +752,38 @@ impl CueTable {
                             cue_number_rect = number_label.rect;
                         }
 
-                        // Type
-                        let type_icon = if is_playing {
-                            "🎶"
+                        // Type — render the matching monochrome SVG instead of
+                        // an emoji glyph. Playing cues use a dedicated running
+                        // note symbol while inactive cues retain their actual cue-type icon.
+                        let type_icon_key = if is_playing {
+                            "running"
                         } else {
                             cue.cue_type.icon()
                         };
-                        ui.add_sized(
-                            [display_widths[1], row_h],
-                            Label::new(RichText::new(type_icon).color(Theme::text()).size(15.0))
-                                .truncate()
-                                .selectable(false)
-                                .sense(Sense::hover()),
-                        )
-                        .on_hover_text(cue.cue_type.label());
+                        let type_icon_color = if is_playing {
+                            Theme::text_active()
+                        } else {
+                            Theme::text()
+                        };
+                        let (type_rect, type_response) =
+                            ui.allocate_exact_size(vec2(display_widths[1], row_h), Sense::hover());
+                        if let Some(texture_id) = icons.texture_id_for_color(
+                            ui.ctx(),
+                            type_icon_key,
+                            appearance,
+                            type_icon_color,
+                        ) {
+                            let icon_size = 18.0_f32.min((row_h - 4.0).max(10.0));
+                            let icon_rect =
+                                Rect::from_center_size(type_rect.center(), Vec2::splat(icon_size));
+                            ui.painter().image(
+                                texture_id,
+                                icon_rect,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        type_response.on_hover_text(cue.cue_type.label());
 
                         // Name — двойной клик по имени запускает редактирование
                         let is_editing_name =
@@ -727,10 +793,13 @@ impl CueTable {
                                 let indent_width = (indent as f32 * 16.0).min(display_widths[2]);
                                 ui.add_space(indent_width);
                                 let name_width = (display_widths[2] - indent_width).max(0.0);
-                                let r = ui.add_sized(
-                                    [name_width, row_h - 4.0],
-                                    TextEdit::singleline(buf).font(TextStyle::Body),
-                                );
+                                let r = Theme::input_scope(ui, |ui| {
+                                    ui.add_sized(
+                                        [name_width, row_h - 4.0],
+                                        TextEdit::singleline(buf).font(TextStyle::Body),
+                                    )
+                                })
+                                .inner;
                                 name_cell_rect = r.rect;
                                 if *editing_focus_pending {
                                     r.request_focus();
@@ -756,7 +825,7 @@ impl CueTable {
                                 Label::new(
                                     RichText::new(&cue.name)
                                         .color(Self::name_color(cue))
-                                        .size(13.0)
+                                        .size(Theme::scaled_font_size(13.0))
                                         .strong(),
                                 )
                                 .truncate()
@@ -775,7 +844,7 @@ impl CueTable {
                                 Label::new(
                                     RichText::new(target_desc)
                                         .color(Theme::text_dim())
-                                        .size(11.0),
+                                        .size(Theme::scaled_font_size(11.0)),
                                 )
                                 .truncate()
                                 .selectable(false)
@@ -811,10 +880,13 @@ impl CueTable {
                         );
                         if is_fade_cue && is_editing_duration {
                             if let Some((_, _, ref mut buf)) = editing {
-                                let response = ui.add_sized(
-                                    [display_widths[5], row_h - 4.0],
-                                    TextEdit::singleline(buf).font(TextStyle::Monospace),
-                                );
+                                let response = Theme::input_scope(ui, |ui| {
+                                    ui.add_sized(
+                                        [display_widths[5], row_h - 4.0],
+                                        TextEdit::singleline(buf).font(TextStyle::Monospace),
+                                    )
+                                })
+                                .inner;
                                 duration_cell_rect = response.rect;
                                 if *editing_focus_pending {
                                     response.request_focus();
@@ -868,7 +940,7 @@ impl CueTable {
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     format_duration(remaining),
-                                    FontId::monospace(10.0),
+                                    FontId::monospace(Theme::scaled_font_size(10.0)),
                                     Theme::text_active(),
                                 );
                             } else if cue.state == CueState::Paused
@@ -896,7 +968,7 @@ impl CueTable {
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     format!("⏸ {}", format_duration(position)),
-                                    FontId::monospace(10.0),
+                                    FontId::monospace(Theme::scaled_font_size(10.0)),
                                     Theme::pause_btn(),
                                 );
                             } else if matches!(&cue.state, CueState::Loading | CueState::Error(_)) {
@@ -905,7 +977,7 @@ impl CueTable {
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     label,
-                                    FontId::proportional(11.0),
+                                    FontId::proportional(Theme::scaled_font_size(11.0)),
                                     color,
                                 );
                             } else if matches!(&cue.cue_type, CueType::Comment { .. }) {
@@ -913,7 +985,7 @@ impl CueTable {
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     "comment",
-                                    FontId::proportional(10.0),
+                                    FontId::proportional(Theme::scaled_font_size(10.0)),
                                     Theme::text_dim(),
                                 );
                             } else {
@@ -932,7 +1004,7 @@ impl CueTable {
                                     rect.center(),
                                     Align2::CENTER_CENTER,
                                     label,
-                                    FontId::monospace(10.0),
+                                    FontId::monospace(Theme::scaled_font_size(10.0)),
                                     color,
                                 );
                             }
@@ -985,30 +1057,37 @@ impl CueTable {
                                         ui.spacing_mut().button_padding = vec2(0.0, 0.0);
                                         ui.spacing_mut().interact_size.y =
                                             compact_rect.height().max(18.0);
-                                        let combo = egui::ComboBox::from_id_salt("cont")
-                                            .width(display_widths[7].max(0.0))
-                                            .height(130.0)
-                                            // Paint the selected label ourselves below so it can
-                                            // be centered independently of the ComboBox arrow.
-                                            .selected_text("")
-                                            .show_ui(ui, |ui| {
-                                                ui.set_min_width(display_widths[7].max(0.0));
-                                                ui.with_layout(
-                                                    egui::Layout::top_down_justified(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        for mode in ContinueMode::ALL {
-                                                            ui.selectable_value(
-                                                                &mut cue.continue_mode,
-                                                                mode.clone(),
-                                                                RichText::new(mode.label())
-                                                                    .size(12.0),
-                                                            );
-                                                        }
-                                                    },
-                                                );
-                                            });
+                                        let combo = Theme::input_scope(ui, |ui| {
+                                            egui::ComboBox::from_id_salt("cont")
+                                                .width(display_widths[7].max(0.0))
+                                                .height(130.0)
+                                                // Paint the selected label ourselves below so it can
+                                                // be centered independently of the ComboBox arrow.
+                                                .selected_text("")
+                                                .show_ui(ui, |ui| {
+                                                    ui.set_min_width(display_widths[7].max(0.0));
+                                                    ui.with_layout(
+                                                        egui::Layout::top_down_justified(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            for mode in ContinueMode::ALL {
+                                                                ui.selectable_value(
+                                                                    &mut cue.continue_mode,
+                                                                    mode.clone(),
+                                                                    RichText::new(mode.label())
+                                                                        .size(
+                                                                            Theme::scaled_font_size(
+                                                                                12.0,
+                                                                            ),
+                                                                        ),
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                })
+                                        })
+                                        .inner;
 
                                         let combo_rect = combo.response.rect;
                                         let selected_text_rect = egui::Rect::from_min_max(
@@ -1022,7 +1101,7 @@ impl CueTable {
                                             selected_text_rect.center(),
                                             egui::Align2::CENTER_CENTER,
                                             cue.continue_mode.label(),
-                                            egui::FontId::proportional(12.0),
+                                            FontId::proportional(Theme::scaled_font_size(12.0)),
                                             Theme::text(),
                                         );
                                         combo.response
@@ -1381,7 +1460,7 @@ impl CueTable {
                     ghost_rect.center(),
                     Align2::CENTER_CENTER,
                     label,
-                    FontId::proportional(12.0),
+                    FontId::proportional(Theme::scaled_font_size(12.0)),
                     Color32::WHITE,
                 );
             }
@@ -1429,6 +1508,17 @@ impl CueTable {
                     action = Some(CueTableAction::Deselect);
                 }
             }
+        }
+
+        let cue_table_elapsed = cue_table_started.elapsed();
+        if cue_table_elapsed >= Duration::from_millis(8)
+            && SLOW_CUE_TABLE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % 30 == 0
+        {
+            tracing::debug!(
+                "Cue List UI build took {:.2} ms for {} Cue(s)",
+                cue_table_elapsed.as_secs_f64() * 1_000.0,
+                cue_count
+            );
         }
 
         action
@@ -1498,10 +1588,13 @@ impl CueTable {
         let is_editing = matches!(editing, Some((id, f, _)) if *id == cue_id && *f == field);
         if is_editing {
             if let Some((_, _, ref mut buf)) = editing {
-                let response = ui.add_sized(
-                    [width, row_h - 4.0],
-                    TextEdit::singleline(buf).font(TextStyle::Monospace),
-                );
+                let response = Theme::input_scope(ui, |ui| {
+                    ui.add_sized(
+                        [width, row_h - 4.0],
+                        TextEdit::singleline(buf).font(TextStyle::Monospace),
+                    )
+                })
+                .inner;
                 if *editing_focus_pending {
                     response.request_focus();
                     *editing_focus_pending = false;
@@ -1539,7 +1632,7 @@ impl CueTable {
                     } else {
                         format_duration(wait_duration_secs - elapsed)
                     },
-                    FontId::monospace(10.0),
+                    FontId::monospace(Theme::scaled_font_size(10.0)),
                     accent,
                 );
                 rect
@@ -1550,7 +1643,7 @@ impl CueTable {
                         RichText::new(format_duration(wait_duration_secs))
                             .color(accent)
                             .monospace()
-                            .size(11.0),
+                            .size(Theme::scaled_font_size(11.0)),
                     )
                     .truncate()
                     .selectable(false)
@@ -1574,7 +1667,7 @@ impl CueTable {
                             Theme::text_dim()
                         })
                         .monospace()
-                        .size(11.0),
+                        .size(Theme::scaled_font_size(11.0)),
                 )
                 .truncate()
                 .selectable(false)
@@ -1671,13 +1764,13 @@ pub enum CueTableAction {
 fn status_label(state: &CueState) -> (&'static str, Color32) {
     match state {
         CueState::Stopped => ("stopped", Theme::text_dim()),
-        CueState::Waiting => ("⏳ waiting", Theme::pause_btn()),
-        CueState::Playing => ("▶ playing", Theme::text_active()),
-        CueState::Paused => ("⏸ paused", Theme::pause_btn()),
-        CueState::FadingIn => ("↗ fade in", Theme::accent2()),
-        CueState::FadingOut => ("↘ fade out", Theme::accent()),
+        CueState::Waiting => ("waiting", Theme::pause_btn()),
+        CueState::Playing => ("playing", Theme::text_active()),
+        CueState::Paused => ("paused", Theme::pause_btn()),
+        CueState::FadingIn => ("fade in", Theme::accent2()),
+        CueState::FadingOut => ("fade out", Theme::accent()),
         CueState::Loading => ("loading…", Theme::accent()),
-        CueState::Error(_) => ("⚠ error", Theme::stop_btn()),
+        CueState::Error(_) => ("error", Theme::stop_btn()),
     }
 }
 
@@ -1699,6 +1792,153 @@ mod tests {
     };
     use crate::cue::{Cue, CueType, GroupMode};
     use std::collections::HashSet;
+
+    #[test]
+    fn display_order_handles_500_flat_cues_without_dropping_or_reordering_rows() {
+        let cues: Vec<Cue> = (0..500)
+            .map(|index| {
+                let mut cue = Cue::new_typed(CueType::Stop { target_id: None });
+                cue.number = (index + 1).to_string();
+                cue.name = format!("Stress Cue {}", index + 1);
+                cue
+            })
+            .collect();
+
+        let visible = visible_cue_ids(&cues, &HashSet::new());
+        assert_eq!(visible.len(), 500);
+        for (index, cue) in cues.iter().enumerate() {
+            assert_eq!(visible[index], cue.id, "row order changed at index {index}");
+        }
+    }
+
+    /// Headless UI stress benchmark. Run in release mode to measure the actual
+    /// CueTable layout + egui tessellation path without opening audio drivers.
+    ///
+    /// Command:
+    /// cargo test --release cue_table_stress_benchmark_100_to_500 -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual release-mode UI performance benchmark"]
+    fn cue_table_stress_benchmark_100_to_500() {
+        use super::{CueTable, EditField};
+        use crate::config::AppearanceSettings;
+        use crate::ui::icons::IconManager;
+        use egui::{CentralPanel, Context, Pos2, RawInput, Rect};
+        use std::collections::HashMap;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = Context::default();
+            let mut icons = IconManager::new(&ctx);
+            let appearance = AppearanceSettings::default();
+            let executable = std::env::current_exe().unwrap_or_default();
+
+            for count in [100usize, 200, 300, 500] {
+                let mut cues: Vec<Cue> = (0..count)
+                    .map(|index| {
+                        let mut cue = if index % 4 == 0 {
+                            Cue::new_audio(executable.clone())
+                        } else if index % 4 == 1 {
+                            Cue::new_typed(CueType::Play { target_id: None })
+                        } else if index % 4 == 2 {
+                            Cue::new_typed(CueType::Stop { target_id: None })
+                        } else {
+                            Cue::new_typed(CueType::Comment {
+                                text: format!("Stage direction {}", index + 1),
+                            })
+                        };
+                        cue.number = (index + 1).to_string();
+                        cue.name = format!("Stress Cue {}", index + 1);
+                        cue
+                    })
+                    .collect();
+
+                let output_issues = HashMap::new();
+                let mut selected = None;
+                let mut selected_ids = HashSet::new();
+                let mut selection_anchor = None;
+                let mut editing: Option<(uuid::Uuid, EditField, String)> = None;
+                let mut editing_focus_pending = false;
+                let mut column_widths = [44.0, 75.0, 210.0, 165.0, 68.0, 173.0, 68.0, 0.0, 125.0];
+                let mut expanded_groups = HashSet::new();
+                let mut samples = Vec::with_capacity(20);
+
+                for frame in 0..25 {
+                    let mut input = RawInput::default();
+                    input.screen_rect =
+                        Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 900.0)));
+                    input.time = Some(frame as f64 / 30.0);
+                    input.predicted_dt = 1.0 / 30.0;
+
+                    let started = Instant::now();
+                    let output = ctx.run(input, |ctx| {
+                        CentralPanel::default().show(ctx, |ui| {
+                            let _ = CueTable::show(
+                                ui,
+                                &mut icons,
+                                &appearance,
+                                &mut cues,
+                                &output_issues,
+                                &mut selected,
+                                &mut selected_ids,
+                                &mut selection_anchor,
+                                &mut editing,
+                                &mut editing_focus_pending,
+                                &mut column_widths,
+                                &mut expanded_groups,
+                                None,
+                                false,
+                            );
+                        });
+                    });
+                    let _primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+                    let elapsed = started.elapsed();
+                    if frame >= 5 {
+                        samples.push(elapsed);
+                    }
+                }
+
+                samples.sort_unstable();
+                let median = samples[samples.len() / 2];
+                let p95_index = ((samples.len() as f64 * 0.95).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(samples.len() - 1);
+                let p95 = samples[p95_index];
+                let maximum = *samples.last().expect("benchmark has samples");
+                let report = (
+                    count,
+                    median.as_secs_f64() * 1_000.0,
+                    p95.as_secs_f64() * 1_000.0,
+                    maximum.as_secs_f64() * 1_000.0,
+                );
+                if result_tx.send(report).is_err() {
+                    return;
+                }
+            }
+        });
+
+        println!("CueTable headless render benchmark (layout + tessellation):");
+        println!("Cues | median ms | p95 ms | max ms");
+        let max_p95_budget_ms = std::env::var("TASQ_PERF_MAX_P95_MS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok());
+        let benchmark_started = Instant::now();
+        for _ in 0..4 {
+            let remaining = Duration::from_secs(60).saturating_sub(benchmark_started.elapsed());
+            let (count, median, p95, maximum) = result_rx
+                .recv_timeout(remaining)
+                .expect("CueTable benchmark timed out after 60 seconds");
+            println!("{count:>4} | {median:>9.2} | {p95:>6.2} | {maximum:>6.2}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if let Some(budget_ms) = max_p95_budget_ms {
+                assert!(
+                    p95 <= budget_ms,
+                    "CueTable p95 for {count} Cue(s) was {p95:.2} ms, exceeding configured budget {budget_ms:.2} ms"
+                );
+            }
+        }
+    }
 
     #[test]
     fn cue_columns_scale_proportionally_with_available_width() {
