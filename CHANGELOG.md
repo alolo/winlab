@@ -39,6 +39,9 @@
     разработке.
 -   MIDI Time Code (MTC) Output Cue добавлен в план будущих реализаций;
     в версии 0.9.1 он не реализован.
+-   Экспорт Text Score / Cue Sheet в PDF/DOCX и редактирование
+    пользовательских шаблонов добавлены в план будущих реализаций;
+    в версии 0.9.1 они не реализованы.
 
 Подробности: [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
@@ -88,6 +91,9 @@ source.
     in development.
 -   MIDI Time Code (MTC) Output Cue has been added to the future
     development plan; it is not implemented in version 0.9.1.
+-   Text Score / Cue Sheet export to PDF/DOCX and editable user
+    templates have been added to the future development plan; they are
+    not implemented in version 0.9.1.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
 

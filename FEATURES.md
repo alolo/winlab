@@ -98,6 +98,12 @@ Preview-сборке:
     Планируется поддержка Quarter Frame, Full Frame/Locate, выбора frame
     rate и Timecode Offset. Точное поведение транспорта и границы первой
     версии будут определены на этапе проектирования.
+-   [ ] **Text Score / Cue Sheet Export** --- экспорт текстовой
+    партитуры проекта в PDF и DOCX.
+-   [ ] **Custom Export Templates** --- редактирование пользовательских
+    шаблонов текстовой партитуры, включая выбор выводимых полей и
+    настройки оформления. Точный состав настроек будет определён при
+    проектировании.
 
 ### 3. Что пока не заявляется как доступная возможность
 
@@ -107,6 +113,8 @@ Preview-сборке:
     Soundcard.
 -   Производственный Sparse Mixer.
 -   MIDI Time Code (MTC) Output.
+-   Экспорт Text Score / Cue Sheet в PDF и DOCX.
+-   Редактирование пользовательских шаблонов Text Score.
 -   macOS-версия.
 
 ### 4. Как читать статусы
@@ -232,6 +240,8 @@ Preview build:
     Soundcard.
 -   Production Sparse Mixer.
 -   MIDI Time Code (MTC) Output.
+-   Text Score / Cue Sheet export to PDF and DOCX.
+-   Editing custom Text Score templates.
 -   macOS version.
 
 ### 4. Status Definitions

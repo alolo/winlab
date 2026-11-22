@@ -30,6 +30,7 @@ TaSQ развивается как инструмент для управлен�
 -   MIDI Output и OSC Output.
 -   MIDI Time Code (MTC) Output Cue запланирован, но в версии 0.9.1
     Preview ещё не реализован.
+-   Экспорт текстовой партитуры в PDF/DOCX и редактирование шаблонов экспорта запланированы, но пока не реализованы.
 
 Подробное состояние функций и границы проведённого тестирования см. в
 [FEATURES.md](FEATURES.md).
@@ -119,6 +120,7 @@ copy of your show project.
 -   MIDI Output and OSC Output.
 -   MIDI Time Code (MTC) Output Cue is planned but is not implemented in
     Preview 0.9.1.
+-   Text Score export to PDF/DOCX and editable export templates are planned but not yet implemented.
 
 See [FEATURES.md](FEATURES.md) for the feature status and the scope of
 testing performed.

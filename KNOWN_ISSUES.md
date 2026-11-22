@@ -77,6 +77,8 @@ DirectSound. Это не является сертификацией всех а
 -   Single Instance и передача проекта уже запущенному экземпляру;
 -   улучшенный запрос имени при Save as Bundle;
 -   MIDI Time Code (MTC) Output Cue.
+-   Экспорт Text Score / Cue Sheet в PDF и DOCX.
+-   Редактирование пользовательских шаблонов Text Score.
 
 Состояние функций: [FEATURES.md](FEATURES.md).
 
@@ -175,6 +177,8 @@ implemented:
     application;
 -   improved project naming in Save as Bundle;
 -   MIDI Time Code (MTC) Output Cue.
+-   Text Score / Cue Sheet export to PDF and DOCX.
+-   Editing custom Text Score templates.
 
 See [FEATURES.md](FEATURES.md) for feature status.
 
