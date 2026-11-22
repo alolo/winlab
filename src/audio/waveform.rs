@@ -1,5 +1,6 @@
 // src/audio/waveform.rs — анализ аудиофайлов и кэширование waveform
 
+use crate::project::asset_manager::AssetManager;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -753,6 +754,168 @@ impl WaveformAnalysisManager {
     }
 
     pub fn try_recv(&self) -> Option<WaveformAnalysisResult> {
+        self.result_receiver.try_recv().ok()
+    }
+}
+
+/// Whether an asynchronous audio import creates a new Cue or replaces media
+/// on an existing Cue. The Cue ID is reserved by the GUI before the job starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioImportKind {
+    Add,
+    Replace,
+}
+
+pub struct AudioImportResult {
+    pub generation: u64,
+    pub cue_id: Uuid,
+    pub kind: AudioImportKind,
+    pub source_path: PathBuf,
+    pub destination_path: Option<PathBuf>,
+    pub analysis: Option<Arc<AudioFileAnalysis>>,
+    pub error: Option<String>,
+}
+
+struct AudioImportJob {
+    generation: u64,
+    cue_id: Uuid,
+    kind: AudioImportKind,
+    source_path: PathBuf,
+    project_path: Option<PathBuf>,
+    buckets: usize,
+}
+
+/// Performs project-asset copying and audio metadata analysis away from the GUI
+/// thread. A single worker preserves submission order, which is important when
+/// several files are inserted after the same selected Cue.
+pub struct AudioImportManager {
+    job_sender: Sender<AudioImportJob>,
+    result_receiver: Receiver<AudioImportResult>,
+    generation: Arc<AtomicU64>,
+    worker_started: bool,
+}
+
+impl AudioImportManager {
+    pub fn new() -> Self {
+        let (job_sender, job_receiver) = unbounded::<AudioImportJob>();
+        let (result_sender, result_receiver) = unbounded::<AudioImportResult>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let active_generation = generation.clone();
+
+        let spawn_result = thread::Builder::new()
+            .name("tasq-audio-import".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_receiver.recv() {
+                    if active_generation.load(Ordering::Acquire) != job.generation {
+                        trace!("Skipping stale audio import for {:?}", job.source_path);
+                        continue;
+                    }
+
+                    let imported =
+                        (|| -> std::result::Result<(PathBuf, Arc<AudioFileAnalysis>), String> {
+                            if !job.source_path.is_file() {
+                                return Err(format!(
+                                    "Audio file does not exist: {}",
+                                    job.source_path.display()
+                                ));
+                            }
+
+                            let destination = if let Some(project_path) = job.project_path.as_ref()
+                            {
+                                let mut assets = AssetManager::new();
+                                assets.set_project_path(project_path.clone());
+                                assets.import_file(&job.source_path).map_err(|error| {
+                                    format!("Could not copy audio asset: {error}")
+                                })?
+                            } else {
+                                job.source_path.clone()
+                            };
+
+                            if active_generation.load(Ordering::Acquire) != job.generation {
+                                return Err(
+                                    "Audio import was cancelled because the project changed"
+                                        .to_string(),
+                                );
+                            }
+
+                            let analysis = analyze_audio_file(&destination, job.buckets);
+                            Ok((destination, analysis))
+                        })();
+
+                    if active_generation.load(Ordering::Acquire) != job.generation {
+                        continue;
+                    }
+
+                    let (destination_path, analysis, error) = match imported {
+                        Ok((path, analysis)) => (Some(path), Some(analysis), None),
+                        Err(error) => (None, None, Some(error)),
+                    };
+
+                    if result_sender
+                        .send(AudioImportResult {
+                            generation: job.generation,
+                            cue_id: job.cue_id,
+                            kind: job.kind,
+                            source_path: job.source_path,
+                            destination_path,
+                            analysis,
+                            error,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+        let worker_started = match spawn_result {
+            Ok(worker) => {
+                drop(worker);
+                true
+            }
+            Err(error) => {
+                error!("Could not start asynchronous audio import worker: {error}");
+                false
+            }
+        };
+
+        Self {
+            job_sender,
+            result_receiver,
+            generation,
+            worker_started,
+        }
+    }
+
+    pub fn begin_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn submit(
+        &self,
+        generation: u64,
+        cue_id: Uuid,
+        kind: AudioImportKind,
+        source_path: PathBuf,
+        project_path: Option<PathBuf>,
+        buckets: usize,
+    ) -> bool {
+        if !self.worker_started {
+            return false;
+        }
+        self.job_sender
+            .send(AudioImportJob {
+                generation,
+                cue_id,
+                kind,
+                source_path,
+                project_path,
+                buckets,
+            })
+            .is_ok()
+    }
+
+    pub fn try_recv(&self) -> Option<AudioImportResult> {
         self.result_receiver.try_recv().ok()
     }
 }

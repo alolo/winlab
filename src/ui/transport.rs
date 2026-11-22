@@ -8,12 +8,8 @@ use egui::*;
 
 pub enum TransportAction {
     Go,
-    StopSelected,
     StopAll,
-    PauseSelected,
     PauseAll,
-    ResumeSelected,
-    ResumeAll,
 }
 
 pub struct TransportBar;
@@ -63,21 +59,35 @@ fn paint_output_meter(ui: &mut Ui, peak: f32) {
         None => Theme::text_dim(),
     };
 
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("OUTPUT PEAK")
-                .color(Theme::text_dim())
-                .size(Theme::scaled_font_size(10.0)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(value_text)
-                .color(value_color)
-                .size(Theme::scaled_font_size(10.0)),
-        );
-    });
+    // Reserve a fixed-width value column so changing dB digits cannot move
+    // neighbouring transport controls or resize the meter section.
+    ui.allocate_ui_with_layout(
+        vec2(196.0, 16.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add_sized(
+                [82.0, 15.0],
+                Label::new(
+                    RichText::new("OUTPUT PEAK")
+                        .color(Theme::text_dim())
+                        .size(Theme::scaled_font_size(10.0)),
+                ),
+            );
+            ui.add_space(4.0);
+            ui.add_sized(
+                [106.0, 15.0],
+                Label::new(
+                    RichText::new(value_text)
+                        .color(value_color)
+                        .size(Theme::scaled_font_size(10.0))
+                        .monospace(),
+                )
+                .halign(Align::RIGHT),
+            );
+        },
+    );
 
-    let (bar_rect, response) = ui.allocate_exact_size(vec2(148.0, 13.0), Sense::hover());
+    let (bar_rect, response) = ui.allocate_exact_size(vec2(196.0, 13.0), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(bar_rect, 3_u8, Theme::bg_dark());
 
@@ -188,7 +198,7 @@ impl TransportBar {
         total_count: usize,
         output_peak: f32,
         performance: &PerformanceSnapshot,
-        master_vol: &mut f32,
+        master_vol: &mut u8,
         bottom_panel_visible: &mut bool,
     ) -> Option<TransportAction> {
         let mut action = None;
@@ -196,7 +206,6 @@ impl TransportBar {
         let go_fill = Theme::go_btn();
         let stop_fill = Theme::stop_btn();
         let pause_fill = Theme::pause_btn();
-        let resume_fill = Color32::from_rgb(40, 100, 60);
         let go_icon = icons.texture_id_for_color(
             &icon_context,
             "play",
@@ -215,13 +224,6 @@ impl TransportBar {
             appearance,
             contrasting_icon_color(pause_fill),
         );
-        let resume_icon = icons.texture_id_for_color(
-            &icon_context,
-            "play",
-            appearance,
-            contrasting_icon_color(resume_fill),
-        );
-
         ui.horizontal(|ui| {
             ui.add_space(4.0);
 
@@ -250,11 +252,11 @@ impl TransportBar {
             if go_resp.clicked() {
                 action = Some(TransportAction::Go);
             }
-            go_resp.on_hover_text("Play selected cue (Space)");
+            go_resp.on_hover_text("GO / Resume selected Cue or Group (Space)");
 
             ui.add_space(8.0);
 
-            // STOP selected — retain the exact button fill and hit area.
+            // STOP button keeps its existing size and appearance, but now stops all cues.
             let stop_resp = ui.add_sized(
                 [60.0, 44.0],
                 Button::new("").fill(stop_fill).corner_radius(6_u8),
@@ -268,11 +270,11 @@ impl TransportBar {
                     24.0,
                 );
             }
-            if stop_resp.on_hover_text("Stop selected (S)").clicked() {
-                action = Some(TransportAction::StopSelected);
+            if stop_resp.on_hover_text("Stop all cues (Escape)").clicked() {
+                action = Some(TransportAction::StopAll);
             }
 
-            // PAUSE selected.
+            // PAUSE button keeps its existing size and appearance, but pauses all cues.
             let pause_resp = ui.add_sized(
                 [60.0, 44.0],
                 Button::new("").fill(pause_fill).corner_radius(6_u8),
@@ -286,85 +288,12 @@ impl TransportBar {
                     24.0,
                 );
             }
-            if pause_resp.on_hover_text("Pause selected (P)").clicked() {
-                action = Some(TransportAction::PauseSelected);
+            if pause_resp
+                .on_hover_text("Pause all cues (Shift+P)")
+                .clicked()
+            {
+                action = Some(TransportAction::PauseAll);
             }
-
-            // RESUME selected.
-            let resume_resp = ui.add_sized(
-                [60.0, 44.0],
-                Button::new("").fill(resume_fill).corner_radius(6_u8),
-            );
-            if let Some(texture_id) = resume_icon {
-                paint_transport_icon(
-                    ui,
-                    resume_resp.rect,
-                    texture_id,
-                    resume_resp.rect.center(),
-                    24.0,
-                );
-            }
-            if resume_resp.on_hover_text("Resume selected (R)").clicked() {
-                action = Some(TransportAction::ResumeSelected);
-            }
-
-            ui.add_space(12.0);
-            ui.add(Separator::default().vertical());
-            ui.add_space(8.0);
-
-            // ALL buttons
-            ui.vertical(|ui| {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            Button::new(
-                                RichText::new("ALL STOP")
-                                    .color(Theme::stop_btn())
-                                    .size(Theme::scaled_font_size(11.0)),
-                            )
-                            .fill(Color32::from_rgb(50, 20, 20))
-                            .corner_radius(4_u8),
-                        )
-                        .on_hover_text("Stop all cues (Escape)")
-                        .clicked()
-                    {
-                        action = Some(TransportAction::StopAll);
-                    }
-
-                    if ui
-                        .add(
-                            Button::new(
-                                RichText::new("ALL PAUSE")
-                                    .color(Theme::pause_btn())
-                                    .size(Theme::scaled_font_size(11.0)),
-                            )
-                            .fill(Color32::from_rgb(50, 40, 10))
-                            .corner_radius(4_u8),
-                        )
-                        .on_hover_text("Pause all (Shift+P)")
-                        .clicked()
-                    {
-                        action = Some(TransportAction::PauseAll);
-                    }
-
-                    if ui
-                        .add(
-                            Button::new(
-                                RichText::new("ALL RESUME")
-                                    .color(Theme::accent2())
-                                    .size(Theme::scaled_font_size(11.0)),
-                            )
-                            .fill(Color32::from_rgb(15, 50, 30))
-                            .corner_radius(4_u8),
-                        )
-                        .on_hover_text("Resume all (Shift+R)")
-                        .clicked()
-                    {
-                        action = Some(TransportAction::ResumeAll);
-                    }
-                });
-            });
 
             ui.add_space(12.0);
             ui.add(Separator::default().vertical());
@@ -402,9 +331,9 @@ impl TransportBar {
                         .size(Theme::scaled_font_size(10.0)),
                 );
                 ui.add(
-                    Slider::new(master_vol, 0.0..=1.0)
+                    Slider::new(master_vol, 0_u8..=100_u8)
                         .show_value(true)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .suffix("%")
                         .text(""),
                 );
             });

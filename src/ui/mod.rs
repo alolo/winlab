@@ -4,5 +4,6 @@ pub mod icons;
 pub mod inspector;
 pub mod performance;
 pub mod theme;
+pub mod timeline;
 pub mod transport;
 pub mod waveform_editor;

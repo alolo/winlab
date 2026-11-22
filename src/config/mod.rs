@@ -475,6 +475,10 @@ pub struct AppSettings {
     /// User-resized lower inspector panel height, in logical points.
     #[serde(default = "default_bottom_panel_height")]
     pub bottom_panel_height: f32,
+    /// Global output master level as an integer percentage (0..=100).
+    /// The audio engine continues to receive normalized linear gain.
+    #[serde(default = "default_master_volume_percent")]
+    pub master_volume_percent: u8,
     /// Periodic project backup interval in minutes. Zero disables timed
     /// backups; a backup is still created after every successful save.
     #[serde(default = "default_backup_interval_minutes")]
@@ -515,6 +519,7 @@ impl Default for AppSettings {
             stop_all_fade_secs: 0.0,
             cue_column_widths: default_cue_column_widths(),
             bottom_panel_height: default_bottom_panel_height(),
+            master_volume_percent: default_master_volume_percent(),
             backup_interval_minutes: default_backup_interval_minutes(),
             diagnostic_log_directory: None,
             recent_projects: Vec::new(),
@@ -530,6 +535,10 @@ fn default_cue_column_widths() -> [f32; 9] {
 
 fn default_bottom_panel_height() -> f32 {
     225.0
+}
+
+fn default_master_volume_percent() -> u8 {
+    100
 }
 
 fn default_backup_interval_minutes() -> u32 {
@@ -672,6 +681,9 @@ mod stable_audio_settings_tests {
         assert!(settings.audio_buffer_size_frames.is_none());
         assert_eq!(settings.audio_routing_schema, 0);
         assert!(settings.recent_projects.is_empty());
+        // Master Volume did not exist in legacy settings; its former runtime
+        // default was normalized 1.0, which is exactly 100% on the new scale.
+        assert_eq!(settings.master_volume_percent, 100);
     }
 
     #[test]
@@ -703,6 +715,25 @@ mod stable_audio_settings_tests {
         let legacy: AppSettings = serde_json::from_str(r#"{"osc_listen_port":7700}"#)
             .expect("legacy settings without per-endpoint preferences should load");
         assert!(legacy.audio_performance_settings_by_device.is_empty());
+    }
+
+    #[test]
+    fn master_volume_percent_round_trips_and_defaults_for_legacy_settings() {
+        for percent in [0_u8, 1, 50, 99, 100] {
+            let mut settings = AppSettings::default();
+            settings.master_volume_percent = percent;
+
+            let encoded =
+                serde_json::to_string(&settings).expect("application settings should serialize");
+            let decoded: AppSettings =
+                serde_json::from_str(&encoded).expect("application settings should deserialize");
+
+            assert_eq!(decoded.master_volume_percent, percent);
+        }
+
+        let legacy: AppSettings = serde_json::from_str(r#"{"osc_listen_port":7700}"#)
+            .expect("legacy settings without Master Volume should deserialize");
+        assert_eq!(legacy.master_volume_percent, 100);
     }
 
     #[test]

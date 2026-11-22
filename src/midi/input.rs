@@ -6,8 +6,8 @@ use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Instant;
-use tracing::{error, info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +33,14 @@ struct MidiPortStatus {
     port_names: Vec<String>,
     current_port: Option<String>,
     error: Option<String>,
+}
+
+/// Connection transitions reported by the MIDI Output owner thread.
+/// These are state notifications only; they never send MIDI data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidiOutputConnectionEvent {
+    Connected { port_name: String },
+    Disconnected { port_name: String },
 }
 
 /// One Cue's MIDI payload inside an application-level launch transaction.
@@ -71,12 +79,106 @@ enum MidiOutputCommand {
     Shutdown,
 }
 
-/// A single background owner serializes native MIDI input teardown and creation.
-///
-/// WinMM can report MMSYSERR_ALLOCATED if a replacement connection is opened
-/// before the previous MidiInputConnection has completed its native teardown.
-/// Keeping the connection on one worker thread guarantees strict drop-before-open
-/// ordering without blocking the GUI thread.
+// Polling and reconnection always run on the native MIDI owner thread. This
+// preserves strict drop-before-open ordering for WinMM connections.
+fn poll_midi_input_recovery(
+    connection: &mut Option<MidiInputConnection<()>>,
+    desired_port: &mut Option<String>,
+    request_id: u64,
+    status_tx: &Sender<MidiPortStatus>,
+    message_tx: &Sender<MidiMessage>,
+    repaint_context: &Arc<OnceLock<egui::Context>>,
+) {
+    let midi_in = match MidiInput::new("Theatre Show Cue Input") {
+        Ok(midi_in) => midi_in,
+        Err(error) => {
+            if connection.take().is_some() {
+                info!(
+                    "MIDI input backend became unavailable; releasing the old connection: {error}"
+                );
+                let _ = status_tx.send(MidiPortStatus {
+                    request_id,
+                    port_names: Vec::new(),
+                    current_port: None,
+                    error: Some(format!("MIDI input backend unavailable: {error}")),
+                });
+            } else {
+                debug!("MIDI input recovery enumeration failed: {error}");
+            }
+            return;
+        }
+    };
+    let ports = midi_in.ports();
+    let port_names: Vec<String> = ports
+        .iter()
+        .filter_map(|port| midi_in.port_name(port).ok())
+        .collect();
+    if desired_port.is_none() {
+        *desired_port = port_names.first().cloned();
+    }
+    let selected_name = desired_port.clone();
+    let target = selected_name.as_deref().and_then(|preferred| {
+        ports
+            .iter()
+            .find(|port| midi_in.port_name(port).ok().as_deref() == Some(preferred))
+    });
+
+    let Some(port) = target else {
+        if connection.take().is_some() {
+            info!(
+                "MIDI input disconnected: selected_port='{}'; waiting for the same port to return",
+                selected_name.as_deref().unwrap_or("<none>")
+            );
+            let _ = status_tx.send(MidiPortStatus {
+                request_id,
+                port_names,
+                current_port: None,
+                error: None,
+            });
+        }
+        return;
+    };
+
+    if connection.is_some() {
+        return;
+    }
+
+    let port_name = selected_name.unwrap_or_default();
+    let callback_tx = message_tx.clone();
+    let callback_context = Arc::clone(repaint_context);
+    match midi_in.connect(
+        port,
+        "tasq-in",
+        move |_stamp, raw, _| {
+            if let Some(message) = parse_midi(raw) {
+                if callback_tx.try_send(message).is_ok() {
+                    if let Some(context) = callback_context.get() {
+                        context.request_repaint();
+                    }
+                }
+            }
+        },
+        (),
+    ) {
+        Ok(new_connection) => {
+            info!("MIDI input automatically reconnected: {}", port_name);
+            *connection = Some(new_connection);
+            let _ = status_tx.send(MidiPortStatus {
+                request_id,
+                port_names,
+                current_port: Some(port_name),
+                error: None,
+            });
+        }
+        Err(error) => debug!(
+            "MIDI input reconnect attempt failed for '{}': {}",
+            port_name, error
+        ),
+    }
+}
+
+/// A single background owner serializes native MIDI input teardown, creation,
+/// and recovery without blocking the GUI thread.
 fn run_midi_input_worker(
     command_rx: Receiver<MidiInputCommand>,
     status_tx: Sender<MidiPortStatus>,
@@ -84,13 +186,31 @@ fn run_midi_input_worker(
     repaint_context: Arc<OnceLock<egui::Context>>,
 ) {
     let mut connection: Option<MidiInputConnection<()>> = None;
+    let mut desired_port: Option<String> = None;
+    let mut active_request_id = 0_u64;
 
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let command = match command_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(command) => command,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                poll_midi_input_recovery(
+                    &mut connection,
+                    &mut desired_port,
+                    active_request_id,
+                    &status_tx,
+                    &message_tx,
+                    &repaint_context,
+                );
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             MidiInputCommand::Connect {
                 request_id,
                 preferred_port,
             } => {
+                active_request_id = request_id;
                 if let Some(previous) = connection.take() {
                     info!("Releasing previous native MIDI input connection before opening a replacement");
                     // The connection is dropped here, on this worker thread. The
@@ -119,22 +239,32 @@ fn run_midi_input_worker(
                     .filter_map(|port| midi_in.port_name(port).ok())
                     .collect();
 
-                let target = preferred_port
-                    .as_deref()
-                    .and_then(|preferred| {
-                        ports
-                            .iter()
-                            .find(|port| midi_in.port_name(port).ok().as_deref() == Some(preferred))
-                    })
-                    .or_else(|| ports.first());
+                desired_port = preferred_port
+                    .clone()
+                    .or_else(|| port_names.first().cloned());
+                let target = desired_port.as_deref().and_then(|preferred| {
+                    ports
+                        .iter()
+                        .find(|port| midi_in.port_name(port).ok().as_deref() == Some(preferred))
+                });
 
                 let Some(port) = target else {
-                    info!("No MIDI input ports are currently available");
+                    let error = preferred_port.map(|preferred| {
+                        format!(
+                            "Selected MIDI input '{}' is unavailable; waiting for that exact port.",
+                            preferred
+                        )
+                    });
+                    if let Some(message) = error.as_deref() {
+                        warn!("{message}");
+                    } else {
+                        info!("No MIDI input ports are currently available");
+                    }
                     let _ = status_tx.send(MidiPortStatus {
                         request_id,
                         port_names,
                         current_port: None,
-                        error: None,
+                        error,
                     });
                     continue;
                 };
@@ -192,6 +322,89 @@ fn run_midi_input_worker(
     info!("MIDI input worker stopped");
 }
 
+fn poll_midi_output_recovery(
+    connection: &mut Option<MidiOutputConnection>,
+    connected_port_name: &mut Option<String>,
+    desired_port: &mut Option<String>,
+    request_id: u64,
+    status_tx: &Sender<MidiPortStatus>,
+) {
+    let midi_out = match MidiOutput::new("Theatre Show Cue Output") {
+        Ok(midi_out) => midi_out,
+        Err(error) => {
+            if connection.take().is_some() {
+                info!(
+                    "MIDI output backend became unavailable; releasing the old connection: {error}"
+                );
+                *connected_port_name = None;
+                let _ = status_tx.send(MidiPortStatus {
+                    request_id,
+                    port_names: Vec::new(),
+                    current_port: None,
+                    error: Some(format!("MIDI output backend unavailable: {error}")),
+                });
+            } else {
+                debug!("MIDI output recovery enumeration failed: {error}");
+            }
+            return;
+        }
+    };
+    let ports = midi_out.ports();
+    let port_names: Vec<String> = ports
+        .iter()
+        .filter_map(|port| midi_out.port_name(port).ok())
+        .collect();
+    if desired_port.is_none() {
+        *desired_port = port_names.first().cloned();
+    }
+    let selected_name = desired_port.clone();
+    let target = selected_name.as_deref().and_then(|preferred| {
+        ports
+            .iter()
+            .find(|port| midi_out.port_name(port).ok().as_deref() == Some(preferred))
+    });
+
+    let Some(port) = target else {
+        if connection.take().is_some() {
+            info!(
+                "MIDI output disconnected: selected_port='{}'; waiting for the same port to return",
+                selected_name.as_deref().unwrap_or("<none>")
+            );
+            *connected_port_name = None;
+            let _ = status_tx.send(MidiPortStatus {
+                request_id,
+                port_names,
+                current_port: None,
+                error: None,
+            });
+        }
+        return;
+    };
+
+    if connection.is_some() {
+        return;
+    }
+
+    let port_name = selected_name.unwrap_or_default();
+    match midi_out.connect(port, "tasq-out") {
+        Ok(new_connection) => {
+            info!("MIDI output automatically reconnected: {}", port_name);
+            *connected_port_name = Some(port_name.clone());
+            *connection = Some(new_connection);
+            let _ = status_tx.send(MidiPortStatus {
+                request_id,
+                port_names,
+                current_port: Some(port_name),
+                error: None,
+            });
+        }
+        Err(error) => debug!(
+            "MIDI output reconnect attempt failed for '{}': {}",
+            port_name, error
+        ),
+    }
+}
+
 /// A single background owner serializes native MIDI output teardown, creation,
 /// and sends. This also prevents a cue from sending to a connection while it is
 /// being replaced by the operator in MIDI settings.
@@ -201,13 +414,30 @@ fn run_midi_output_worker(
 ) {
     let mut connection: Option<MidiOutputConnection> = None;
     let mut connected_port_name: Option<String> = None;
+    let mut desired_port: Option<String> = None;
+    let mut active_request_id = 0_u64;
 
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let command = match command_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(command) => command,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                poll_midi_output_recovery(
+                    &mut connection,
+                    &mut connected_port_name,
+                    &mut desired_port,
+                    active_request_id,
+                    &status_tx,
+                );
+                continue;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             MidiOutputCommand::Connect {
                 request_id,
                 preferred_port,
             } => {
+                active_request_id = request_id;
                 if let Some(previous) = connection.take() {
                     info!("Releasing previous native MIDI output connection before opening a replacement");
                     drop(previous);
@@ -236,30 +466,32 @@ fn run_midi_output_worker(
                     .collect();
                 info!("Enumerated MIDI output ports: {:?}", port_names);
 
-                let preferred_target = preferred_port.as_deref().and_then(|preferred| {
+                desired_port = preferred_port
+                    .clone()
+                    .or_else(|| port_names.first().cloned());
+                let target = desired_port.as_deref().and_then(|preferred| {
                     ports
                         .iter()
                         .find(|port| midi_out.port_name(port).ok().as_deref() == Some(preferred))
                 });
-                let preferred_found = preferred_target.is_some();
-                let target = preferred_target.or_else(|| ports.first());
-
-                if let Some(preferred) = preferred_port.as_deref() {
-                    if !preferred_found {
-                        warn!(
-                            "Preferred MIDI output '{}' was not found; falling back to the first available output port",
-                            preferred
-                        );
-                    }
-                }
 
                 let Some(port) = target else {
-                    info!("No MIDI output ports are currently available");
+                    let error = preferred_port.map(|preferred| {
+                        format!(
+                        "Selected MIDI output '{}' is unavailable; waiting for that exact port.",
+                        preferred
+                    )
+                    });
+                    if let Some(message) = error.as_deref() {
+                        warn!("{message}");
+                    } else {
+                        info!("No MIDI output ports are currently available");
+                    }
                     let _ = status_tx.send(MidiPortStatus {
                         request_id,
                         port_names,
                         current_port: None,
-                        error: None,
+                        error,
                     });
                     continue;
                 };
@@ -294,6 +526,7 @@ fn run_midi_output_worker(
                     continue;
                 }
                 let started_at = Instant::now();
+                let mut connection_failed = false;
                 match connection.as_mut() {
                     Some(connection) => match connection.send(&bytes) {
                         Ok(()) => info!(
@@ -302,17 +535,33 @@ fn run_midi_output_worker(
                             bytes,
                             started_at.elapsed().as_micros()
                         ),
-                        Err(error) => warn!(
-                            "MIDI output send failed: port='{}', bytes={:02X?}, error={}",
-                            connected_port_name.as_deref().unwrap_or("unknown"),
-                            bytes,
-                            error
-                        ),
+                        Err(error) => {
+                            connection_failed = true;
+                            warn!(
+                                "MIDI output send failed: port='{}', bytes={:02X?}, error={}; releasing connection for exact-port recovery",
+                                connected_port_name.as_deref().unwrap_or("unknown"),
+                                bytes,
+                                error
+                            );
+                        }
                     },
                     None => warn!(
                         "No MIDI Output port connected; bytes {:02X?} not sent",
                         bytes
                     ),
+                }
+                if connection_failed {
+                    drop(connection.take());
+                    connected_port_name = None;
+                    let _ = status_tx.send(MidiPortStatus {
+                        request_id: active_request_id,
+                        port_names: Vec::new(),
+                        current_port: None,
+                        error: Some(
+                            "MIDI output send failed; waiting to reconnect the selected port"
+                                .to_string(),
+                        ),
+                    });
                 }
             }
             MidiOutputCommand::SendBatch {
@@ -325,7 +574,9 @@ fn run_midi_output_worker(
                 let queue_wait_us = worker_started_at
                     .saturating_duration_since(queued_at)
                     .as_micros();
-                let port_name = connected_port_name.as_deref().unwrap_or("unconnected");
+                let port_name = connected_port_name
+                    .clone()
+                    .unwrap_or_else(|| "unconnected".to_string());
                 let mut sent = 0usize;
                 let mut failed = 0usize;
                 let mut skipped = 0usize;
@@ -337,6 +588,7 @@ fn run_midi_output_worker(
                 let mut last_send_call_us: Option<u128> = None;
                 let mut first_send_cue_id: Option<Uuid> = None;
                 let mut last_send_cue_id: Option<Uuid> = None;
+                let mut native_connection_failed = false;
 
                 for event in events {
                     let batch_offset_us = worker_started_at.elapsed().as_micros();
@@ -400,6 +652,7 @@ fn run_midi_output_worker(
                                 }
                                 Err(error) => {
                                     failed += 1;
+                                    native_connection_failed = true;
                                     results.push(MidiSendResult {
                                         cue_id,
                                         cue_number,
@@ -502,6 +755,20 @@ fn run_midi_output_worker(
                 let worker_to_last_send_completed_us = last_send_completed_at
                     .map(|at| at.saturating_duration_since(worker_started_at).as_micros());
 
+                if native_connection_failed {
+                    drop(connection.take());
+                    connected_port_name = None;
+                    let _ = status_tx.send(MidiPortStatus {
+                        request_id: active_request_id,
+                        port_names: Vec::new(),
+                        current_port: None,
+                        error: Some(
+                            "MIDI output batch send failed; waiting to reconnect the selected port"
+                                .to_string(),
+                        ),
+                    });
+                }
+
                 info!(
                     target: "TaSQ::midi::input",
                     "MIDI dispatch latency: transaction_id={}, stage=LATENCY_SUMMARY, events={}, sent={}, failed={}, skipped={}, go_to_transaction_started_us={:?}, transaction_started_to_go_received_us={:?}, go_to_batch_queued_us={:?}, go_to_worker_started_us={:?}, go_to_first_send_started_us={:?}, go_to_first_send_completed_us={:?}, go_to_last_send_completed_us={:?}, transaction_to_batch_queued_us={}, batch_queued_to_worker_started_us={}, transaction_to_worker_started_us={}, transaction_to_first_send_started_us={:?}, transaction_to_first_send_completed_us={:?}, transaction_to_last_send_completed_us={:?}, queue_wait_us={}, worker_to_first_send_started_us={:?}, worker_to_first_send_completed_us={:?}, worker_to_last_send_completed_us={:?}, worker_elapsed_us={}, first_send_call_us={:?}, last_send_call_us={:?}, first_to_last_send_span_us={:?}, first_send_cue_id={:?}, last_send_cue_id={:?}, go_origin_present={}",
@@ -571,6 +838,26 @@ fn run_midi_output_worker(
     }
 
     info!("MIDI output worker stopped");
+}
+
+fn midi_output_connection_event(
+    previous_port: Option<&str>,
+    current_port: Option<&str>,
+) -> Option<MidiOutputConnectionEvent> {
+    match (previous_port, current_port) {
+        (Some(previous), None) => Some(MidiOutputConnectionEvent::Disconnected {
+            port_name: previous.to_owned(),
+        }),
+        (None, Some(current)) => Some(MidiOutputConnectionEvent::Connected {
+            port_name: current.to_owned(),
+        }),
+        (Some(previous), Some(current)) if previous != current => {
+            Some(MidiOutputConnectionEvent::Connected {
+                port_name: current.to_owned(),
+            })
+        }
+        _ => None,
+    }
 }
 
 pub struct MidiInputManager {
@@ -706,11 +993,24 @@ impl MidiOutputManager {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Apply native MIDI status updates and report connection transitions.
+    /// The one-second owner-thread polling remains responsible for detecting
+    /// when the selected port disappears from the backend's device list.
+    pub fn poll(&mut self) -> Vec<MidiOutputConnectionEvent> {
+        let mut transitions = Vec::new();
+
         while let Ok(status) = self.status_rx.try_recv() {
             if status.request_id != self.latest_request_id {
                 continue;
             }
+
+            if let Some(transition) = midi_output_connection_event(
+                self.current_port.as_deref(),
+                status.current_port.as_deref(),
+            ) {
+                transitions.push(transition);
+            }
+
             self.port_names = status.port_names;
             self.current_port = status.current_port;
             if let Some(error) = status.error {
@@ -720,6 +1020,8 @@ impl MidiOutputManager {
                 context.request_repaint();
             }
         }
+
+        transitions
     }
 
     pub fn send_batch(
@@ -807,9 +1109,50 @@ fn parse_midi(raw: &[u8]) -> Option<MidiMessage> {
 
 #[cfg(test)]
 mod midi_worker_serialization_tests {
-    use super::{MidiInputCommand, MidiOutputCommand};
+    use super::{
+        midi_output_connection_event, MidiInputCommand, MidiOutputCommand,
+        MidiOutputConnectionEvent,
+    };
     use crate::dispatch::DispatchTiming;
     use crossbeam_channel::unbounded;
+
+    #[test]
+    fn output_connection_transition_reports_first_available_port() {
+        assert_eq!(
+            midi_output_connection_event(None, Some("MIDI Control 1")),
+            Some(MidiOutputConnectionEvent::Connected {
+                port_name: "MIDI Control 1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn output_connection_transition_ignores_unchanged_port() {
+        assert_eq!(
+            midi_output_connection_event(Some("MIDI Control 1"), Some("MIDI Control 1")),
+            None
+        );
+    }
+
+    #[test]
+    fn output_connection_transition_reports_changed_port() {
+        assert_eq!(
+            midi_output_connection_event(Some("MIDI Control 1"), Some("MIDI Control 2")),
+            Some(MidiOutputConnectionEvent::Connected {
+                port_name: "MIDI Control 2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn output_disconnection_reports_the_previously_connected_port() {
+        assert_eq!(
+            midi_output_connection_event(Some("MIDI Control 1"), None),
+            Some(MidiOutputConnectionEvent::Disconnected {
+                port_name: "MIDI Control 1".to_string(),
+            })
+        );
+    }
 
     #[test]
     fn midi_input_connection_requests_are_queued_in_order() {

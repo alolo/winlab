@@ -3,7 +3,7 @@
 use crate::audio::device_registry::DeviceRegistryMonitor;
 use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::waveform::{
-    analyze_audio_file, audio_analysis_cache_stats, AudioAnalysisCacheStats,
+    audio_analysis_cache_stats, AudioAnalysisCacheStats, AudioImportKind, AudioImportManager,
     WaveformAnalysisManager,
 };
 use crate::audio::worker::AudioWorkerManagerEvent;
@@ -17,7 +17,9 @@ use crate::cue::{
 };
 use crate::dispatch::DispatchTiming;
 use crate::export::session_report::SessionReport;
-use crate::midi::input::{MidiDispatch, MidiInputManager, MidiOutputManager};
+use crate::midi::input::{
+    MidiDispatch, MidiInputManager, MidiOutputConnectionEvent, MidiOutputManager,
+};
 use crate::osc::server::{OscDispatch, OscServer};
 use crate::performance::PerformanceMonitor;
 use crate::project::{
@@ -33,6 +35,7 @@ use crate::ui::{
     },
     inspector::{Inspector, InspectorAction},
     theme::Theme,
+    timeline::TimelineEditor,
     transport::{TransportAction, TransportBar},
     waveform_editor::WaveformEditor,
 };
@@ -42,13 +45,243 @@ use rfd::FileDialog;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const INTERNAL_CUE_CLIPBOARD_MARKER: &str = "TheatreShowCue::InternalCueClipboard::v1";
 const WAVEFORM_BUCKETS: usize = 4096;
 static SLOW_GUI_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unix_micros_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+const MIDI_OUTPUT_DISCONNECTED_REASON: &str = "No selected MIDI output device is connected";
+
+/// Convert the operator-facing integer percentage to the linear gain used by the DSP.
+fn master_volume_linear_gain(percent: u8) -> f32 {
+    f32::from(percent.min(100)) / 100.0
+}
+
+/// Map the 7-bit MIDI CC range (0..=127) to the operator-facing 0..=100 percent scale.
+fn midi_cc_to_master_volume_percent(value: u8) -> u8 {
+    let value = u16::from(value.min(127));
+    ((value * 100 + 63) / 127) as u8
+}
+
+fn is_midi_output_connection_preflight_error(cue: &Cue) -> bool {
+    matches!(&cue.cue_type, CueType::Midi { .. })
+        && matches!(
+            &cue.state,
+            CueState::Error(message)
+                if message.starts_with("Preflight validation:")
+                    && message.contains(MIDI_OUTPUT_DISCONNECTED_REASON)
+        )
+}
+
+fn midi_output_disconnect_preflight_message(
+    current_state: &CueState,
+    mut issues: Vec<String>,
+) -> Option<String> {
+    // Preserve runtime errors unrelated to device availability. A Cue that is
+    // already showing such an error remains visibly failed, but reconnection
+    // must never clear or rewrite that error.
+    if matches!(
+        current_state,
+        CueState::Error(message) if !message.starts_with("Preflight validation:")
+    ) {
+        return None;
+    }
+
+    if !issues
+        .iter()
+        .any(|issue| issue == MIDI_OUTPUT_DISCONNECTED_REASON)
+    {
+        issues.push(MIDI_OUTPUT_DISCONNECTED_REASON.to_string());
+    }
+
+    Some(format!("Preflight validation: {}", issues.join("; ")))
+}
+
+fn should_schedule_auto_continue(
+    continue_mode: &ContinueMode,
+    suppressed_for_playback: bool,
+    is_managed_child: bool,
+    _is_group_run: bool,
+) -> bool {
+    // A managed Group owns its children's order but still participates in the
+    // parent cue sequence. Auto-Continue on the *group* must start its next
+    // sibling when the group starts, not when its children have finished.
+    continue_mode == &ContinueMode::AutoContinue && !suppressed_for_playback && !is_managed_child
+}
+
+fn should_auto_follow_after_completion(
+    continue_mode: &ContinueMode,
+    suppressed_for_playback: bool,
+    _is_timeline_group: bool,
+    _is_managed_group_mode: bool,
+) -> bool {
+    // Auto-Follow is strictly completion-driven, including Timeline groups.
+    // Auto-Continue has already been dispatched when the group was started.
+    !suppressed_for_playback && continue_mode == &ContinueMode::AutoFollow
+}
+
+/// Auto-Continue on a managed Group fires at the group's actual start, not
+/// after its Post-Wait (which belongs to completion). Ordinary Cues retain
+/// their existing Pre-Wait + Post-Wait continuation delay.
+fn auto_continue_delay(pre_wait: f64, post_wait: f64, is_group_run: bool) -> f64 {
+    if is_group_run {
+        pre_wait
+    } else {
+        pre_wait + post_wait
+    }
+}
+
+/// Find the next sibling outside a container, bubbling through nested Groups.
+/// This is shared by GUI navigation and regression tests without starting ASIO.
+fn next_after_container_in(cues: &[Cue], container_id: Uuid) -> Option<Uuid> {
+    let child_ids: HashSet<Uuid> = cues
+        .iter()
+        .filter_map(|cue| match &cue.cue_type {
+            CueType::Group { children, .. } => Some(children.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let mut container = container_id;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(container) {
+            return None;
+        }
+        if let Some((parent_id, siblings)) = cues.iter().find_map(|cue| match &cue.cue_type {
+            CueType::Group { children, .. } if children.contains(&container) => {
+                Some((cue.id, children))
+            }
+            _ => None,
+        }) {
+            let idx = siblings.iter().position(|id| *id == container)?;
+            if let Some(next) = siblings.get(idx + 1) {
+                return Some(*next);
+            }
+            container = parent_id;
+            continue;
+        }
+        let roots: Vec<Uuid> = cues
+            .iter()
+            .filter(|cue| !child_ids.contains(&cue.id))
+            .map(|cue| cue.id)
+            .collect();
+        let idx = roots.iter().position(|id| *id == container)?;
+        return roots.get(idx + 1).copied();
+    }
+}
+
+fn next_non_comment_after_container_in(cues: &[Cue], group_id: Uuid) -> Option<Uuid> {
+    let mut candidate = next_after_container_in(cues, group_id)?;
+    let mut visited = HashSet::new();
+    while visited.insert(candidate) {
+        let is_comment = cues
+            .iter()
+            .find(|cue| cue.id == candidate)
+            .is_some_and(|cue| matches!(&cue.cue_type, CueType::Comment { .. }));
+        if !is_comment {
+            return Some(candidate);
+        }
+        candidate = next_after_container_in(cues, candidate)?;
+    }
+    None
+}
+
+/// Return the next Cue in the flattened project sequence, entering the next
+/// sibling inside a Group and bubbling out after the last child.
+fn next_cue_in(cues: &[Cue], current_id: Uuid) -> Option<Uuid> {
+    if let Some(parent) = cues.iter().find(|cue| {
+        matches!(&cue.cue_type, CueType::Group { children, .. } if children.contains(&current_id))
+    }) {
+        if let CueType::Group { children, .. } = &parent.cue_type {
+            let index = children.iter().position(|id| *id == current_id)?;
+            if let Some(next) = children.get(index + 1) {
+                return Some(*next);
+            }
+        }
+        return next_after_container_in(cues, parent.id);
+    }
+    next_after_container_in(cues, current_id)
+}
+
+fn next_non_comment_after_in(cues: &[Cue], current_id: Uuid) -> Option<Uuid> {
+    let mut candidate = next_cue_in(cues, current_id)?;
+    let mut visited = HashSet::new();
+    while visited.insert(candidate) {
+        let is_comment = cues
+            .iter()
+            .find(|cue| cue.id == candidate)
+            .is_some_and(|cue| matches!(&cue.cue_type, CueType::Comment { .. }));
+        if !is_comment {
+            return Some(candidate);
+        }
+        candidate = next_cue_in(cues, candidate)?;
+    }
+    None
+}
+
+fn next_auto_cue_in(cues: &[Cue], current_id: Uuid) -> Option<Uuid> {
+    next_non_comment_after_in(cues, current_id)
+}
+
+fn selection_after_auto_chain_in(cues: &[Cue], start_id: Uuid) -> Option<Uuid> {
+    let mut current_id = start_id;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current_id) {
+            return None;
+        }
+        let cue = cues.iter().find(|cue| cue.id == current_id)?;
+        if matches!(&cue.cue_type, CueType::Comment { .. }) {
+            current_id = next_cue_in(cues, current_id)?;
+            continue;
+        }
+        if cue.continue_mode == ContinueMode::Nothing {
+            return next_non_comment_after_in(cues, current_id);
+        }
+        current_id = next_auto_cue_in(cues, current_id)?;
+    }
+}
+
+/// The next manual Cue after a Group's own Continue action and the resulting
+/// automatic chain. With Continue=Nothing, the first Cue after the Group is manual.
+fn next_manual_after_group_auto_chain_in(cues: &[Cue], group_id: Uuid) -> Option<Uuid> {
+    let group = cues.iter().find(|cue| cue.id == group_id)?;
+    let first_after_group = next_non_comment_after_container_in(cues, group_id)?;
+    if group.continue_mode == ContinueMode::Nothing {
+        Some(first_after_group)
+    } else {
+        selection_after_auto_chain_in(cues, first_after_group)
+    }
+}
+
+fn normal_group_last_playable_child_in(cues: &[Cue], group_id: Uuid) -> Option<Uuid> {
+    let group = cues.iter().find(|cue| cue.id == group_id)?;
+    let CueType::Group {
+        mode: GroupMode::Normal,
+        children,
+        ..
+    } = &group.cue_type
+    else {
+        return None;
+    };
+    children.iter().rev().copied().find(|child_id| {
+        cues.iter()
+            .find(|cue| cue.id == *child_id)
+            .is_some_and(|cue| !matches!(&cue.cue_type, CueType::Comment { .. }))
+    })
+}
 
 fn edit_rgb_color(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
     ui.horizontal(|ui| {
@@ -311,6 +544,7 @@ enum Panel {
     Midi,
     Report,
     Performance,
+    Timeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +563,7 @@ enum SettingsTab {
 enum PendingAction {
     ExecuteCue,
     TriggerCue,
+    ResumeCue,
     BeginPostWait,
     ClearWait,
     CompleteCue,
@@ -377,6 +612,23 @@ struct ActiveAllCues {
     fade_out_secs: f64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTimelineCue {
+    cue_id: Uuid,
+    fire_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTimeline {
+    group_id: Uuid,
+    pending: Vec<PendingTimelineCue>,
+    remaining: HashSet<Uuid>,
+    started_at: Instant,
+    paused_at: Option<Instant>,
+    fade_in_secs: f64,
+    fade_out_secs: f64,
+}
+
 /// Build consecutive All Cues launch segments. A non-zero pre-wait starts
 /// a new segment; a non-zero post-wait closes the current segment. Therefore
 /// every segment contains only Cue events that may start in one transaction.
@@ -412,6 +664,19 @@ fn build_all_cues_segments(cue_list: &CueList, children: &[Uuid]) -> Vec<AllCues
     }
 
     segments
+}
+
+/// Timeline launch offsets are absolute offsets from the group's GO origin.
+/// The order of the source child list is retained for stable same-time dispatch.
+fn build_timeline_schedule(cue_list: &CueList, children: &[Uuid]) -> Vec<(Uuid, f64)> {
+    children
+        .iter()
+        .filter_map(|cue_id| {
+            cue_list
+                .find(*cue_id)
+                .map(|cue| (*cue_id, cue.pre_wait_secs.clamp(0.0, 3600.0)))
+        })
+        .collect()
 }
 
 /// Returns whether Cue completion itself owns the post-wait countdown.
@@ -565,7 +830,10 @@ pub struct TheatreShowCueApp {
     project_name_edit_focus_pending: bool,
     expanded_groups: HashSet<Uuid>,
     active_panel: Panel,
-    master_vol: f32,
+    /// Operator-facing master level in integer percent (0..=100).
+    master_vol: u8,
+    /// Debounced persistence of Master Volume changes (including MIDI CC control).
+    master_volume_save_deadline: Option<Instant>,
     /// Latest output peak across all active endpoint workers (linear amplitude).
     output_meter_peak: f32,
     /// Session performance telemetry; native metrics are sampled on a background thread.
@@ -583,6 +851,10 @@ pub struct TheatreShowCueApp {
     notes_sidebar_open: bool,
     fade_started_at: HashMap<Uuid, Instant>,
     fade_managed_targets: HashSet<Uuid>,
+    /// Cue IDs whose current playback was started/resumed with Resume Selected.
+    /// Their configured Auto-Continue/Auto-Follow is preserved in the project,
+    /// but suppressed for this one playback instance only.
+    continuation_suppressed_once: HashSet<Uuid>,
     /// Current audio playback generation per cue. Late updates from a stopped
     /// playback instance are ignored after a stop/restart race.
     audio_generations: HashMap<Uuid, u64>,
@@ -605,6 +877,14 @@ pub struct TheatreShowCueApp {
     /// Background waveform workers never block the GUI or audio callback.
     waveform_manager: WaveformAnalysisManager,
     waveform_generation: u64,
+    /// File copying and media analysis are performed outside the GUI thread.
+    audio_import_manager: AudioImportManager,
+    audio_import_generation: u64,
+    pending_audio_imports: usize,
+    audio_import_total: usize,
+    audio_import_completed: usize,
+    /// Preserve insertion order while one or more asynchronous imports are queued.
+    import_insertion_anchor: Option<Uuid>,
     waveform_pending_cues: HashSet<Uuid>,
     waveform_scheduled_cues: HashSet<Uuid>,
     waveform_total_cues: usize,
@@ -614,15 +894,27 @@ pub struct TheatreShowCueApp {
     time_trigger_last_fired: HashMap<Uuid, String>,
     active_playlists: Vec<ActivePlaylist>,
     active_all_cues: Vec<ActiveAllCues>,
+    active_timelines: Vec<ActiveTimeline>,
+    /// Normal Groups stay active until their final playable child has completed.
+    active_normal_groups: HashSet<Uuid>,
+    timeline_view_group: Option<Uuid>,
     startup_frame_logged: bool,
     last_backup_at: Instant,
     last_media_scan_at: Instant,
+    /// Time spent in intentional native file dialogs during the current GUI update.
+    /// It is reported separately and excluded from active GUI frame-time metrics.
+    native_dialog_elapsed_this_update: Duration,
 }
 
 impl TheatreShowCueApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let mut settings = AppSettings::load();
         let requested_backend = settings.audio_backend;
+        let loaded_master_volume_percent = settings.master_volume_percent;
+        let master_volume_percent = loaded_master_volume_percent.min(100);
+        let master_volume_settings_sanitized =
+            loaded_master_volume_percent != master_volume_percent;
+        settings.master_volume_percent = master_volume_percent;
         let mut asio_profiles_sanitized = false;
         for (key, profile) in &mut settings.audio_performance_settings_by_device {
             if key.starts_with("ASIO::") && *profile != AudioPerformanceSettings::default() {
@@ -763,9 +1055,10 @@ impl TheatreShowCueApp {
             || active_output_settings_profile_missing
             || legacy_performance_mirror_changed
             || asio_profiles_sanitized
+            || master_volume_settings_sanitized
         {
             if let Err(error) = settings.save() {
-                warn!("Could not persist migrated endpoint preferences: {error}");
+                warn!("Could not persist normalized application settings: {error}");
             }
         }
         if let Some(active_directory) = crate::diagnostics::active_log_directory() {
@@ -830,6 +1123,8 @@ impl TheatreShowCueApp {
 
         let waveform_manager = WaveformAnalysisManager::new(1);
         let waveform_generation = waveform_manager.begin_generation();
+        let audio_import_manager = AudioImportManager::new();
+        let audio_import_generation = audio_import_manager.begin_generation();
         let waveform_cache_stats_before = audio_analysis_cache_stats();
 
         info!("Theatre Show Cue initialization complete; creating the main window");
@@ -870,7 +1165,8 @@ impl TheatreShowCueApp {
             project_name_edit_focus_pending: false,
             expanded_groups: HashSet::new(),
             active_panel: Panel::Inspector,
-            master_vol: 1.0,
+            master_vol: master_volume_percent,
+            master_volume_save_deadline: None,
             output_meter_peak: 0.0,
             performance_monitor: PerformanceMonitor::new(),
             status_msg: "Ready — drag audio files here or add events from the toolbar".to_string(),
@@ -878,9 +1174,13 @@ impl TheatreShowCueApp {
             time_trigger_last_fired: HashMap::new(),
             active_playlists: Vec::new(),
             active_all_cues: Vec::new(),
+            active_timelines: Vec::new(),
+            active_normal_groups: HashSet::new(),
+            timeline_view_group: None,
             startup_frame_logged: false,
             last_backup_at: Instant::now(),
             last_media_scan_at: Instant::now(),
+            native_dialog_elapsed_this_update: Duration::ZERO,
             cue_column_widths,
             bottom_panel_height,
             bottom_panel_visible: true,
@@ -889,6 +1189,7 @@ impl TheatreShowCueApp {
             notes_sidebar_open: true,
             fade_started_at: HashMap::new(),
             fade_managed_targets: HashSet::new(),
+            continuation_suppressed_once: HashSet::new(),
             audio_generations: HashMap::new(),
             launch_transaction_depth: 0,
             launch_transaction_id: None,
@@ -901,6 +1202,12 @@ impl TheatreShowCueApp {
             immediate_playlist_advances: VecDeque::new(),
             waveform_manager,
             waveform_generation,
+            audio_import_manager,
+            audio_import_generation,
+            pending_audio_imports: 0,
+            audio_import_total: 0,
+            audio_import_completed: 0,
+            import_insertion_anchor: None,
             waveform_pending_cues: HashSet::new(),
             waveform_scheduled_cues: HashSet::new(),
             waveform_total_cues: 0,
@@ -939,8 +1246,48 @@ impl TheatreShowCueApp {
         if self.selected.is_none() {
             self.select_only(id);
         }
-        let next_manual = self.selection_after_auto_chain(id);
-        let is_normal_group = self.cue_list.find(id).is_some_and(|cue| {
+
+        // GO restores the normal continuation semantics for the selected item.
+        // If it is a Group, clear one-shot suppression for all its descendants too.
+        if self
+            .cue_list
+            .find(id)
+            .is_some_and(|cue| matches!(&cue.cue_type, CueType::Group { .. }))
+        {
+            for cue_id in self.group_descendant_ids(id) {
+                self.continuation_suppressed_once.remove(&cue_id);
+            }
+        } else {
+            self.continuation_suppressed_once.remove(&id);
+        }
+
+        // GO is contextual: a paused Cue resumes itself; a paused Group resumes
+        // its paused descendants and its own scheduler, without touching other
+        // active Cues elsewhere in the project.
+        if self.resume_selected_for_go(id, go_received_at) {
+            return;
+        }
+
+        let selected_snapshot = self.cue_list.find(id).cloned();
+        let is_managed_group = selected_snapshot.as_ref().is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Playlist | GroupMode::AllCues | GroupMode::Timeline,
+                    ..
+                }
+            )
+        });
+        let is_timeline_group = selected_snapshot.as_ref().is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            )
+        });
+        let is_normal_group = selected_snapshot.as_ref().is_some_and(|cue| {
             matches!(
                 &cue.cue_type,
                 CueType::Group {
@@ -949,13 +1296,30 @@ impl TheatreShowCueApp {
                 }
             )
         });
+        let next_manual = if is_timeline_group {
+            // Timeline already had correct post-container cursor navigation;
+            // preserve that established path.
+            self.next_manual_after_timeline_group(id)
+        } else if is_managed_group {
+            // The missing cursor behavior applies to Playlist and All Cues:
+            // select the next parent-level Cue, never a managed child.
+            self.next_manual_after_managed_group(id)
+        } else {
+            self.selection_after_auto_chain(id)
+        };
 
         self.record_go_received_at(go_received_at);
-        // The timestamp is captured at the GO entry and the diagnostic event is
-        // queued immediately. File I/O is handled by the background log writer,
-        // so this record does not delay Cue preparation or MIDI/OSC dispatch.
         info!("GO_RECEIVED: cue_id={}, captured_at_go_entry=true", id);
-        self.trigger_cue(id);
+        if !self.trigger_cue(id) {
+            // Group Preflight selected and opened the first blocking Cue.
+            // Never move the operator cursor after a failed group start.
+            return;
+        }
+
+        if is_timeline_group {
+            self.timeline_view_group = Some(id);
+            self.expanded_groups.remove(&id);
+        }
 
         // Normal Groups may select an internal manual boundary and expand the
         // required nested groups while starting. Preserve that specialized
@@ -973,10 +1337,8 @@ impl TheatreShowCueApp {
             return;
         }
 
-        // Playlist and All Cues select the next manual Cue after the whole group,
-        // not whichever child happens to be starting or completing right now.
-        // The same target is used for scrolling so delayed automatic events do
-        // not pull the viewport through the queue one Cue at a time.
+        // Playlist, All Cues and Timeline select the next manual Cue after the
+        // complete group, not a child that is already controlled by its scheduler.
         if let Some(next_id) = next_manual {
             self.select_only(next_id);
             self.scroll_to_cue = Some(next_id);
@@ -995,30 +1357,300 @@ impl TheatreShowCueApp {
         }
     }
 
-    fn selection_after_auto_chain(&self, start_id: Uuid) -> Option<Uuid> {
-        let mut current_id = start_id;
-        let mut visited = HashSet::new();
-        loop {
-            if !visited.insert(current_id) {
-                // An automatic cycle has no next manual cue to select.
-                return None;
+    fn next_manual_after_timeline_group(&self, group_id: Uuid) -> Option<Uuid> {
+        next_manual_after_group_auto_chain_in(&self.cue_list.cues, group_id)
+    }
+
+    fn next_manual_after_managed_group(&self, group_id: Uuid) -> Option<Uuid> {
+        next_manual_after_group_auto_chain_in(&self.cue_list.cues, group_id)
+    }
+
+    fn resume_selected_for_go(&mut self, selected_id: Uuid, go_received_at: Instant) -> bool {
+        let Some(snapshot) = self.cue_list.find(selected_id).cloned() else {
+            return false;
+        };
+
+        if matches!(&snapshot.cue_type, CueType::Group { .. }) {
+            let descendants = self.group_descendant_ids(selected_id);
+            let has_paused_descendant = descendants.iter().any(|cue_id| {
+                self.cue_list
+                    .find(*cue_id)
+                    .is_some_and(|cue| cue.state == CueState::Paused)
+            });
+            let has_paused_timeline = self
+                .active_timelines
+                .iter()
+                .any(|run| run.group_id == selected_id && run.paused_at.is_some());
+            if !has_paused_descendant && !has_paused_timeline {
+                return false;
             }
-            let Some(cue) = self.cue_list.find(current_id) else {
-                return None;
+            if !self.preflight_group(selected_id) {
+                // A paused Group still gets the same all-or-nothing validation
+                // before any of its paused descendants are resumed.
+                return true;
+            }
+
+            self.record_go_received_at(go_received_at);
+            self.begin_launch_transaction();
+            self.resume_timeline_scheduler(selected_id);
+            let mut resumed_ids = Vec::new();
+            for cue_id in descendants
+                .into_iter()
+                .filter(|cue_id| *cue_id != selected_id)
+            {
+                let Some(cue_snapshot) = self.cue_list.find(cue_id).cloned() else {
+                    continue;
+                };
+                if cue_snapshot.state != CueState::Paused {
+                    continue;
+                }
+                if cue_owns_audio_stream(&cue_snapshot) {
+                    self.audio.send(AudioCommand::Resume(cue_id));
+                }
+                if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                    cue.state = match &cue.cue_type {
+                        CueType::Fade { fade_in: true, .. } => CueState::FadingIn,
+                        CueType::Fade { fade_in: false, .. } => CueState::FadingOut,
+                        _ => CueState::Playing,
+                    };
+                }
+                self.report.record(
+                    &cue_snapshot.number,
+                    &cue_snapshot.name,
+                    cue_snapshot.position_secs,
+                    "Resume",
+                );
+                resumed_ids.push(cue_id);
+            }
+            if let Some(group) = self.cue_list.find_mut(selected_id) {
+                if group.state == CueState::Paused {
+                    group.state = CueState::Playing;
+                }
+            }
+            for cue_id in resumed_ids {
+                self.restore_auto_continue_after_resume(cue_id);
+            }
+            // Normal Group restores its own continuation chain when resumed.
+            // Managed Group modes dispatch the Group Cue's Auto-Continue at the
+            // original group start; replaying it here could trigger the next
+            // parent-level Cue twice. Their child order remains owned by the
+            // Playlist / All Cues / Timeline scheduler.
+            if matches!(
+                &snapshot.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Normal,
+                    ..
+                }
+            ) {
+                self.restore_auto_continue_after_resume(selected_id);
+            }
+            self.end_launch_transaction();
+            if matches!(
+                &snapshot.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            ) {
+                self.timeline_view_group = Some(selected_id);
+                self.expanded_groups.remove(&selected_id);
+                if let Some(next_id) = self.next_manual_after_timeline_group(selected_id) {
+                    self.select_only(next_id);
+                    self.scroll_to_cue = Some(next_id);
+                } else {
+                    self.selected = None;
+                    self.selected_ids.clear();
+                    self.selection_anchor = None;
+                    self.editing = None;
+                    self.editing_focus_pending = false;
+                }
+            }
+            self.status_msg = format!("▶ Resumed group: {}", snapshot.name);
+            info!(
+                "GO_RESUME_GROUP: group_id={}, resumed_descendants={}, timeline_scheduler_resumed={}",
+                selected_id,
+                self.group_descendant_ids(selected_id)
+                    .iter()
+                    .filter(|cue_id| self.cue_list.find(**cue_id).is_some_and(|cue| cue.state == CueState::Playing))
+                    .count(),
+                has_paused_timeline
+            );
+            return true;
+        }
+
+        if snapshot.state != CueState::Paused {
+            return false;
+        }
+
+        self.record_go_received_at(go_received_at);
+        self.begin_launch_transaction();
+        if cue_owns_audio_stream(&snapshot) {
+            self.audio.send(AudioCommand::Resume(selected_id));
+        }
+        if let Some(cue) = self.cue_list.find_mut(selected_id) {
+            cue.state = match &cue.cue_type {
+                CueType::Fade { fade_in: true, .. } => CueState::FadingIn,
+                CueType::Fade { fade_in: false, .. } => CueState::FadingOut,
+                _ => CueState::Playing,
             };
-            // Comments are transparent to automatic sequence navigation.
-            if matches!(&cue.cue_type, CueType::Comment { .. }) {
-                current_id = self.next_cue_id(current_id)?;
-                continue;
+        }
+        self.report.record(
+            &snapshot.number,
+            &snapshot.name,
+            snapshot.position_secs,
+            "Resume",
+        );
+        self.restore_auto_continue_after_resume(selected_id);
+        self.end_launch_transaction();
+        self.status_msg = format!("▶ Resumed: {}", snapshot.name);
+        info!(
+            "GO_RESUME_CUE: cue_id={}, number='{}', name='{}', position={:.3}s",
+            snapshot.id, snapshot.number, snapshot.name, snapshot.position_secs
+        );
+        true
+    }
+
+    fn resume_timeline_scheduler(&mut self, group_id: Uuid) {
+        let now = Instant::now();
+        let mut pending_restore = Vec::new();
+        if let Some(run) = self
+            .active_timelines
+            .iter_mut()
+            .find(|run| run.group_id == group_id)
+        {
+            if let Some(paused_at) = run.paused_at.take() {
+                let pause_duration = now.saturating_duration_since(paused_at);
+                run.started_at += pause_duration;
+                for pending in &mut run.pending {
+                    pending.fire_at += pause_duration;
+                    pending_restore.push((pending.cue_id, run.started_at));
+                }
             }
-            if cue.continue_mode == ContinueMode::Nothing {
-                return self.next_non_comment_after(current_id);
+        }
+        for (cue_id, started_at) in pending_restore {
+            if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                if cue.state == CueState::Stopped {
+                    cue.state = CueState::Waiting;
+                    cue.wait_phase = WaitPhase::Pre;
+                    cue.wait_started_at = Some(started_at);
+                    cue.wait_duration_secs = cue.pre_wait_secs.max(0.0);
+                }
+            }
+        }
+    }
+
+    fn restore_auto_continue_after_resume(&mut self, cue_id: Uuid) {
+        // Pause All can leave several consecutive Cues in Paused state. Resume
+        // only the automatic chain that starts at the selected Cue; unrelated
+        // paused Cues elsewhere in the project remain untouched.
+        let mut current_id = cue_id;
+        let mut visited = HashSet::new();
+
+        while visited.insert(current_id) {
+            let Some(snapshot) = self.cue_list.find(current_id).cloned() else {
+                return;
+            };
+            if snapshot.continue_mode != ContinueMode::AutoContinue
+                || self.is_managed_group_child(current_id)
+            {
+                return;
             }
             let Some(next_id) = self.next_auto_cue_id(current_id) else {
-                return None;
+                return;
             };
-            current_id = next_id;
+            if self.fade_target_is_next_or_container(current_id, next_id) {
+                return;
+            }
+            if self.pending_triggers.iter().any(|trigger| {
+                trigger.cue_id == next_id || trigger.source_cue_id == Some(current_id)
+            }) {
+                return;
+            }
+
+            let next_state = self.cue_list.find(next_id).map(|cue| cue.state.clone());
+            let Some(next_state) = next_state else {
+                return;
+            };
+            if !matches!(&next_state, CueState::Stopped | CueState::Paused) {
+                return;
+            }
+
+            let post_wait = snapshot.post_wait_secs.max(0.0);
+            if post_wait > 0.0 {
+                let now = Instant::now();
+                self.begin_auto_continue_post_wait(current_id);
+                self.pending_triggers.push(PendingTrigger {
+                    cue_id: current_id,
+                    source_cue_id: Some(current_id),
+                    fire_at: now + Duration::from_secs_f64(post_wait),
+                    action: PendingAction::ClearWait,
+                    go_received_at: self.launch_transaction_go_received_at,
+                });
+                self.pending_triggers.push(PendingTrigger {
+                    cue_id: next_id,
+                    source_cue_id: Some(current_id),
+                    fire_at: now + Duration::from_secs_f64(post_wait),
+                    action: if next_state == CueState::Paused {
+                        PendingAction::ResumeCue
+                    } else {
+                        PendingAction::TriggerCue
+                    },
+                    go_received_at: self.launch_transaction_go_received_at,
+                });
+                return;
+            }
+
+            match next_state {
+                CueState::Paused => {
+                    if !self.resume_paused_cue_for_auto_chain(next_id) {
+                        return;
+                    }
+                    current_id = next_id;
+                }
+                CueState::Stopped => {
+                    // A fresh Cue uses the ordinary trigger path, which already
+                    // schedules the rest of its own Auto-Continue chain.
+                    self.trigger_cue(next_id);
+                    return;
+                }
+                _ => return,
+            }
         }
+    }
+
+    fn resume_paused_cue_for_auto_chain(&mut self, cue_id: Uuid) -> bool {
+        let Some(snapshot) = self.cue_list.find(cue_id).cloned() else {
+            return false;
+        };
+        if snapshot.state != CueState::Paused {
+            return false;
+        }
+
+        if cue_owns_audio_stream(&snapshot) {
+            self.audio.send(AudioCommand::Resume(cue_id));
+        }
+        if let Some(cue) = self.cue_list.find_mut(cue_id) {
+            cue.state = match &cue.cue_type {
+                CueType::Fade { fade_in: true, .. } => CueState::FadingIn,
+                CueType::Fade { fade_in: false, .. } => CueState::FadingOut,
+                _ => CueState::Playing,
+            };
+        }
+        self.report.record(
+            &snapshot.number,
+            &snapshot.name,
+            snapshot.position_secs,
+            "Resume",
+        );
+        info!(
+            "AUTO_CHAIN_RESUME_CUE: cue_id={}, number='{}', name='{}', position={:.3}s",
+            snapshot.id, snapshot.number, snapshot.name, snapshot.position_secs
+        );
+        true
+    }
+
+    fn selection_after_auto_chain(&self, start_id: Uuid) -> Option<Uuid> {
+        selection_after_auto_chain_in(&self.cue_list.cues, start_id)
     }
 
     fn is_comment_cue(&self, id: Uuid) -> bool {
@@ -1185,15 +1817,334 @@ impl TheatreShowCueApp {
         }
     }
 
-    /// Public trigger boundary. Nested automatic chains and groups share the
-    /// outer transaction; only the outermost call emits Begin/End markers.
-    fn trigger_cue(&mut self, id: Uuid) {
-        if self.cue_list.find(id).is_none() {
-            return;
+    /// Public trigger boundary. A Group is fully validated before any child can
+    /// start, so a broken child can never leave a partially-running group.
+    /// Nested automatic chains and groups share the outer launch transaction.
+    fn trigger_cue(&mut self, id: Uuid) -> bool {
+        let Some(snapshot) = self.cue_list.find(id).cloned() else {
+            return false;
+        };
+        if matches!(&snapshot.cue_type, CueType::Group { .. }) && !self.preflight_group(id) {
+            return false;
         }
         self.begin_launch_transaction();
         self.trigger_cue_inner(id);
         self.end_launch_transaction();
+        true
+    }
+
+    fn preflight_group(&mut self, group_id: Uuid) -> bool {
+        let mut errors = Vec::<(Uuid, String)>::new();
+        let mut recursion_stack = HashSet::new();
+        self.collect_group_preflight_errors(group_id, &mut recursion_stack, &mut errors);
+
+        if errors.is_empty() {
+            let validated_ids = self.group_descendant_ids(group_id);
+            for cue_id in validated_ids {
+                if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                    if matches!(&cue.state, CueState::Error(message) if message.starts_with("Preflight validation:"))
+                    {
+                        cue.state = CueState::Stopped;
+                    }
+                }
+            }
+            info!("GROUP_PREFLIGHT_OK: group_id={group_id}");
+            return true;
+        }
+
+        for (cue_id, reason) in &errors {
+            warn!(
+                "GROUP_PREFLIGHT_ERROR: group_id={}, cue_id={}, reason='{}'",
+                group_id, cue_id, reason
+            );
+            if let Some(cue) = self.cue_list.find_mut(*cue_id) {
+                cue.state = CueState::Error(format!("Preflight validation: {reason}"));
+            }
+        }
+
+        let first_error_id = errors[0].0;
+        self.expand_group_path_to_cue(group_id, first_error_id);
+        self.select_only(first_error_id);
+        self.scroll_to_cue = Some(first_error_id);
+        let first_reason = errors[0].1.clone();
+        self.status_msg = format!(
+            "Group was not started: {} blocking issue(s). First issue: {}",
+            errors.len(),
+            first_reason
+        );
+        false
+    }
+
+    fn collect_group_preflight_errors(
+        &self,
+        group_id: Uuid,
+        recursion_stack: &mut HashSet<Uuid>,
+        errors: &mut Vec<(Uuid, String)>,
+    ) {
+        let Some(group) = self.cue_list.find(group_id) else {
+            errors.push((group_id, "Group no longer exists".to_string()));
+            return;
+        };
+        let CueType::Group {
+            mode,
+            children,
+            fade_in_secs,
+            fade_out_secs,
+        } = &group.cue_type
+        else {
+            errors.push((group_id, "Selected Cue is not a group".to_string()));
+            return;
+        };
+        if *mode != GroupMode::Timeline
+            && (!group.pre_wait_secs.is_finite()
+                || group.pre_wait_secs < 0.0
+                || group.pre_wait_secs > 3600.0)
+        {
+            errors.push((
+                group_id,
+                "Group Pre-Wait must be between 00:00.00 and 60:00.00".to_string(),
+            ));
+        }
+        if *mode != GroupMode::Timeline
+            && (!group.post_wait_secs.is_finite()
+                || group.post_wait_secs < 0.0
+                || group.post_wait_secs > 3600.0)
+        {
+            errors.push((
+                group_id,
+                "Group Post-Wait must be between 00:00.00 and 60:00.00".to_string(),
+            ));
+        }
+        if !fade_in_secs.is_finite()
+            || *fade_in_secs < 0.0
+            || !fade_out_secs.is_finite()
+            || *fade_out_secs < 0.0
+        {
+            errors.push((group_id, "Group fade settings are invalid".to_string()));
+        }
+        if !recursion_stack.insert(group_id) {
+            errors.push((group_id, "Circular group reference detected".to_string()));
+            return;
+        }
+        if children.is_empty() {
+            errors.push((group_id, "Group contains no Cue events".to_string()));
+        }
+
+        for child_id in children {
+            let Some(child) = self.cue_list.find(*child_id) else {
+                errors.push((group_id, format!("Group references missing Cue {child_id}")));
+                continue;
+            };
+            if matches!(&child.cue_type, CueType::Comment { .. }) {
+                continue;
+            }
+            let child_is_timeline_group = matches!(
+                &child.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            );
+            if *mode != GroupMode::Timeline
+                && !child_is_timeline_group
+                && (!child.post_wait_secs.is_finite()
+                    || child.post_wait_secs < 0.0
+                    || child.post_wait_secs > 3600.0)
+            {
+                errors.push((
+                    child.id,
+                    "Post-Wait must be between 00:00.00 and 60:00.00".to_string(),
+                ));
+            }
+            for reason in self.preflight_cue_issues(child) {
+                errors.push((child.id, reason));
+            }
+            if matches!(&child.cue_type, CueType::Group { .. }) {
+                self.collect_group_preflight_errors(child.id, recursion_stack, errors);
+            }
+        }
+        recursion_stack.remove(&group_id);
+    }
+
+    fn preflight_cue_issues(&self, cue: &Cue) -> Vec<String> {
+        let mut issues = Vec::new();
+        if !cue.pre_wait_secs.is_finite() || cue.pre_wait_secs < 0.0 || cue.pre_wait_secs > 3600.0 {
+            issues.push("Pre-Wait must be between 00:00.00 and 60:00.00".to_string());
+        }
+        match &cue.cue_type {
+            CueType::Audio => {
+                if cue.file_path.as_os_str().is_empty() || !cue.file_path.is_file() {
+                    issues.push(format!(
+                        "Audio file is missing: {}",
+                        cue.file_path.display()
+                    ));
+                }
+                if let Some(reason) = self.cue_output_issue_for_table(cue) {
+                    issues.push(format!("Audio routing: {reason}"));
+                }
+            }
+            CueType::Play { target_id } => {
+                if let Some(target_id) = target_id {
+                    if let Some(target) = self.cue_list.find(*target_id) {
+                        if cue_owns_audio_stream(target) {
+                            if target.file_path.as_os_str().is_empty()
+                                || !target.file_path.is_file()
+                            {
+                                issues.push(format!(
+                                    "Play target audio file is missing: {}",
+                                    target.file_path.display()
+                                ));
+                            }
+                            if let Some(reason) = self.cue_output_issue_for_table(target) {
+                                issues.push(format!("Play target routing: {reason}"));
+                            }
+                        }
+                    } else {
+                        issues.push(format!("Play target Cue {target_id} does not exist"));
+                    }
+                } else {
+                    if cue.file_path.as_os_str().is_empty() || !cue.file_path.is_file() {
+                        issues.push(format!(
+                            "Play Cue audio file is missing: {}",
+                            cue.file_path.display()
+                        ));
+                    }
+                    if let Some(reason) = self.cue_output_issue_for_table(cue) {
+                        issues.push(format!("Audio routing: {reason}"));
+                    }
+                }
+            }
+            CueType::Midi {
+                channel,
+                message,
+                raw_hex,
+            } => {
+                if self.midi_out.current_port.is_none() {
+                    issues.push(MIDI_OUTPUT_DISCONNECTED_REASON.to_string());
+                }
+                if !(1..=16).contains(channel) {
+                    issues.push(format!(
+                        "MIDI channel {channel} is outside the valid 1–16 range"
+                    ));
+                }
+                let is_raw = matches!(message, MidiMessageKind::Raw(_));
+                let raw_tokens: Vec<&str> = raw_hex
+                    .split(|character: char| {
+                        character.is_whitespace() || character == ',' || character == ';'
+                    })
+                    .filter(|token| !token.is_empty())
+                    .collect();
+                let invalid_raw_token = is_raw
+                    && !raw_tokens.is_empty()
+                    && raw_tokens.iter().any(|token| {
+                        let clean = token
+                            .strip_prefix("0x")
+                            .or_else(|| token.strip_prefix("0X"))
+                            .unwrap_or(token);
+                        u8::from_str_radix(clean, 16).is_err()
+                    });
+                let midi_bytes = if is_raw && !raw_hex.trim().is_empty() {
+                    MidiMessageKind::parse_hex(raw_hex)
+                } else {
+                    message.to_bytes(*channel)
+                };
+                if midi_bytes.is_empty() || invalid_raw_token {
+                    issues.push(
+                        "MIDI message contains no valid bytes or has invalid hexadecimal tokens"
+                            .to_string(),
+                    );
+                }
+            }
+            CueType::Osc { address, .. } => {
+                if !address.starts_with('/') {
+                    issues.push(format!("OSC address '{}' must start with '/'", address));
+                }
+                if self.osc.is_none() {
+                    issues
+                        .push("OSC server is unavailable or could not be initialized".to_string());
+                }
+            }
+            CueType::Pause { target_id } | CueType::Stop { target_id } => {
+                if target_id
+                    .as_ref()
+                    .is_some_and(|target_id| self.cue_list.find(*target_id).is_none())
+                {
+                    issues.push("Target Cue does not exist".to_string());
+                }
+            }
+            CueType::Fade {
+                target_id,
+                duration_secs,
+                ..
+            } => {
+                if !duration_secs.is_finite() || *duration_secs < 0.0 {
+                    issues.push("Fade duration is invalid".to_string());
+                }
+                if let Some(target_id) = target_id {
+                    if let Some(target) = self.cue_list.find(*target_id) {
+                        if cue_owns_audio_stream(target)
+                            && (target.file_path.as_os_str().is_empty()
+                                || !target.file_path.is_file())
+                        {
+                            issues.push(format!(
+                                "Fade target audio file is missing: {}",
+                                target.file_path.display()
+                            ));
+                        }
+                        if let Some(reason) = self.cue_output_issue_for_table(target) {
+                            issues.push(format!("Fade target routing: {reason}"));
+                        }
+                    } else {
+                        issues.push(format!("Fade target Cue {target_id} does not exist"));
+                    }
+                }
+            }
+            CueType::Group { .. } | CueType::Comment { .. } => {}
+        }
+        issues
+    }
+
+    fn expand_group_path_to_cue(&mut self, root_id: Uuid, target_id: Uuid) {
+        fn find_path(
+            cues: &[Cue],
+            current_id: Uuid,
+            target_id: Uuid,
+            visited: &mut HashSet<Uuid>,
+            path: &mut Vec<Uuid>,
+        ) -> bool {
+            if current_id == target_id {
+                return true;
+            }
+            if !visited.insert(current_id) {
+                return false;
+            }
+            let Some(cue) = cues.iter().find(|cue| cue.id == current_id) else {
+                return false;
+            };
+            if let CueType::Group { children, .. } = &cue.cue_type {
+                for child_id in children {
+                    path.push(current_id);
+                    if find_path(cues, *child_id, target_id, visited, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+            }
+            false
+        }
+
+        let mut path = Vec::new();
+        let mut visited = HashSet::new();
+        if find_path(
+            &self.cue_list.cues,
+            root_id,
+            target_id,
+            &mut visited,
+            &mut path,
+        ) {
+            self.expanded_groups.extend(path);
+        }
+        self.expanded_groups.insert(root_id);
     }
 
     fn trigger_cue_inner(&mut self, id: Uuid) {
@@ -1247,7 +2198,14 @@ impl TheatreShowCueApp {
             cue.pre_wait_secs,
             cue.post_wait_secs
         );
-        let pre_wait = if honor_pre_wait {
+        let is_timeline_group = matches!(
+            &cue.cue_type,
+            CueType::Group {
+                mode: GroupMode::Timeline,
+                ..
+            }
+        );
+        let pre_wait = if honor_pre_wait && !is_timeline_group {
             cue.pre_wait_secs.max(0.0)
         } else {
             0.0
@@ -1257,11 +2215,12 @@ impl TheatreShowCueApp {
         let is_group_run = matches!(
             &cue.cue_type,
             CueType::Group {
-                mode: GroupMode::Playlist | GroupMode::AllCues,
+                mode: GroupMode::Playlist | GroupMode::AllCues | GroupMode::Timeline,
                 ..
             }
         );
-        let is_managed_child = self.is_managed_group_child(id);
+        let is_managed_child =
+            self.is_managed_group_child(id) || self.normal_group_boundary_owns_continuation(id);
         let cue_name = cue.name.clone();
 
         if pre_wait > 0.0 {
@@ -1285,10 +2244,17 @@ impl TheatreShowCueApp {
             self.execute_cue_now(id);
         }
 
-        // Auto-Continue keeps its time-based behaviour in Normal mode. Playlist
-        // and All Cues own their child order, so their children cannot schedule
-        // a second, competing continuation chain.
-        if continue_mode == ContinueMode::AutoContinue && !is_managed_child && !is_group_run {
+        // Managed group *children* do not dispatch their own continuation;
+        // their parent controls the playback order. A managed Group itself
+        // participates in the parent sequence and may Auto-Continue as soon
+        // as the group starts (after its own Pre-Wait, if any).
+        let continuation_suppressed = self.continuation_suppressed_once.contains(&id);
+        if should_schedule_auto_continue(
+            &continue_mode,
+            continuation_suppressed,
+            is_managed_child,
+            is_group_run,
+        ) {
             if let Some(next_id) = self.next_auto_cue_id(id) {
                 let fade_target_is_next = self.fade_target_is_next_or_container(id, next_id);
                 if fade_target_is_next {
@@ -1297,8 +2263,10 @@ impl TheatreShowCueApp {
                     return;
                 }
                 let now = trigger_started_at;
-                let delay = pre_wait + post_wait;
-                if post_wait > 0.0 {
+                // Starting a managed group is the trigger boundary: its own
+                // Post-Wait belongs to the completion path, not Auto-Continue.
+                let delay = auto_continue_delay(pre_wait, post_wait, is_group_run);
+                if post_wait > 0.0 && !is_group_run {
                     self.pending_triggers.push(PendingTrigger {
                         cue_id: id,
                         source_cue_id: Some(id),
@@ -1337,6 +2305,10 @@ impl TheatreShowCueApp {
                 .active_all_cues
                 .iter()
                 .any(|run| run.remaining.contains(&cue_id))
+            || self
+                .active_timelines
+                .iter()
+                .any(|run| run.remaining.contains(&cue_id))
     }
 
     /// Schedule Cue completion after any post-wait owned by completion.
@@ -1359,7 +2331,7 @@ impl TheatreShowCueApp {
                     matches!(
                         &cue.cue_type,
                         CueType::Group {
-                            mode: GroupMode::Playlist | GroupMode::AllCues,
+                            mode: GroupMode::Playlist | GroupMode::AllCues | GroupMode::Timeline,
                             ..
                         }
                     ),
@@ -1373,7 +2345,25 @@ impl TheatreShowCueApp {
         let is_all_cues_child = self
             .active_all_cues
             .iter()
-            .any(|run| run.remaining.contains(&cue_id));
+            .any(|run| run.remaining.contains(&cue_id))
+            || self
+                .active_timelines
+                .iter()
+                .any(|run| run.remaining.contains(&cue_id));
+        let is_timeline_cue = self
+            .active_timelines
+            .iter()
+            .any(|run| run.remaining.contains(&cue_id))
+            || self.cue_list.find(cue_id).is_some_and(|cue| {
+                matches!(
+                    &cue.cue_type,
+                    CueType::Group {
+                        mode: GroupMode::Timeline,
+                        ..
+                    }
+                )
+            });
+        let post_wait = if is_timeline_cue { 0.0 } else { post_wait };
         let completion_owns_wait = completion_owns_post_wait(
             &continue_mode,
             is_playlist_child,
@@ -1386,16 +2376,23 @@ impl TheatreShowCueApp {
         // Auto-Continue can already be counting the cue's post-wait while an
         // audio cue is still playing. If playback ends during that countdown,
         // reuse the remaining time instead of restarting the post-wait clock.
-        let existing_post_wait_remaining = self.cue_list.find(cue_id).and_then(|cue| {
-            if cue.wait_phase != WaitPhase::Post {
-                return None;
-            }
-            let started_at = cue.wait_started_at?;
-            if now < started_at {
-                return None;
-            }
-            Some((cue.wait_duration_secs - now.duration_since(started_at).as_secs_f64()).max(0.0))
-        });
+        let existing_post_wait_remaining = if is_timeline_cue {
+            None
+        } else {
+            self.cue_list.find(cue_id).and_then(|cue| {
+                if cue.wait_phase != WaitPhase::Post {
+                    return None;
+                }
+                let started_at = cue.wait_started_at?;
+                if now < started_at {
+                    return None;
+                }
+                Some(
+                    (cue.wait_duration_secs - now.duration_since(started_at).as_secs_f64())
+                        .max(0.0),
+                )
+            })
+        };
 
         if completion_owns_wait && existing_post_wait_remaining.is_none() && post_wait > 0.0 {
             if let Some(cue) = self.cue_list.find_mut(cue_id) {
@@ -1460,6 +2457,20 @@ impl TheatreShowCueApp {
     /// Playlist advances one child; All Cues waits for every child; Normal
     /// follows the cue's Auto-Follow setting.
     fn complete_cue(&mut self, cue_id: Uuid) {
+        let normal_group_boundary_owns_continuation =
+            self.normal_group_boundary_owns_continuation(cue_id);
+        let normal_group_parent_to_complete = self.active_normal_group_ending_at_child(cue_id);
+        if self.cue_list.find(cue_id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Normal,
+                    ..
+                }
+            )
+        }) {
+            self.active_normal_groups.remove(&cue_id);
+        }
         if let Some(go_origin) = self.cue_go_origins.remove(&cue_id) {
             if self.launch_transaction_depth > 0 {
                 self.launch_transaction_go_received_at
@@ -1469,6 +2480,7 @@ impl TheatreShowCueApp {
             }
         }
         let suppress_target_continue = self.fade_managed_targets.remove(&cue_id);
+        let suppress_automatic_continue = self.continuation_suppressed_once.remove(&cue_id);
         let fade_target_id = self.cue_list.find(cue_id).and_then(|cue| {
             if let CueType::Fade { target_id, .. } = &cue.cue_type {
                 *target_id
@@ -1540,9 +2552,42 @@ impl TheatreShowCueApp {
             return;
         }
 
+        if let Some(run_pos) = self
+            .active_timelines
+            .iter()
+            .position(|run| run.remaining.contains(&cue_id))
+        {
+            let (group_id, finished) = {
+                let run = &mut self.active_timelines[run_pos];
+                run.remaining.remove(&cue_id);
+                run.pending.retain(|pending| pending.cue_id != cue_id);
+                (run.group_id, run.remaining.is_empty())
+            };
+            if finished {
+                self.active_timelines.remove(run_pos);
+                self.status_msg = "Timeline finished".to_string();
+                self.schedule_cue_completion(group_id, 0.0);
+            }
+            return;
+        }
+
+        if let Some(group_id) = normal_group_parent_to_complete {
+            info!(
+                "NORMAL_GROUP_CHILDREN_COMPLETED: group_id={}, final_child_id={}",
+                group_id, cue_id
+            );
+            self.schedule_cue_completion(group_id, 0.0);
+            if normal_group_boundary_owns_continuation {
+                // The parent Group's Continue setting owns the transition
+                // outside its boundary; do not also run the final child's chain.
+                return;
+            }
+        }
+
         // The Fade cue owns continuation when it directly started or stopped
-        // this target. Do not let the target fire a second automatic chain.
-        if suppress_target_continue {
+        // this target. Resume Selected also suppresses this Cue's configured
+        // Auto-Continue/Auto-Follow for exactly one playback instance.
+        if suppress_target_continue || suppress_automatic_continue {
             return;
         }
 
@@ -1550,15 +2595,26 @@ impl TheatreShowCueApp {
             return;
         };
         let continue_mode = cue.continue_mode.clone();
-        let is_managed_group_mode = matches!(
+        let is_timeline_group = matches!(
             &cue.cue_type,
             CueType::Group {
-                mode: GroupMode::Playlist | GroupMode::AllCues,
+                mode: GroupMode::Timeline,
                 ..
             }
         );
-        let should_follow = continue_mode == ContinueMode::AutoFollow
-            || (is_managed_group_mode && continue_mode == ContinueMode::AutoContinue);
+        let is_managed_group_mode = matches!(
+            &cue.cue_type,
+            CueType::Group {
+                mode: GroupMode::Playlist | GroupMode::AllCues | GroupMode::Timeline,
+                ..
+            }
+        );
+        let should_follow = should_auto_follow_after_completion(
+            &continue_mode,
+            suppress_automatic_continue,
+            is_timeline_group,
+            is_managed_group_mode,
+        );
 
         if should_follow {
             if let Some(next_id) = self.next_auto_cue_id(cue_id) {
@@ -1567,7 +2623,14 @@ impl TheatreShowCueApp {
                     // by this Fade. Do not restart it or jump over its Continue=Nothing.
                     return;
                 }
-                self.trigger_cue(next_id);
+                let next_state = self.cue_list.find(next_id).map(|next| next.state.clone());
+                if next_state == Some(CueState::Paused) {
+                    if self.resume_paused_cue_for_auto_chain(next_id) {
+                        self.restore_auto_continue_after_resume(next_id);
+                    }
+                } else {
+                    self.trigger_cue(next_id);
+                }
             }
         }
     }
@@ -1890,7 +2953,7 @@ impl TheatreShowCueApp {
                 (target_volume, duration, curve, points)
             }
             None => (
-                snapshot.volume * self.master_vol,
+                snapshot.volume * master_volume_linear_gain(self.master_vol),
                 snapshot.fade_in_secs,
                 snapshot.fade_curve,
                 snapshot.custom_fade_points.clone(),
@@ -2118,7 +3181,9 @@ impl TheatreShowCueApp {
                         .is_some_and(|source_id| descendants.contains(&source_id))
             });
             let has_group_run = self.active_playlists.iter().any(|run| run.group_id == id)
-                || self.active_all_cues.iter().any(|run| run.group_id == id);
+                || self.active_all_cues.iter().any(|run| run.group_id == id)
+                || self.active_timelines.iter().any(|run| run.group_id == id)
+                || self.active_normal_groups.contains(&id);
             if has_active_child || has_pending_child || has_group_run {
                 // Re-triggering a group starts a clean run from its first child.
                 self.stop_target_and_descendants(id);
@@ -2209,7 +3274,7 @@ impl TheatreShowCueApp {
                         start_secs: Self::cue_play_start_position(&cue_snapshot),
                         end_secs: cue_snapshot.end_secs,
                         duration_secs: cue_snapshot.duration_secs,
-                        volume: cue_snapshot.volume * self.master_vol,
+                        volume: cue_snapshot.volume * master_volume_linear_gain(self.master_vol),
                         volume_automation_enabled: cue_snapshot.volume_automation_enabled,
                         volume_automation: cue_snapshot.volume_automation.clone(),
                         time_pitch: cue_snapshot.time_pitch.clone(),
@@ -2344,7 +3409,7 @@ impl TheatreShowCueApp {
                         } else {
                             0.0
                         }
-                    }) * self.master_vol;
+                    }) * master_volume_linear_gain(self.master_vol);
 
                     let stopped = matches!(&target.state, CueState::Stopped | CueState::Error(_));
                     let paused = target.state == CueState::Paused;
@@ -2471,26 +3536,38 @@ impl TheatreShowCueApp {
             } => {
                 match mode {
                     GroupMode::Normal => {
-                        if let Some(first_id) = children.iter().copied().find(|child_id| {
+                        let first_id = children.iter().copied().find(|child_id| {
                             self.cue_list.find(*child_id).is_some()
                                 && !self.is_comment_cue(*child_id)
-                        }) {
+                        });
+                        if let Some(first_id) = first_id {
+                            self.active_normal_groups.insert(id);
+                            info!(
+                                "NORMAL_GROUP_STARTED: group_id={}, children={}",
+                                id,
+                                children
+                                    .iter()
+                                    .filter(|child_id| {
+                                        self.cue_list.find(**child_id).is_some()
+                                            && !self.is_comment_cue(**child_id)
+                                    })
+                                    .count()
+                            );
                             if let Some((groups_to_expand, next_manual_id)) =
                                 self.normal_group_next_manual_cue(id, &mut HashSet::new())
                             {
                                 for group_id in groups_to_expand {
                                     self.expanded_groups.insert(group_id);
                                 }
-                                // Select the next Cue that requires manual GO. The Cue
-                                // with Continue=Nothing has already been started by the
-                                // group or reached automatically from its predecessor.
+                                // Select the next child that still requires manual GO.
                                 self.select_only(next_manual_id);
                                 self.status_msg = "📁 Group: automatic chain stops here; remaining cues need manual GO".to_string();
                             } else {
-                                // The automatic chain reaches the end of this group. Do not
-                                // auto-expand it; move the operator cursor to the next root/parent item.
+                                // All playable children are reached automatically.
+                                // Include the Group's own Continue chain when choosing
+                                // the next manual Cue outside the container.
                                 self.expanded_groups.remove(&id);
-                                if let Some(next_id) = self.next_after_container(id) {
+                                if let Some(next_id) = self.next_manual_after_managed_group(id) {
                                     self.select_only(next_id);
                                 } else {
                                     self.select_only(id);
@@ -2501,9 +3578,10 @@ impl TheatreShowCueApp {
                             }
                             self.trigger_cue(first_id);
                         } else {
+                            self.active_normal_groups.remove(&id);
                             self.status_msg = "📁 Group is empty".to_string();
+                            self.schedule_cue_completion(id, 0.0);
                         }
-                        self.schedule_cue_completion(id, 0.0);
                     }
                     GroupMode::Playlist => {
                         let playable_children: Vec<Uuid> = children
@@ -2566,6 +3644,91 @@ impl TheatreShowCueApp {
                             self.status_msg =
                                 format!("📁 All Cues: starting {} events", valid_children.len());
                             self.advance_all_cues(id);
+                        }
+                    }
+                    GroupMode::Timeline => {
+                        let valid_children: Vec<Uuid> = children
+                            .into_iter()
+                            .filter(|child_id| {
+                                self.cue_list.find(*child_id).is_some()
+                                    && !self.is_comment_cue(*child_id)
+                            })
+                            .collect();
+                        if valid_children.is_empty() {
+                            self.status_msg = "Timeline group is empty".to_string();
+                            self.schedule_cue_completion(id, 0.0);
+                        } else {
+                            // This is the actual GO/start instant for this Timeline
+                            // group. If it is auto-triggered by another Cue, its own
+                            // schedule must not inherit that earlier Cue's GO origin.
+                            let go_origin = Instant::now();
+                            let now = go_origin;
+                            let schedule = build_timeline_schedule(&self.cue_list, &valid_children);
+                            let mut pending = Vec::new();
+                            let mut immediate = Vec::new();
+
+                            for (child_id, offset_secs) in schedule {
+                                let fire_at =
+                                    go_origin + Duration::from_secs_f64(offset_secs.max(0.0));
+                                if fire_at <= now {
+                                    immediate.push(child_id);
+                                } else {
+                                    pending.push(PendingTimelineCue {
+                                        cue_id: child_id,
+                                        fire_at,
+                                    });
+                                    if let Some(child) = self.cue_list.find_mut(child_id) {
+                                        child.state = CueState::Waiting;
+                                        child.position_secs = 0.0;
+                                        child.wait_phase = WaitPhase::Pre;
+                                        child.wait_started_at = Some(go_origin);
+                                        child.wait_duration_secs = offset_secs.max(0.0);
+                                    }
+                                }
+                            }
+
+                            self.active_timelines.retain(|run| run.group_id != id);
+                            self.active_timelines.push(ActiveTimeline {
+                                group_id: id,
+                                pending,
+                                remaining: valid_children.iter().copied().collect(),
+                                started_at: go_origin,
+                                paused_at: None,
+                                fade_in_secs,
+                                fade_out_secs,
+                            });
+                            if let Some(group) = self.cue_list.find_mut(id) {
+                                group.state = CueState::Playing;
+                            }
+                            self.timeline_view_group = Some(id);
+                            self.expanded_groups.remove(&id);
+
+                            info!(
+                                "TIMELINE_STARTED: group_id={}, children={}, immediate={}, delayed={}, go_origin_elapsed_ms={}",
+                                id,
+                                valid_children.len(),
+                                immediate.len(),
+                                self.active_timelines
+                                    .iter()
+                                    .find(|run| run.group_id == id)
+                                    .map(|run| run.pending.len())
+                                    .unwrap_or(0),
+                                now.saturating_duration_since(go_origin).as_millis()
+                            );
+                            self.status_msg = format!(
+                                "Timeline: scheduled {} events from group GO",
+                                valid_children.len()
+                            );
+
+                            // All events due at GO share the current launch transaction.
+                            for child_id in immediate {
+                                if !self.active_timelines.iter().any(|run| run.group_id == id) {
+                                    break;
+                                }
+                                self.apply_group_fades(child_id, fade_in_secs, fade_out_secs);
+                                self.trigger_cue_inner_with_pre_wait(child_id, false);
+                                self.finish_failed_timeline_start(child_id);
+                            }
                         }
                     }
                 }
@@ -2841,6 +4004,44 @@ impl TheatreShowCueApp {
         })
     }
 
+    /// Return the active Normal Group whose final playable direct child just
+    /// completed. Nested Normal Groups bubble completion one level at a time.
+    fn active_normal_group_ending_at_child(&self, child_id: Uuid) -> Option<Uuid> {
+        let parent_id = self.parent_group_of(child_id)?;
+        self.active_normal_groups
+            .contains(&parent_id)
+            .then_some(parent_id)
+            .filter(|group_id| {
+                normal_group_last_playable_child_in(&self.cue_list.cues, *group_id)
+                    == Some(child_id)
+            })
+    }
+
+    /// True when an active Normal Group with Auto-Continue / Auto-Follow owns
+    /// the transition beyond this Cue. This prevents the final child from
+    /// launching the same parent-level successor independently.
+    fn normal_group_boundary_owns_continuation(&self, cue_id: Uuid) -> bool {
+        let mut descendant_id = cue_id;
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = self.parent_group_of(descendant_id) {
+            if !visited.insert(parent_id) {
+                return false;
+            }
+            if self.active_normal_groups.contains(&parent_id)
+                && normal_group_last_playable_child_in(&self.cue_list.cues, parent_id)
+                    == Some(descendant_id)
+                && self
+                    .cue_list
+                    .find(parent_id)
+                    .is_some_and(|group| group.continue_mode != ContinueMode::Nothing)
+            {
+                return true;
+            }
+            descendant_id = parent_id;
+        }
+        false
+    }
+
     fn group_descendant_ids(&self, root_id: Uuid) -> Vec<Uuid> {
         let mut result = Vec::new();
         let mut stack = vec![root_id];
@@ -2857,6 +4058,42 @@ impl TheatreShowCueApp {
             }
         }
         result
+    }
+
+    /// Return the Timeline group that currently owns the editor context.
+    /// A Cue selected inside the Timeline keeps that group context so the
+    /// operator can edit child events without the Timeline tab disappearing.
+    fn timeline_context_group(&self) -> Option<Uuid> {
+        let selected_id = self.selected?;
+        if self.cue_list.find(selected_id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            )
+        }) {
+            return Some(selected_id);
+        }
+
+        let group_id = self.timeline_view_group?;
+        let is_timeline_group = self.cue_list.find(group_id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            )
+        });
+        if !is_timeline_group {
+            return None;
+        }
+
+        self.group_descendant_ids(group_id)
+            .contains(&selected_id)
+            .then_some(group_id)
     }
 
     fn audio_targets_in(&self, target_id: Uuid) -> Vec<Uuid> {
@@ -2925,6 +4162,10 @@ impl TheatreShowCueApp {
             .retain(|run| !affected.contains(&run.group_id));
         self.active_all_cues
             .retain(|run| !affected.contains(&run.group_id));
+        self.active_timelines
+            .retain(|run| !affected.contains(&run.group_id));
+        self.active_normal_groups
+            .retain(|group_id| !affected.contains(group_id));
         let audio_ids = self.audio_targets_in(target_id);
         for id in &affected {
             self.bump_audio_generation(*id);
@@ -2940,7 +4181,7 @@ impl TheatreShowCueApp {
             }
         }
         for id in audio_ids {
-            self.audio.send(AudioCommand::Stop(id));
+            self.send_timed_stop(id, "cue_tree");
         }
     }
 
@@ -3199,44 +4440,7 @@ impl TheatreShowCueApp {
     /// group is nested, continue after it in its parent; otherwise use the next
     /// root-level item. A visited set protects against malformed cyclic groups.
     fn next_after_container(&self, container_id: Uuid) -> Option<Uuid> {
-        let mut current_container = container_id;
-        let mut visited = HashSet::new();
-
-        loop {
-            if !visited.insert(current_container) {
-                return None;
-            }
-
-            if let Some(parent_id) = self.parent_group_of(current_container) {
-                if let Some(next_sibling) = self.next_group_sibling(parent_id, current_container) {
-                    return Some(next_sibling);
-                }
-                current_container = parent_id;
-                continue;
-            }
-
-            let child_ids: HashSet<Uuid> = self
-                .cue_list
-                .cues
-                .iter()
-                .filter_map(|cue| match &cue.cue_type {
-                    CueType::Group { children, .. } => Some(children.iter().copied()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            let root_ids: Vec<Uuid> = self
-                .cue_list
-                .cues
-                .iter()
-                .filter(|cue| !child_ids.contains(&cue.id))
-                .map(|cue| cue.id)
-                .collect();
-            let position = root_ids
-                .iter()
-                .position(|cue_id| *cue_id == current_container)?;
-            return root_ids.get(position + 1).copied();
-        }
+        next_after_container_in(&self.cue_list.cues, container_id)
     }
 
     fn begin_auto_continue_post_wait(&mut self, cue_id: Uuid) {
@@ -3266,6 +4470,88 @@ impl TheatreShowCueApp {
                 cue.state = CueState::Stopped;
                 cue.position_secs = 0.0;
             }
+        }
+    }
+
+    fn poll_timeline(&mut self) {
+        let now = Instant::now();
+        let mut due_runs = Vec::<(Uuid, Vec<Uuid>, f64, f64, Instant)>::new();
+
+        for run in &mut self.active_timelines {
+            if run.paused_at.is_some() {
+                continue;
+            }
+            let mut due = Vec::new();
+            run.pending.retain(|pending| {
+                if pending.fire_at <= now {
+                    due.push(pending.cue_id);
+                    false
+                } else {
+                    true
+                }
+            });
+            if !due.is_empty() {
+                due_runs.push((
+                    run.group_id,
+                    due,
+                    run.fade_in_secs,
+                    run.fade_out_secs,
+                    run.started_at,
+                ));
+            }
+        }
+
+        for (group_id, due_cues, fade_in_secs, fade_out_secs, go_origin) in due_runs {
+            let due_count = due_cues.len();
+            self.pending_go_received_at = Some(go_origin);
+            self.begin_launch_transaction();
+            for cue_id in due_cues {
+                if !self
+                    .active_timelines
+                    .iter()
+                    .any(|run| run.group_id == group_id)
+                {
+                    break;
+                }
+                let should_start = self
+                    .cue_list
+                    .find(cue_id)
+                    .is_some_and(|cue| cue.state == CueState::Waiting);
+                if should_start {
+                    self.apply_group_fades(cue_id, fade_in_secs, fade_out_secs);
+                    self.trigger_cue_inner_with_pre_wait(cue_id, false);
+                    self.finish_failed_timeline_start(cue_id);
+                } else {
+                    // A scheduled Cue cancelled before its absolute start is
+                    // treated as completed, so the Timeline cannot hang forever.
+                    self.schedule_cue_completion(cue_id, 0.0);
+                }
+            }
+            self.end_launch_transaction();
+            info!(
+                "TIMELINE_DUE_BATCH: group_id={}, due_cues={}, elapsed_since_go_ms={}",
+                group_id,
+                due_count,
+                self.active_timelines
+                    .iter()
+                    .find(|run| run.group_id == group_id)
+                    .map(|run| now.saturating_duration_since(run.started_at).as_millis())
+                    .unwrap_or(0)
+            );
+        }
+    }
+
+    fn finish_failed_timeline_start(&mut self, cue_id: Uuid) {
+        let is_pending_member = self
+            .active_timelines
+            .iter()
+            .any(|run| run.remaining.contains(&cue_id));
+        let failed_to_start = self
+            .cue_list
+            .find(cue_id)
+            .is_some_and(|cue| matches!(&cue.state, CueState::Stopped | CueState::Error(_)));
+        if is_pending_member && failed_to_start {
+            self.schedule_cue_completion(cue_id, 0.0);
         }
     }
 
@@ -3322,7 +4608,14 @@ impl TheatreShowCueApp {
     fn process_pending_trigger(&mut self, trigger: PendingTrigger) {
         match trigger.action {
             PendingAction::ExecuteCue => self.execute_cue_now(trigger.cue_id),
-            PendingAction::TriggerCue => self.trigger_cue(trigger.cue_id),
+            PendingAction::TriggerCue => {
+                self.trigger_cue(trigger.cue_id);
+            }
+            PendingAction::ResumeCue => {
+                if self.resume_paused_cue_for_auto_chain(trigger.cue_id) {
+                    self.restore_auto_continue_after_resume(trigger.cue_id);
+                }
+            }
             PendingAction::BeginPostWait => self.begin_auto_continue_post_wait(trigger.cue_id),
             PendingAction::ClearWait => self.clear_cue_wait(trigger.cue_id),
             PendingAction::CompleteCue => self.complete_cue(trigger.cue_id),
@@ -3389,12 +4682,60 @@ impl TheatreShowCueApp {
 
     // ── Transport actions ────────────────────────────────────────────────────
 
+    fn send_timed_stop(&self, cue_id: Uuid, scope: &str) {
+        let request_id = Uuid::new_v4();
+        let requested_at_unix_micros = unix_micros_now();
+        info!(
+            "STOP_LATENCY: request_id={}, cue_id={}, scope='{}', stage=gui_requested",
+            request_id, cue_id, scope
+        );
+        self.audio.send(AudioCommand::StopTimed {
+            id: cue_id,
+            request_id,
+            requested_at_unix_micros,
+        });
+    }
+
     fn stop_selected(&mut self) {
         let id = match self.selected {
             Some(id) => id,
             None => return,
         };
         if self.is_comment_cue(id) {
+            return;
+        }
+        let is_timeline_group = self.cue_list.find(id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            )
+        });
+        let is_normal_group = self.cue_list.find(id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Normal,
+                    ..
+                }
+            )
+        });
+        if is_timeline_group || is_normal_group {
+            self.stop_target_and_descendants(id);
+            if let Some(group) = self.cue_list.find_mut(id) {
+                group.state = CueState::Stopped;
+                group.position_secs = 0.0;
+                group.clear_wait_runtime();
+            }
+            if is_timeline_group {
+                self.status_msg = "⏹ Timeline stopped".to_string();
+                info!("TIMELINE_STOPPED: group_id={id}");
+            } else {
+                self.status_msg = "⏹ Normal Group stopped".to_string();
+                info!("NORMAL_GROUP_STOPPED: group_id={id}");
+            }
             return;
         }
         if let Some(cue) = self.cue_list.find(id) {
@@ -3406,6 +4747,7 @@ impl TheatreShowCueApp {
         self.clear_fade_managed_targets_for_cue(id);
         self.fade_started_at.remove(&id);
         self.fade_managed_targets.remove(&id);
+        self.continuation_suppressed_once.remove(&id);
         self.pending_triggers
             .retain(|trigger| trigger.cue_id != id && trigger.source_cue_id != Some(id));
         self.bump_audio_generation(id);
@@ -3420,7 +4762,7 @@ impl TheatreShowCueApp {
             cue.position_secs = 0.0;
             cue.clear_wait_runtime();
         }
-        self.audio.send(AudioCommand::Stop(id));
+        self.send_timed_stop(id, "selected_cue");
         if self.is_managed_group_child(id) {
             self.schedule_cue_completion(id, 0.0);
         } else {
@@ -3439,8 +4781,11 @@ impl TheatreShowCueApp {
         self.immediate_playlist_advances.clear();
         self.active_playlists.clear();
         self.active_all_cues.clear();
+        self.active_timelines.clear();
+        self.active_normal_groups.clear();
         self.fade_started_at.clear();
         self.fade_managed_targets.clear();
+        self.continuation_suppressed_once.clear();
         self.cue_go_origins.clear();
         let fade_secs = self.settings.stop_all_fade_secs.max(0.0);
         if fade_secs > 0.0 {
@@ -3492,7 +4837,16 @@ impl TheatreShowCueApp {
                 self.bump_audio_generation(id);
             }
             self.cue_list.stop_all();
-            self.audio.send(AudioCommand::StopAll);
+            let request_id = Uuid::new_v4();
+            let requested_at_unix_micros = unix_micros_now();
+            info!(
+                "STOP_LATENCY: request_id={}, scope=all, stage=gui_requested",
+                request_id
+            );
+            self.audio.send(AudioCommand::StopAllTimed {
+                request_id,
+                requested_at_unix_micros,
+            });
             self.status_msg = "⏹ All stopped".to_string();
         }
     }
@@ -3505,6 +4859,19 @@ impl TheatreShowCueApp {
         if self.is_comment_cue(id) {
             return;
         }
+        let is_timeline_group = self.cue_list.find(id).is_some_and(|cue| {
+            matches!(
+                &cue.cue_type,
+                CueType::Group {
+                    mode: GroupMode::Timeline,
+                    ..
+                }
+            )
+        });
+        if is_timeline_group {
+            self.pause_timeline_group(id);
+            return;
+        }
         let is_waiting = self
             .cue_list
             .find(id)
@@ -3513,6 +4880,7 @@ impl TheatreShowCueApp {
         self.pending_triggers
             .retain(|trigger| trigger.cue_id != id && trigger.source_cue_id != Some(id));
         if is_waiting {
+            self.continuation_suppressed_once.remove(&id);
             if let Some(cue) = self.cue_list.find_mut(id) {
                 cue.state = CueState::Stopped;
                 cue.position_secs = 0.0;
@@ -3538,6 +4906,62 @@ impl TheatreShowCueApp {
         }
     }
 
+    fn pause_timeline_group(&mut self, group_id: Uuid) {
+        let now = Instant::now();
+        if let Some(run) = self
+            .active_timelines
+            .iter_mut()
+            .find(|run| run.group_id == group_id)
+        {
+            if run.paused_at.is_none() {
+                run.paused_at = Some(now);
+            }
+        }
+        let descendants = self.group_descendant_ids(group_id);
+        let descendant_set: HashSet<Uuid> = descendants.iter().copied().collect();
+        self.pending_triggers.retain(|trigger| {
+            !descendant_set.contains(&trigger.cue_id)
+                && !trigger
+                    .source_cue_id
+                    .is_some_and(|source_id| descendant_set.contains(&source_id))
+        });
+        for cue_id in descendants.into_iter().filter(|cue_id| *cue_id != group_id) {
+            let Some(snapshot) = self.cue_list.find(cue_id).cloned() else {
+                continue;
+            };
+            match &snapshot.state {
+                CueState::Waiting => {
+                    if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                        cue.state = CueState::Stopped;
+                        cue.position_secs = 0.0;
+                        cue.clear_wait_runtime();
+                    }
+                }
+                CueState::Playing | CueState::FadingIn | CueState::FadingOut => {
+                    if cue_owns_audio_stream(&snapshot) {
+                        self.audio.send(AudioCommand::Pause(cue_id));
+                    }
+                    if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                        cue.state = CueState::Paused;
+                        cue.clear_wait_runtime();
+                    }
+                    self.report.record(
+                        &snapshot.number,
+                        &snapshot.name,
+                        snapshot.position_secs,
+                        "Pause",
+                    );
+                }
+                _ => {}
+            }
+        }
+        if let Some(group) = self.cue_list.find_mut(group_id) {
+            group.state = CueState::Paused;
+        }
+        self.status_msg = "⏸ Timeline paused".to_string();
+        info!("TIMELINE_PAUSED: group_id={group_id}");
+    }
+
     fn pause_all(&mut self) {
         info!(
             "Pause all requested: active_cues={}",
@@ -3547,6 +4971,12 @@ impl TheatreShowCueApp {
                 .filter(|cue| cue.is_active())
                 .count()
         );
+        let pause_started_at = Instant::now();
+        for run in &mut self.active_timelines {
+            if run.paused_at.is_none() {
+                run.paused_at = Some(pause_started_at);
+            }
+        }
         let waiting_ids: HashSet<Uuid> = self
             .cue_list
             .cues
@@ -3568,12 +4998,18 @@ impl TheatreShowCueApp {
                     .is_some_and(|source_id| waiting_ids.contains(&source_id));
             let active_auto_chain = matches!(
                 trigger.action,
-                PendingAction::TriggerCue | PendingAction::BeginPostWait | PendingAction::ClearWait
+                PendingAction::TriggerCue
+                    | PendingAction::ResumeCue
+                    | PendingAction::BeginPostWait
+                    | PendingAction::ClearWait
             ) && trigger
                 .source_cue_id
                 .is_some_and(|source_id| active_ids.contains(&source_id));
             !waiting_target && !active_auto_chain
         });
+        for cue_id in &waiting_ids {
+            self.continuation_suppressed_once.remove(cue_id);
+        }
         for cue in &mut self.cue_list.cues {
             if waiting_ids.contains(&cue.id) {
                 cue.state = CueState::Stopped;
@@ -3596,45 +5032,62 @@ impl TheatreShowCueApp {
             }
             return;
         }
+
         let Some(snapshot) = self.cue_list.find(id).cloned() else {
             return;
         };
+        if matches!(&snapshot.cue_type, CueType::Group { .. }) {
+            self.status_msg =
+                "Resume Selected applies to one Cue; use GO to resume a Group.".to_string();
+            info!("RESUME_SELECTED_IGNORED_GROUP: group_id={id}");
+            return;
+        }
 
-        match snapshot.state {
-            CueState::Paused => {
-                info!(
-                    "Resume selected: id={}, number='{}', name='{}', position={:.3}s",
-                    snapshot.id, snapshot.number, snapshot.name, snapshot.position_secs
-                );
+        // Unlike GO, Resume Selected never resumes a Group, follows an
+        // automatic chain, or starts another Cue. The suppression is runtime-only
+        // and expires when this Cue completes or is stopped.
+        self.continuation_suppressed_once.insert(id);
+        self.pending_triggers
+            .retain(|trigger| trigger.cue_id != id && trigger.source_cue_id != Some(id));
+
+        if snapshot.state == CueState::Paused {
+            if cue_owns_audio_stream(&snapshot) {
                 self.audio.send(AudioCommand::Resume(id));
-                if let Some(cue) = self.cue_list.find_mut(id) {
-                    cue.state = CueState::Playing;
-                }
-                self.report.record(
-                    &snapshot.number,
-                    &snapshot.name,
-                    snapshot.position_secs,
-                    "Resume",
-                );
-                self.status_msg = format!("▶ Resumed: {}", snapshot.name);
             }
-            CueState::Stopped | CueState::Error(_) => {
-                // Resume Selected is also a convenient Play Selected command
-                // when the selected cue has not been started yet.
-                self.trigger_cue(id);
+            if let Some(cue) = self.cue_list.find_mut(id) {
+                cue.state = match &cue.cue_type {
+                    CueType::Fade { fade_in: true, .. } => CueState::FadingIn,
+                    CueType::Fade { fade_in: false, .. } => CueState::FadingOut,
+                    _ => CueState::Playing,
+                };
             }
-            CueState::Waiting
-            | CueState::Loading
-            | CueState::Playing
-            | CueState::FadingIn
-            | CueState::FadingOut => {
-                // Already scheduled or running: avoid restarting the cue.
-            }
+            self.report.record(
+                &snapshot.number,
+                &snapshot.name,
+                snapshot.position_secs,
+                "Resume",
+            );
+            self.status_msg = format!("▶ Resumed selected: {}", snapshot.name);
+            info!(
+                "RESUME_SELECTED_CUE: cue_id={}, number='{}', name='{}', position={:.3}s, automatic_continuation_suppressed=true",
+                snapshot.id, snapshot.number, snapshot.name, snapshot.position_secs
+            );
+        } else if !self.trigger_cue(id) {
+            self.continuation_suppressed_once.remove(&id);
         }
     }
 
     fn resume_all(&mut self) {
         info!("Resume all requested");
+        let timeline_ids: Vec<Uuid> = self
+            .active_timelines
+            .iter()
+            .filter(|run| run.paused_at.is_some())
+            .map(|run| run.group_id)
+            .collect();
+        for group_id in timeline_ids {
+            self.resume_timeline_scheduler(group_id);
+        }
         self.cue_list.resume_all();
         self.audio.send(AudioCommand::ResumeAll);
         self.status_msg = "▶ All resumed".to_string();
@@ -3642,13 +5095,27 @@ impl TheatreShowCueApp {
 
     // ── Создание и управление событиями ──────────────────────────────────────
 
+    fn record_native_dialog_duration(&mut self, kind: &'static str, started_at: Instant) {
+        let elapsed = started_at.elapsed();
+        self.native_dialog_elapsed_this_update = self
+            .native_dialog_elapsed_this_update
+            .saturating_add(elapsed);
+        info!(
+            "NATIVE_DIALOG_DURATION: kind={}, duration_ms={:.2}",
+            kind,
+            elapsed.as_secs_f64() * 1_000.0
+        );
+    }
+
     fn add_files(&mut self) {
+        let dialog_started_at = Instant::now();
         let files = FileDialog::new()
             .add_filter(
                 "Audio",
                 &["wav", "mp3", "flac", "ogg", "aiff", "aif", "m4a"],
             )
             .pick_files();
+        self.record_native_dialog_duration("audio_import", dialog_started_at);
 
         if let Some(paths) = files {
             for path in paths {
@@ -3658,44 +5125,56 @@ impl TheatreShowCueApp {
     }
 
     fn import_file(&mut self, path: PathBuf) {
-        let final_path = if self.project_path.is_some() && !self.project_needs_save_as {
-            self.assets
-                .import_file(&path)
-                .unwrap_or_else(|_| path.clone())
+        if !path.is_file() {
+            self.status_msg = format!("Audio file does not exist: {}", path.display());
+            return;
+        }
+
+        if self.pending_audio_imports == 0 {
+            self.audio_import_total = 0;
+            self.audio_import_completed = 0;
+            self.import_insertion_anchor = self.selected;
+        } else if self.import_insertion_anchor.is_none() {
+            self.import_insertion_anchor = self.selected;
+        }
+
+        let cue_id = Uuid::new_v4();
+        let project_path = if self.project_path.is_some() && !self.project_needs_save_as {
+            self.project_path.clone()
         } else {
-            path.clone()
+            None
         };
-
-        let analysis = analyze_audio_file(&final_path, WAVEFORM_BUCKETS);
-        let mut cue = Cue::new_audio(final_path.clone());
-        cue.audio_channels = analysis.channels;
-        if cue.audio_channels > 0 {
-            let default_route_channels = self
-                .audio
-                .default_route_channels_for_source(None, cue.audio_channels);
-            cue.io.ensure_channel_routes_with_defaults(
-                cue.audio_channels,
-                self.audio.output_channels,
-                &default_route_channels,
+        if !self.audio_import_manager.submit(
+            self.audio_import_generation,
+            cue_id,
+            AudioImportKind::Add,
+            path.clone(),
+            project_path,
+            WAVEFORM_BUCKETS,
+        ) {
+            self.status_msg = format!("Could not queue audio import: {}", path.display());
+            error!(
+                "Could not queue asynchronous audio import: {}",
+                path.display()
             );
+            return;
         }
-        let duration = analysis.duration_secs;
-        if duration > 0.0 {
-            cue.duration_secs = duration;
-            cue.loop_region.end_secs = duration;
-        }
-        cue.waveform = analysis.waveform.clone();
 
-        let name = cue.name.clone();
-        info!(
-            "Audio file imported: path='{}', channels={}, duration={:.3}s",
-            final_path.display(),
-            cue.audio_channels,
-            cue.duration_secs
+        self.pending_audio_imports = self.pending_audio_imports.saturating_add(1);
+        self.audio_import_total = self.audio_import_total.saturating_add(1);
+        self.status_msg = format!(
+            "Importing audio: {} ({}/{})",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("audio file"),
+            self.audio_import_completed,
+            self.audio_import_total
         );
-        let id = self.insert_cue_after_selected(cue);
-        self.select_only(id);
-        self.status_msg = format!("Added audio cue: {name}");
+        info!(
+            "Audio import queued: cue_id={}, path='{}'",
+            cue_id,
+            path.display()
+        );
     }
 
     /// Insert a newly-created cue immediately after the selected row in the
@@ -3855,6 +5334,8 @@ impl TheatreShowCueApp {
         self.active_playlists
             .retain(|run| run.group_id != id && !run.children.contains(&id));
         self.active_all_cues
+            .retain(|run| run.group_id != id && !run.remaining.contains(&id));
+        self.active_timelines
             .retain(|run| run.group_id != id && !run.remaining.contains(&id));
     }
 
@@ -4021,15 +5502,15 @@ impl TheatreShowCueApp {
             }
             EditField::PreWait => {
                 if let Some(cue) = self.cue_list.find_mut(id) {
-                    if let Ok(value) = new_val.trim().parse::<f64>() {
-                        cue.pre_wait_secs = value.max(0.0);
+                    if let Some(value) = crate::ui::cue_table::parse_timecode(&new_val) {
+                        cue.pre_wait_secs = value.clamp(0.0, 3600.0);
                     }
                 }
             }
             EditField::PostWait => {
                 if let Some(cue) = self.cue_list.find_mut(id) {
-                    if let Ok(value) = new_val.trim().parse::<f64>() {
-                        cue.post_wait_secs = value.max(0.0);
+                    if let Some(value) = crate::ui::cue_table::parse_timecode(&new_val) {
+                        cue.post_wait_secs = value.clamp(0.0, 3600.0);
                     }
                 }
             }
@@ -4084,6 +5565,15 @@ impl TheatreShowCueApp {
 
     fn request_application_close(&mut self, ctx: &Context) {
         if !ctx.input(|input| input.viewport().close_requested()) || self.close_allowed {
+            return;
+        }
+
+        if self.pending_audio_imports > 0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.status_msg = format!(
+                "Wait for {} audio import(s) to finish before closing TaSQ",
+                self.pending_audio_imports
+            );
             return;
         }
 
@@ -4187,6 +5677,13 @@ impl TheatreShowCueApp {
     }
 
     fn save_project(&mut self) -> bool {
+        if self.pending_audio_imports > 0 {
+            self.status_msg = format!(
+                "Wait for audio imports to finish ({}) before saving",
+                self.pending_audio_imports
+            );
+            return false;
+        }
         // Renaming an already-open project changes its in-memory identity only.
         // Ctrl+S must therefore create a new file instead of overwriting or
         // renaming the file that was originally opened.
@@ -4198,10 +5695,12 @@ impl TheatreShowCueApp {
 
         if self.project_path.is_none() {
             let default_name = format!("{}.tsq", self.project.settings.name);
+            let dialog_started_at = Instant::now();
             let path = FileDialog::new()
                 .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
                 .set_file_name(&default_name)
                 .save_file();
+            self.record_native_dialog_duration("save_project", dialog_started_at);
             match path {
                 Some(path) => {
                     let path = ensure_project_extension(path);
@@ -4269,13 +5768,22 @@ impl TheatreShowCueApp {
     /// Save the current project under a new filename. Media references are
     /// preserved; use Save as Bundle to copy media into a portable folder.
     fn save_as_project(&mut self) -> bool {
+        if self.pending_audio_imports > 0 {
+            self.status_msg = format!(
+                "Wait for audio imports to finish ({}) before Save As",
+                self.pending_audio_imports
+            );
+            return false;
+        }
         let default_name = format!("{}.tsq", self.project.settings.name);
 
-        let Some(path) = FileDialog::new()
+        let dialog_started_at = Instant::now();
+        let selected_path = FileDialog::new()
             .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
             .set_file_name(&default_name)
-            .save_file()
-        else {
+            .save_file();
+        self.record_native_dialog_duration("save_as_project", dialog_started_at);
+        let Some(path) = selected_path else {
             return false;
         };
         let path = ensure_project_extension(path);
@@ -4327,12 +5835,22 @@ impl TheatreShowCueApp {
     /// The user chooses a parent directory; TaSQ creates one self-contained
     /// project folder inside it instead of asking for a project-file path.
     fn save_as_bundle(&mut self) -> bool {
+        if self.pending_audio_imports > 0 {
+            self.status_msg = format!(
+                "Wait for audio imports to finish ({}) before Save as Bundle",
+                self.pending_audio_imports
+            );
+            return false;
+        }
         let Some(bundle_name) = sanitize_project_name(&self.project.settings.name) else {
             self.status_msg = "Project name cannot be used as a bundle folder name".to_string();
             return false;
         };
 
-        let Some(bundle_parent) = FileDialog::new().pick_folder() else {
+        let dialog_started_at = Instant::now();
+        let selected_bundle_parent = FileDialog::new().pick_folder();
+        self.record_native_dialog_duration("save_as_bundle_folder", dialog_started_at);
+        let Some(bundle_parent) = selected_bundle_parent else {
             return false;
         };
 
@@ -4720,7 +6238,9 @@ impl TheatreShowCueApp {
             self.waveform_total_cues = 0;
         }
 
-        if !self.waveform_pending_cues.is_empty() {
+        if self.pending_audio_imports > 0 {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        } else if !self.waveform_pending_cues.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
@@ -4779,13 +6299,10 @@ impl TheatreShowCueApp {
             self.status_msg = format!("Audio file does not exist: {}", source_path.display());
             return;
         }
-
-        let analysis = analyze_audio_file(&source_path, WAVEFORM_BUCKETS);
-        let duration = analysis.duration_secs;
-        let waveform = analysis.waveform.clone();
-        let channels = analysis.channels;
-        if duration <= 0.0 || waveform.is_empty() {
-            self.status_msg = format!("Could not decode audio file: {}", source_path.display());
+        let Some(cue) = self.cue_list.find(cue_id) else {
+            return;
+        };
+        if !matches!(&cue.cue_type, CueType::Audio) {
             return;
         }
 
@@ -4796,19 +6313,54 @@ impl TheatreShowCueApp {
             .and_then(|parent| parent.file_name())
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case("backup"));
-        let destination =
+        let project_path =
             if self.project_path.is_some() && !is_backup_project && !self.project_needs_save_as {
-                match self.assets.import_file(&source_path) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.status_msg = format!("Could not import audio file: {error}");
-                        error!("Could not import replacement audio file: {error}");
-                        return;
-                    }
-                }
+                self.project_path.clone()
             } else {
-                source_path
+                None
             };
+
+        if !self.audio_import_manager.submit(
+            self.audio_import_generation,
+            cue_id,
+            AudioImportKind::Replace,
+            source_path.clone(),
+            project_path,
+            WAVEFORM_BUCKETS,
+        ) {
+            self.status_msg = format!(
+                "Could not queue audio replacement: {}",
+                source_path.display()
+            );
+            error!(
+                "Could not queue asynchronous audio replacement: {}",
+                source_path.display()
+            );
+            return;
+        }
+        self.pending_audio_imports = self.pending_audio_imports.saturating_add(1);
+        self.audio_import_total = self.audio_import_total.saturating_add(1);
+        self.status_msg = format!("Preparing replacement audio: {}", source_path.display());
+        info!(
+            "Audio replacement queued: cue_id={}, source='{}'",
+            cue_id,
+            source_path.display()
+        );
+    }
+
+    fn apply_audio_cue_file_import(
+        &mut self,
+        cue_id: Uuid,
+        destination: PathBuf,
+        analysis: std::sync::Arc<crate::audio::waveform::AudioFileAnalysis>,
+    ) {
+        let duration = analysis.duration_secs;
+        let waveform = analysis.waveform.clone();
+        let channels = analysis.channels;
+        if duration <= 0.0 || waveform.is_empty() {
+            self.status_msg = format!("Could not decode audio file: {}", destination.display());
+            return;
+        }
 
         let Some(cue_snapshot) = self.cue_list.find(cue_id).cloned() else {
             return;
@@ -4919,10 +6471,116 @@ impl TheatreShowCueApp {
         );
     }
 
+    fn begin_audio_import_generation(&mut self) {
+        self.audio_import_generation = self.audio_import_manager.begin_generation();
+        self.pending_audio_imports = 0;
+        self.audio_import_total = 0;
+        self.audio_import_completed = 0;
+        self.import_insertion_anchor = None;
+    }
+
+    fn poll_audio_imports(&mut self, ctx: &Context) {
+        while let Some(result) = self.audio_import_manager.try_recv() {
+            if result.generation != self.audio_import_generation {
+                continue;
+            }
+
+            self.pending_audio_imports = self.pending_audio_imports.saturating_sub(1);
+            self.audio_import_completed = self.audio_import_completed.saturating_add(1);
+
+            if let Some(error) = result.error {
+                self.status_msg = format!("Audio import failed: {error}");
+                warn!(
+                    "Audio import failed: cue_id={}, source='{}': {}",
+                    result.cue_id,
+                    result.source_path.display(),
+                    error
+                );
+                continue;
+            }
+
+            let Some(destination) = result.destination_path else {
+                self.status_msg = format!("Audio import failed: {}", result.source_path.display());
+                continue;
+            };
+            let Some(analysis) = result.analysis else {
+                self.status_msg = format!(
+                    "Audio analysis returned no result: {}",
+                    destination.display()
+                );
+                continue;
+            };
+
+            match result.kind {
+                AudioImportKind::Add => {
+                    let mut cue = Cue::new_audio(destination.clone());
+                    cue.id = result.cue_id;
+                    cue.audio_channels = analysis.channels;
+                    if cue.audio_channels > 0 {
+                        let default_route_channels = self
+                            .audio
+                            .default_route_channels_for_source(None, cue.audio_channels);
+                        cue.io.ensure_channel_routes_with_defaults(
+                            cue.audio_channels,
+                            self.audio.output_channels,
+                            &default_route_channels,
+                        );
+                    }
+                    if analysis.duration_secs > 0.0 {
+                        cue.duration_secs = analysis.duration_secs;
+                        cue.loop_region.end_secs = analysis.duration_secs;
+                    }
+                    cue.waveform = analysis.waveform.clone();
+                    let name = cue.name.clone();
+                    self.selected = self
+                        .import_insertion_anchor
+                        .filter(|anchor| self.cue_list.find(*anchor).is_some());
+                    let id = self.insert_cue_after_selected(cue);
+                    self.import_insertion_anchor = Some(id);
+                    self.select_only(id);
+                    info!(
+                        "Audio file imported asynchronously: path='{}', channels={}, duration={:.3}s",
+                        destination.display(),
+                        analysis.channels,
+                        analysis.duration_secs
+                    );
+                    self.status_msg = format!("Added audio cue: {name}");
+                }
+                AudioImportKind::Replace => {
+                    self.apply_audio_cue_file_import(result.cue_id, destination, analysis);
+                }
+            }
+            ctx.request_repaint();
+        }
+
+        if self.pending_audio_imports > 0 {
+            self.status_msg = format!(
+                "Importing audio files: {}/{}",
+                self.audio_import_completed,
+                self.audio_import_total.max(self.audio_import_completed)
+            );
+            ctx.request_repaint_after(Duration::from_millis(40));
+        } else if self.audio_import_total > 0 {
+            info!(
+                "Asynchronous audio import batch completed: completed={}",
+                self.audio_import_completed
+            );
+            self.status_msg = format!(
+                "Audio import complete: {} file(s)",
+                self.audio_import_completed
+            );
+            self.audio_import_total = 0;
+            self.audio_import_completed = 0;
+            self.import_insertion_anchor = None;
+        }
+    }
+
     fn open_project(&mut self) {
+        let dialog_started_at = Instant::now();
         let file = FileDialog::new()
             .add_filter("Theatre Show Cue Project", &["tsq", "clabs"])
             .pick_file();
+        self.record_native_dialog_duration("open_project", dialog_started_at);
 
         if let Some(path) = file {
             self.open_project_path(path);
@@ -5071,6 +6729,8 @@ impl TheatreShowCueApp {
 
                 proj.cue_list = cl.clone();
                 self.cue_list = cl;
+                self.timeline_view_group = None;
+                self.active_timelines.clear();
                 self.cue_clipboard.clear();
                 self.time_trigger_last_fired.clear();
                 self.project = proj;
@@ -5093,6 +6753,7 @@ impl TheatreShowCueApp {
                 }
                 self.project_needs_save_as = false;
                 self.begin_waveform_generation();
+                self.begin_audio_import_generation();
                 self.queue_waveform_analysis_jobs(
                     waveform_jobs
                         .into_values()
@@ -5127,7 +6788,10 @@ impl TheatreShowCueApp {
         info!("New project requested");
         self.stop_all();
         self.begin_waveform_generation();
+        self.begin_audio_import_generation();
         self.cue_list = CueList::new("Main");
+        self.timeline_view_group = None;
+        self.active_timelines.clear();
         self.cue_clipboard.clear();
         self.time_trigger_last_fired.clear();
         let audio_routing = self.current_project_audio_routing();
@@ -5165,6 +6829,9 @@ impl TheatreShowCueApp {
                         finished_cues.push(update.id);
                     }
                 }
+            }
+            if matches!(&update.state, CueState::Error(_)) {
+                self.continuation_suppressed_once.remove(&update.id);
             }
         }
 
@@ -5234,8 +6901,108 @@ impl TheatreShowCueApp {
         }
     }
 
+    fn mark_midi_cues_error_after_output_unavailable(&mut self, port_name: &str) {
+        let midi_cue_ids: Vec<Uuid> = self
+            .cue_list
+            .cues
+            .iter()
+            .filter(|cue| matches!(&cue.cue_type, CueType::Midi { .. }))
+            .map(|cue| cue.id)
+            .collect();
+
+        let mut marked = 0usize;
+        let mut preserved_runtime_errors = 0usize;
+
+        for cue_id in midi_cue_ids {
+            let Some(snapshot) = self.cue_list.find(cue_id).cloned() else {
+                continue;
+            };
+            let issues = self.preflight_cue_issues(&snapshot);
+            let Some(error_message) =
+                midi_output_disconnect_preflight_message(&snapshot.state, issues)
+            else {
+                preserved_runtime_errors += 1;
+                continue;
+            };
+
+            if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                cue.state = CueState::Error(error_message.clone());
+                marked += 1;
+                warn!(
+                    "MIDI_OUTPUT_CUE_DISCONNECTED: cue_id={}, cue_number='{}', cue_name='{}', port='{}', error='{}'",
+                    cue.id, cue.number, cue.name, port_name, error_message
+                );
+            }
+        }
+
+        warn!(
+            "MIDI_OUTPUT_CUE_DISCONNECTION_APPLIED: port='{}', marked={}, preserved_runtime_errors={}",
+            port_name, marked, preserved_runtime_errors
+        );
+    }
+
+    fn refresh_midi_preflight_errors_after_output_available(&mut self, port_name: &str) {
+        let candidate_ids: Vec<Uuid> = self
+            .cue_list
+            .cues
+            .iter()
+            .filter(|cue| is_midi_output_connection_preflight_error(cue))
+            .map(|cue| cue.id)
+            .collect();
+
+        let mut cleared = 0usize;
+        let mut still_blocked = 0usize;
+
+        for cue_id in candidate_ids.iter().copied() {
+            let Some(snapshot) = self.cue_list.find(cue_id).cloned() else {
+                continue;
+            };
+            let remaining_issues = self.preflight_cue_issues(&snapshot);
+
+            if let Some(cue) = self.cue_list.find_mut(cue_id) {
+                if remaining_issues.is_empty() {
+                    cue.state = CueState::Stopped;
+                    cleared += 1;
+                    info!(
+                        "MIDI_PREFLIGHT_ERROR_CLEARED: cue_id={}, cue_number='{}', cue_name='{}', port='{}'",
+                        cue.id, cue.number, cue.name, port_name
+                    );
+                } else {
+                    cue.state = CueState::Error(format!(
+                        "Preflight validation: {}",
+                        remaining_issues.join("; ")
+                    ));
+                    still_blocked += 1;
+                    debug!(
+                        "MIDI_PREFLIGHT_ERROR_RETAINED: cue_id={}, cue_number='{}', reasons='{}'",
+                        cue.id,
+                        cue.number,
+                        remaining_issues.join("; ")
+                    );
+                }
+            }
+        }
+
+        info!(
+            "MIDI_OUTPUT_CUE_REVALIDATION: port='{}', candidates={}, cleared={}, still_blocked={}",
+            port_name,
+            candidate_ids.len(),
+            cleared,
+            still_blocked
+        );
+    }
+
     fn poll_midi(&mut self) {
-        self.midi_out.poll();
+        for transition in self.midi_out.poll() {
+            match transition {
+                MidiOutputConnectionEvent::Disconnected { port_name } => {
+                    self.mark_midi_cues_error_after_output_unavailable(&port_name);
+                }
+                MidiOutputConnectionEvent::Connected { port_name } => {
+                    self.refresh_midi_preflight_errors_after_output_available(&port_name);
+                }
+            }
+        }
         let messages = self.midi.drain();
         if messages.is_empty() {
             return;
@@ -5284,11 +7051,17 @@ impl TheatreShowCueApp {
                     value,
                 } => {
                     if cc == 7 {
-                        let vol = value as f32 / 127.0;
-                        self.master_vol = vol;
-                        for cue in self.cue_list.cues.iter().filter(|c| c.is_active()) {
-                            self.audio
-                                .send(AudioCommand::SetVolume(cue.id, cue.volume * vol));
+                        let percent = midi_cc_to_master_volume_percent(value);
+                        if self.master_vol != percent {
+                            self.master_vol = percent;
+                            self.mark_master_volume_changed();
+                            let linear_gain = master_volume_linear_gain(percent);
+                            for cue in self.cue_list.cues.iter().filter(|c| c.is_active()) {
+                                self.audio.send(AudioCommand::SetVolume(
+                                    cue.id,
+                                    cue.volume * linear_gain,
+                                ));
+                            }
                         }
                     }
                 }
@@ -6300,6 +8073,24 @@ impl TheatreShowCueApp {
         true
     }
 
+    fn mark_master_volume_changed(&mut self) {
+        self.master_vol = self.master_vol.min(100);
+        self.settings.master_volume_percent = self.master_vol;
+        // MIDI faders can send many CC messages per second. Persist once the
+        // control has been idle briefly instead of writing settings per message.
+        self.master_volume_save_deadline = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    fn flush_pending_master_volume_settings(&mut self) {
+        if self
+            .master_volume_save_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.master_volume_save_deadline = None;
+            self.save_app_settings();
+        }
+    }
+
     fn save_app_settings(&mut self) {
         if let Err(error) = self.settings.save() {
             self.status_msg = format!("Settings save error: {error}");
@@ -6634,10 +8425,12 @@ impl TheatreShowCueApp {
                                 }
 
                                 if choose_file {
-                                    if let Some(source) = FileDialog::new()
+                                    let dialog_started_at = Instant::now();
+                                    let selected_source = FileDialog::new()
                                         .add_filter("Image files", &["png", "jpg", "jpeg", "webp"])
-                                        .pick_file()
-                                    {
+                                        .pick_file();
+                                    self.record_native_dialog_duration("custom_icon", dialog_started_at);
+                                    if let Some(source) = selected_source {
                                         match import_custom_icon(&source, role) {
                                             Ok(stored_path) => {
                                                 self.settings.appearance.icon_overrides.insert(
@@ -7678,10 +9471,12 @@ impl TheatreShowCueApp {
                                 );
                             });
                             if ui.button("Browse…").clicked() {
-                                if let Some(path) = FileDialog::new()
+                                let dialog_started_at = Instant::now();
+                                let selected_path = FileDialog::new()
                                     .set_directory(&current_log_directory)
-                                    .pick_folder()
-                                {
+                                    .pick_folder();
+                                self.record_native_dialog_duration("log_directory", dialog_started_at);
+                                if let Some(path) = selected_path {
                                     selected_log_directory = Some(path);
                                 }
                             }
@@ -7745,12 +9540,14 @@ impl TheatreShowCueApp {
                                 }
                             }
                             if ui.button("Export diagnostic ZIP…").clicked() {
-                                if let Some(destination) = FileDialog::new()
+                                let dialog_started_at = Instant::now();
+                                let selected_destination = FileDialog::new()
                                     .add_filter("ZIP archive", &["zip"])
                                     .set_directory(&current_log_directory)
                                     .set_file_name("TheatreShowCue_diagnostics.zip")
-                                    .save_file()
-                                {
+                                    .save_file();
+                                self.record_native_dialog_duration("export_diagnostics", dialog_started_at);
+                                if let Some(destination) = selected_destination {
                                     if let Err(error) = crate::diagnostics::write_performance_report(
                                         &self.performance_monitor.session_summary(),
                                     ) {
@@ -7902,7 +9699,7 @@ impl TheatreShowCueApp {
 
         if added > 0 {
             ctx.request_repaint();
-            self.status_msg = format!("Added {} file(s) via drag-and-drop", added);
+            self.status_msg = format!("Queued {} audio file(s) from drag-and-drop", added);
         }
     }
 
@@ -7910,6 +9707,7 @@ impl TheatreShowCueApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let recent_projects = self.settings.recent_projects.clone();
+        let timeline_context_group = self.timeline_context_group();
         let mut open_recent_path: Option<PathBuf> = None;
 
         egui::menu::bar(ui, |ui| {
@@ -7983,7 +9781,10 @@ impl TheatreShowCueApp {
                 }
                 ui.separator();
                 if ui.button("Export session report…").clicked() {
-                    if let Some(dir) = FileDialog::new().pick_folder() {
+                    let dialog_started_at = Instant::now();
+                    let selected_dir = FileDialog::new().pick_folder();
+                    self.record_native_dialog_duration("export_session_report", dialog_started_at);
+                    if let Some(dir) = selected_dir {
                         self.report.finish();
                         match self.report.save(&dir) {
                             Ok(p) => self.status_msg = format!("Report saved: {}", p.display()),
@@ -8087,6 +9888,13 @@ impl TheatreShowCueApp {
                     self.active_panel = Panel::Performance;
                     ui.close_menu();
                 }
+                if let Some(group_id) = timeline_context_group {
+                    if ui.button("Timeline").clicked() {
+                        self.timeline_view_group = Some(group_id);
+                        self.active_panel = Panel::Timeline;
+                        ui.close_menu();
+                    }
+                }
                 ui.separator();
                 if ui
                     .checkbox(&mut self.notes_sidebar_open, "Notes Sidebar")
@@ -8114,6 +9922,15 @@ impl TheatreShowCueApp {
             .map(|cue| cue.cue_type.clone());
         let selected_is_audio = matches!(selected_type.as_ref(), Some(CueType::Audio));
         let selected_is_midi = matches!(selected_type.as_ref(), Some(CueType::Midi { .. }));
+        let selected_timeline_group = self.timeline_context_group();
+        if let Some(group_id) = selected_timeline_group {
+            self.timeline_view_group = Some(group_id);
+        } else {
+            self.timeline_view_group = None;
+            if self.active_panel == Panel::Timeline {
+                self.active_panel = Panel::Inspector;
+            }
+        }
 
         if !selected_is_audio
             && matches!(
@@ -8172,6 +9989,12 @@ impl TheatreShowCueApp {
             &tab_icon_appearance,
             tab_icon_color,
         );
+        let tab_timeline_icon = self.icons.texture_id_for_color(
+            &tab_icon_context,
+            "audio",
+            &tab_icon_appearance,
+            tab_icon_color,
+        );
 
         ui.horizontal(|ui| {
             if icon_selectable_label(
@@ -8183,6 +10006,19 @@ impl TheatreShowCueApp {
             .clicked()
             {
                 self.active_panel = Panel::Inspector;
+            }
+            if let Some(group_id) = selected_timeline_group {
+                if icon_selectable_label(
+                    ui,
+                    tab_timeline_icon,
+                    "Timeline",
+                    self.active_panel == Panel::Timeline,
+                )
+                .clicked()
+                {
+                    self.timeline_view_group = Some(group_id);
+                    self.active_panel = Panel::Timeline;
+                }
             }
             if selected_is_audio {
                 if icon_selectable_label(
@@ -8408,7 +10244,7 @@ impl TheatreShowCueApp {
 
                     Panel::Playback => {
                         if let Some(id) = self.selected {
-                            let master = self.master_vol;
+                            let master = master_volume_linear_gain(self.master_vol);
                             let mut volume_update = None;
                             let mut time_pitch_update = None;
                             if let Some(cue) = self.cue_list.find_mut(id) {
@@ -8519,7 +10355,7 @@ impl TheatreShowCueApp {
                                     (
                                         cue.io.channel_routes.clone(),
                                         cue.io.output_gains_db.clone(),
-                                        cue.volume * self.master_vol,
+                                        cue.volume * master_volume_linear_gain(self.master_vol),
                                         endpoint_changed,
                                         route_backend,
                                         route_endpoint_id,
@@ -8589,7 +10425,8 @@ impl TheatreShowCueApp {
                                     let (route_backend, route_endpoint_id, route_device_name, _) =
                                         self.cue_output_endpoint_context(&cue);
                                     let routes = cue.io.channel_routes.clone();
-                                    let volume = cue.volume * self.master_vol;
+                                    let volume =
+                                        cue.volume * master_volume_linear_gain(self.master_vol);
                                     self.audio.send(AudioCommand::SetRouting {
                                         id,
                                         routes: self.audio.cue_routes_for_endpoint(
@@ -8624,6 +10461,31 @@ impl TheatreShowCueApp {
                         let snapshot = self.performance_monitor.snapshot();
                         crate::ui::performance::show(ui, &snapshot);
                     }
+                    Panel::Timeline => {
+                        if let Some(group_id) = selected_timeline_group {
+                            let playhead_secs = self
+                                .active_timelines
+                                .iter()
+                                .find(|run| run.group_id == group_id)
+                                .map(|run| {
+                                    let reference = run.paused_at.unwrap_or_else(Instant::now);
+                                    reference
+                                        .saturating_duration_since(run.started_at)
+                                        .as_secs_f64()
+                                });
+                            if let Some(selected_id) = TimelineEditor::show(
+                                ui,
+                                group_id,
+                                self.selected,
+                                &mut self.cue_list.cues,
+                                playhead_secs,
+                            ) {
+                                self.select_only(selected_id);
+                            }
+                        } else {
+                            ui.label("Select a group and set its mode to Timeline to edit its events.");
+                        }
+                    }
                 }
             });
     }
@@ -8631,6 +10493,11 @@ impl TheatreShowCueApp {
 
 impl Drop for TheatreShowCueApp {
     fn drop(&mut self) {
+        if self.master_volume_save_deadline.take().is_some() {
+            if let Err(error) = self.settings.save() {
+                eprintln!("Could not save Master Volume while closing TaSQ: {error}");
+            }
+        }
         if let Err(error) = crate::diagnostics::write_performance_report(
             &self.performance_monitor.session_summary(),
         ) {
@@ -8644,10 +10511,12 @@ impl Drop for TheatreShowCueApp {
 
 impl eframe::App for TheatreShowCueApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.native_dialog_elapsed_this_update = Duration::ZERO;
         let gui_update_started = Instant::now();
         // Re-apply our palette during update as well as at startup. This keeps
         // egui's native-window defaults from overriding custom text colors on Windows.
         Theme::apply(ctx, &self.settings.appearance);
+        self.flush_pending_master_volume_settings();
         self.request_application_close(ctx);
 
         if !self.startup_frame_logged {
@@ -8839,18 +10708,22 @@ impl eframe::App for TheatreShowCueApp {
         }
 
         self.poll_pending_triggers();
+        self.poll_timeline();
         self.poll_time_triggers();
         self.poll_audio();
         self.poll_wait_progress();
         self.poll_midi();
         self.poll_osc();
+        self.poll_audio_imports(ctx);
         self.poll_waveform_analysis(ctx);
         self.poll_audio_file_metadata();
         self.poll_periodic_backup();
         self.handle_keyboard(ctx);
         self.handle_drop(ctx);
 
-        if !self.waveform_pending_cues.is_empty() {
+        if self.pending_audio_imports > 0 {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        } else if !self.waveform_pending_cues.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else if self.cue_list.active_count() > 0 || !self.pending_triggers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(30));
@@ -8908,6 +10781,19 @@ impl eframe::App for TheatreShowCueApp {
                             .color(Theme::text_dim())
                             .size(Theme::scaled_font_size(11.0)),
                     );
+                    if self.pending_audio_imports > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(
+                                self.audio_import_completed as f32
+                                    / self.audio_import_total.max(1) as f32,
+                            )
+                            .desired_width(150.0)
+                            .text(format!(
+                                "Imports {}/{}",
+                                self.audio_import_completed, self.audio_import_total
+                            )),
+                        );
+                    }
                     if !self.waveform_pending_cues.is_empty() {
                         let total = self
                             .waveform_total_cues
@@ -8961,22 +10847,18 @@ impl eframe::App for TheatreShowCueApp {
                         &mut self.master_vol,
                         &mut self.bottom_panel_visible,
                     );
-                    if (self.master_vol - prev_master).abs() > f32::EPSILON {
+                    if self.master_vol != prev_master {
+                        self.mark_master_volume_changed();
+                        let linear_gain = master_volume_linear_gain(self.master_vol);
                         for cue in self.cue_list.cues.iter().filter(|c| c.is_active()) {
-                            self.audio.send(AudioCommand::SetVolume(
-                                cue.id,
-                                cue.volume * self.master_vol,
-                            ));
+                            self.audio
+                                .send(AudioCommand::SetVolume(cue.id, cue.volume * linear_gain));
                         }
                     }
                     match action {
                         Some(TransportAction::Go) => self.go(),
-                        Some(TransportAction::StopSelected) => self.stop_selected(),
                         Some(TransportAction::StopAll) => self.stop_all(),
-                        Some(TransportAction::PauseSelected) => self.pause_selected(),
                         Some(TransportAction::PauseAll) => self.pause_all(),
-                        Some(TransportAction::ResumeSelected) => self.resume_selected(),
-                        Some(TransportAction::ResumeAll) => self.resume_all(),
                         None => {}
                     }
                 });
@@ -9738,7 +11620,17 @@ impl eframe::App for TheatreShowCueApp {
         self.show_drop_overlay(ctx);
         self.show_close_confirmation(ctx);
 
-        let gui_update_elapsed = gui_update_started.elapsed();
+        let gui_update_wall_elapsed = gui_update_started.elapsed();
+        let native_dialog_elapsed = self.native_dialog_elapsed_this_update;
+        let gui_update_elapsed = gui_update_wall_elapsed.saturating_sub(native_dialog_elapsed);
+        if native_dialog_elapsed >= Duration::from_millis(1) {
+            info!(
+                "GUI_UPDATE_TIMING: wall_ms={:.2}, native_dialog_ms={:.2}, active_gui_ms={:.2}",
+                gui_update_wall_elapsed.as_secs_f64() * 1_000.0,
+                native_dialog_elapsed.as_secs_f64() * 1_000.0,
+                gui_update_elapsed.as_secs_f64() * 1_000.0
+            );
+        }
         self.performance_monitor
             .record_gui_update(gui_update_elapsed);
         if gui_update_elapsed >= Duration::from_millis(33)
@@ -9757,8 +11649,11 @@ impl eframe::App for TheatreShowCueApp {
 
 #[cfg(test)]
 mod normal_group_tests {
-    use super::{normal_group_next_manual_cue_in, TheatreShowCueApp};
-    use crate::cue::{ContinueMode, Cue, CueType, GroupMode};
+    use super::{
+        is_midi_output_connection_preflight_error, midi_output_disconnect_preflight_message,
+        normal_group_next_manual_cue_in, TheatreShowCueApp, MIDI_OUTPUT_DISCONNECTED_REASON,
+    };
+    use crate::cue::{ContinueMode, Cue, CueState, CueType, GroupMode, MidiMessageKind};
     use std::collections::HashSet;
 
     fn audio_cue(mode: ContinueMode) -> Cue {
@@ -9780,6 +11675,76 @@ mod normal_group_tests {
         Cue::new_typed(CueType::Comment {
             text: "Stage direction".to_string(),
         })
+    }
+
+    #[test]
+    fn midi_output_disconnect_preflight_errors_are_candidates_for_revalidation() {
+        let mut cue = Cue::new_typed(CueType::Midi {
+            channel: 1,
+            message: MidiMessageKind::NoteOn {
+                note: 60,
+                velocity: 100,
+            },
+            raw_hex: String::new(),
+        });
+        cue.state = CueState::Error(format!(
+            "Preflight validation: {MIDI_OUTPUT_DISCONNECTED_REASON}"
+        ));
+
+        assert!(is_midi_output_connection_preflight_error(&cue));
+    }
+
+    #[test]
+    fn non_preflight_midi_errors_are_not_cleared_by_output_recovery() {
+        let mut cue = Cue::new_typed(CueType::Midi {
+            channel: 1,
+            message: MidiMessageKind::NoteOn {
+                note: 60,
+                velocity: 100,
+            },
+            raw_hex: String::new(),
+        });
+        cue.state = CueState::Error("MIDI message send failed".to_string());
+
+        assert!(!is_midi_output_connection_preflight_error(&cue));
+    }
+
+    #[test]
+    fn non_midi_preflight_errors_are_not_cleared_by_output_recovery() {
+        let mut cue = Cue::new_typed(CueType::Audio);
+        cue.state = CueState::Error("Preflight validation: Audio file is missing".to_string());
+
+        assert!(!is_midi_output_connection_preflight_error(&cue));
+    }
+
+    #[test]
+    fn midi_disconnect_error_is_added_to_existing_preflight_issues() {
+        let message = midi_output_disconnect_preflight_message(
+            &CueState::Error("Preflight validation: MIDI channel 17 is invalid".to_string()),
+            vec!["MIDI channel 17 is outside the valid 1–16 range".to_string()],
+        )
+        .expect("preflight errors should be augmented with the connection error");
+
+        assert!(message.contains("MIDI channel 17 is outside the valid 1–16 range"));
+        assert!(message.contains(MIDI_OUTPUT_DISCONNECTED_REASON));
+    }
+
+    #[test]
+    fn midi_disconnect_does_not_overwrite_unrelated_runtime_error() {
+        assert_eq!(
+            midi_output_disconnect_preflight_message(
+                &CueState::Error("MIDI message send failed".to_string()),
+                Vec::new(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn midi_disconnect_error_is_created_for_stopped_cue() {
+        let message = midi_output_disconnect_preflight_message(&CueState::Stopped, Vec::new())
+            .expect("stopped MIDI Cue should become a preflight error");
+        assert!(message.contains(MIDI_OUTPUT_DISCONNECTED_REASON));
     }
 
     #[test]
@@ -10015,6 +11980,68 @@ mod completion_post_wait_tests {
 }
 
 #[cfg(test)]
+mod timeline_timing_tests {
+    use super::build_timeline_schedule;
+    use crate::cue::{Cue, CueList, CueType};
+
+    #[test]
+    fn zero_pre_wait_events_share_the_group_go_origin() {
+        let mut cue_list = CueList::new("Timeline zero-offset test");
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            let cue = Cue::new_typed(CueType::Audio);
+            ids.push(cue.id);
+            cue_list.add(cue);
+        }
+
+        let schedule = build_timeline_schedule(&cue_list, &ids);
+        assert_eq!(schedule.len(), 10);
+        assert!(schedule.iter().all(|(_, offset)| *offset == 0.0));
+    }
+
+    #[test]
+    fn pre_waits_are_absolute_offsets_and_ignore_previous_audio_duration() {
+        let mut cue_list = CueList::new("Timeline absolute-offset test");
+        let mut first = Cue::new_typed(CueType::Audio);
+        first.duration_secs = 90.0;
+        let mut second = Cue::new_typed(CueType::Audio);
+        second.pre_wait_secs = 4.0;
+        second.duration_secs = 120.0;
+        let mut third = Cue::new_typed(CueType::Audio);
+        third.pre_wait_secs = 8.0;
+        third.duration_secs = 45.0;
+        let ids = vec![first.id, second.id, third.id];
+        cue_list.add(first);
+        cue_list.add(second);
+        cue_list.add(third);
+
+        let schedule = build_timeline_schedule(&cue_list, &ids);
+        assert_eq!(schedule, vec![(ids[0], 0.0), (ids[1], 4.0), (ids[2], 8.0)]);
+    }
+
+    #[test]
+    fn equal_offsets_remain_equal_and_keep_source_order() {
+        let mut cue_list = CueList::new("Timeline simultaneous-offset test");
+        let mut first = Cue::new_typed(CueType::Audio);
+        first.pre_wait_secs = 4.0;
+        let mut second = Cue::new_typed(CueType::Midi {
+            channel: 1,
+            message: crate::cue::MidiMessageKind::ProgramChange { program: 1 },
+            raw_hex: String::new(),
+        });
+        second.pre_wait_secs = 4.0;
+        let ids = vec![first.id, second.id];
+        cue_list.add(first);
+        cue_list.add(second);
+
+        assert_eq!(
+            build_timeline_schedule(&cue_list, &ids),
+            vec![(ids[0], 4.0), (ids[1], 4.0)]
+        );
+    }
+}
+
+#[cfg(test)]
 mod all_cues_timing_tests {
     use super::build_all_cues_segments;
     use crate::cue::{Cue, CueList, CueType};
@@ -10191,6 +12218,236 @@ mod audio_output_mapping_tests {
 }
 
 #[cfg(test)]
+mod resume_selected_continuation_tests {
+    use super::{should_auto_follow_after_completion, should_schedule_auto_continue};
+    use crate::cue::ContinueMode;
+
+    #[test]
+    fn resume_selected_suppresses_auto_continue_for_one_playback() {
+        assert!(!should_schedule_auto_continue(
+            &ContinueMode::AutoContinue,
+            true,
+            false,
+            false,
+        ));
+        assert!(should_schedule_auto_continue(
+            &ContinueMode::AutoContinue,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn resume_selected_suppresses_auto_follow_for_one_playback() {
+        assert!(!should_auto_follow_after_completion(
+            &ContinueMode::AutoFollow,
+            true,
+            false,
+            false,
+        ));
+        assert!(should_auto_follow_after_completion(
+            &ContinueMode::AutoFollow,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn suppression_does_not_change_the_cue_configuration() {
+        let configured_mode = ContinueMode::AutoContinue;
+        let _suppressed_for_this_playback = true;
+        assert_eq!(configured_mode, ContinueMode::AutoContinue);
+    }
+}
+
+#[cfg(test)]
+mod managed_group_continuation_tests {
+    use super::{
+        auto_continue_delay, next_after_container_in, next_non_comment_after_container_in,
+        should_auto_follow_after_completion, should_schedule_auto_continue,
+    };
+    use crate::cue::{ContinueMode, Cue, CueType, GroupMode};
+
+    fn group(mode: GroupMode, child: &Cue) -> Cue {
+        Cue::new_typed(CueType::Group {
+            mode,
+            children: vec![child.id],
+            fade_in_secs: 0.0,
+            fade_out_secs: 0.0,
+        })
+    }
+
+    #[test]
+    fn managed_group_cue_auto_continue_is_dispatched_at_group_start() {
+        // The Group Cue itself is not a managed child, so its Auto-Continue
+        // participates in the parent-level Cue sequence.
+        assert!(should_schedule_auto_continue(
+            &ContinueMode::AutoContinue,
+            false,
+            false,
+            true,
+        ));
+        // A Cue managed by a Playlist / All Cues / Timeline child scheduler
+        // must not start a competing parent-level continuation chain.
+        assert!(!should_schedule_auto_continue(
+            &ContinueMode::AutoContinue,
+            false,
+            true,
+            false,
+        ));
+        // Group Auto-Continue is start-driven, not completion-driven.
+        assert!(!should_auto_follow_after_completion(
+            &ContinueMode::AutoContinue,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn group_auto_continue_ignores_group_post_wait_but_honours_pre_wait() {
+        assert_eq!(auto_continue_delay(0.0, 8.0, true), 0.0);
+        assert_eq!(auto_continue_delay(3.0, 8.0, true), 3.0);
+        assert_eq!(auto_continue_delay(3.0, 8.0, false), 11.0);
+    }
+
+    #[test]
+    fn group_auto_follow_only_fires_after_completion_even_in_timeline() {
+        for is_timeline in [false, true] {
+            assert!(should_auto_follow_after_completion(
+                &ContinueMode::AutoFollow,
+                false,
+                is_timeline,
+                true
+            ));
+            assert!(!should_auto_follow_after_completion(
+                &ContinueMode::AutoFollow,
+                true,
+                is_timeline,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn playlist_and_all_cues_cursor_leave_group_without_entering_children() {
+        for mode in [GroupMode::Playlist, GroupMode::AllCues] {
+            let child = Cue::new_typed(CueType::Audio);
+            let group = group(mode, &child);
+            let comment = Cue::new_typed(CueType::Comment {
+                text: "note".into(),
+            });
+            let next = Cue::new_typed(CueType::Audio);
+            let cues = vec![child, group.clone(), comment, next.clone()];
+            assert_eq!(next_after_container_in(&cues, group.id), Some(cues[2].id));
+            assert_eq!(
+                next_non_comment_after_container_in(&cues, group.id),
+                Some(next.id)
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_navigation_helper_keeps_skipping_comments() {
+        let child = Cue::new_typed(CueType::Audio);
+        let group = group(GroupMode::Timeline, &child);
+        let comment = Cue::new_typed(CueType::Comment {
+            text: "note".into(),
+        });
+        let next = Cue::new_typed(CueType::Audio);
+        let cues = vec![child, group.clone(), comment, next.clone()];
+        assert_eq!(
+            next_non_comment_after_container_in(&cues, group.id),
+            Some(next.id)
+        );
+    }
+
+    #[test]
+    fn nested_managed_group_navigation_moves_past_outer_group() {
+        let nested_child = Cue::new_typed(CueType::Audio);
+        let nested = group(GroupMode::Playlist, &nested_child);
+        let parent = group(GroupMode::AllCues, &nested);
+        let following = Cue::new_typed(CueType::Audio);
+        let cues = vec![nested_child, nested.clone(), parent, following.clone()];
+        assert_eq!(
+            next_non_comment_after_container_in(&cues, nested.id),
+            Some(following.id)
+        );
+    }
+
+    #[test]
+    fn group_continue_selection_skips_every_automatically_started_successor() {
+        use super::next_manual_after_group_auto_chain_in;
+
+        let child = Cue::new_typed(CueType::Audio);
+        let mut group = group(GroupMode::Playlist, &child);
+        group.continue_mode = ContinueMode::AutoFollow;
+
+        let mut auto_one = Cue::new_typed(CueType::Audio);
+        auto_one.continue_mode = ContinueMode::AutoContinue;
+        let mut auto_two = Cue::new_typed(CueType::Audio);
+        auto_two.continue_mode = ContinueMode::AutoFollow;
+        // Auto-Follow on auto_two starts auto_three automatically.
+        // auto_three has Continue=Nothing, so the Cue after it is the first
+        // event that still requires a manual GO.
+        let auto_three = Cue::new_typed(CueType::Audio);
+        let manual = Cue::new_typed(CueType::Audio);
+        let cues = vec![
+            child,
+            group.clone(),
+            auto_one,
+            auto_two,
+            auto_three,
+            manual.clone(),
+        ];
+
+        assert_eq!(
+            next_manual_after_group_auto_chain_in(&cues, group.id),
+            Some(manual.id)
+        );
+    }
+
+    #[test]
+    fn group_without_continue_selects_first_cue_after_container() {
+        use super::next_manual_after_group_auto_chain_in;
+
+        let child = Cue::new_typed(CueType::Audio);
+        let group = group(GroupMode::AllCues, &child);
+        let first_after = Cue::new_typed(CueType::Audio);
+        let later = Cue::new_typed(CueType::Audio);
+        let cues = vec![child, group.clone(), first_after.clone(), later];
+
+        assert_eq!(
+            next_manual_after_group_auto_chain_in(&cues, group.id),
+            Some(first_after.id)
+        );
+    }
+
+    #[test]
+    fn normal_group_last_playable_child_ignores_trailing_comments_and_stale_ids() {
+        use super::normal_group_last_playable_child_in;
+
+        let first = Cue::new_typed(CueType::Audio);
+        let last = Cue::new_typed(CueType::Audio);
+        let comment = Cue::new_typed(CueType::Comment { text: "end".into() });
+        let mut group = group(GroupMode::Normal, &first);
+        if let CueType::Group { children, .. } = &mut group.cue_type {
+            children.push(last.id);
+            children.push(comment.id);
+            children.push(uuid::Uuid::new_v4());
+        }
+        let cues = vec![first, last.clone(), comment, group.clone()];
+
+        assert_eq!(
+            normal_group_last_playable_child_in(&cues, group.id),
+            Some(last.id)
+        );
+    }
+}
+
+#[cfg(test)]
 mod recent_project_tests {
     use super::{
         recent_project_hover_path, recent_project_menu_label, remember_recent_project_path,
@@ -10308,5 +12565,30 @@ mod project_close_snapshot_tests {
             .expect("edited project snapshot serializes");
 
         assert_ne!(saved, current);
+    }
+}
+
+#[cfg(test)]
+mod master_volume_scale_tests {
+    use super::{master_volume_linear_gain, midi_cc_to_master_volume_percent};
+
+    #[test]
+    fn integer_master_percent_maps_to_linear_dsp_gain() {
+        assert_eq!(master_volume_linear_gain(0), 0.0);
+        assert_eq!(master_volume_linear_gain(1), 0.01);
+        assert_eq!(master_volume_linear_gain(50), 0.5);
+        assert_eq!(master_volume_linear_gain(99), 0.99);
+        assert_eq!(master_volume_linear_gain(100), 1.0);
+        // Defensive clamp protects the DSP boundary from an invalid persisted value.
+        assert_eq!(master_volume_linear_gain(255), 1.0);
+    }
+
+    #[test]
+    fn midi_cc_seven_bit_values_map_to_integer_percent() {
+        assert_eq!(midi_cc_to_master_volume_percent(0), 0);
+        assert_eq!(midi_cc_to_master_volume_percent(1), 1);
+        assert_eq!(midi_cc_to_master_volume_percent(64), 50);
+        assert_eq!(midi_cc_to_master_volume_percent(127), 100);
+        assert_eq!(midi_cc_to_master_volume_percent(255), 100);
     }
 }

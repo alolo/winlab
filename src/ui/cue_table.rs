@@ -1199,13 +1199,13 @@ impl CueTable {
                                 action = Some(CueTableAction::StartEdit(
                                     cue.id,
                                     EditField::PreWait,
-                                    format!("{:.2}", cue.pre_wait_secs),
+                                    format_timecode(cue.pre_wait_secs),
                                 ));
                             } else if post_wait_rect.contains(position) {
                                 action = Some(CueTableAction::StartEdit(
                                     cue.id,
                                     EditField::PostWait,
-                                    format!("{:.2}", cue.post_wait_secs),
+                                    format_timecode(cue.post_wait_secs),
                                 ));
                             } else if duration_cell_rect.contains(position)
                                 && matches!(&cue.cue_type, CueType::Fade { .. })
@@ -1800,6 +1800,29 @@ fn status_label(state: &CueState) -> (&'static str, Color32) {
     }
 }
 
+pub fn format_timecode(secs: f64) -> String {
+    let total_centiseconds = (secs.max(0.0) * 100.0).round() as u64;
+    let minutes = total_centiseconds / 6_000;
+    let seconds = (total_centiseconds / 100) % 60;
+    let centiseconds = total_centiseconds % 100;
+    format!("{minutes:02}:{seconds:02}.{centiseconds:02}")
+}
+
+pub fn parse_timecode(value: &str) -> Option<f64> {
+    let value = value.trim().replace(',', ".");
+    if let Some((minutes, seconds)) = value.split_once(':') {
+        let minutes = minutes.trim().parse::<u64>().ok()?;
+        let seconds = seconds.trim().parse::<f64>().ok()?;
+        if !seconds.is_finite() || !(0.0..60.0).contains(&seconds) {
+            return None;
+        }
+        Some(minutes as f64 * 60.0 + seconds)
+    } else {
+        let seconds = value.parse::<f64>().ok()?;
+        (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
+    }
+}
+
 pub fn format_duration(secs: f64) -> String {
     if secs <= 0.0 {
         return "--:--".to_string();
@@ -1813,12 +1836,30 @@ pub fn format_duration(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sibling_locations, resize_adjacent_column_widths, responsive_column_widths,
-        visible_cue_ids, visible_navigation_cue_ids, wait_countdown_is_visible,
+        build_sibling_locations, format_timecode, parse_timecode, resize_adjacent_column_widths,
+        responsive_column_widths, visible_cue_ids, visible_navigation_cue_ids,
+        wait_countdown_is_visible,
     };
     use crate::cue::{Cue, CueType, GroupMode, WaitPhase};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn timecode_formats_minutes_seconds_and_hundredths() {
+        assert_eq!(format_timecode(0.0), "00:00.00");
+        assert_eq!(format_timecode(65.237), "01:05.24");
+        assert_eq!(format_timecode(3_600.0), "60:00.00");
+    }
+
+    #[test]
+    fn timecode_parser_accepts_clock_format_and_legacy_seconds() {
+        assert_eq!(parse_timecode("01:05.25"), Some(65.25));
+        assert_eq!(parse_timecode("00:04.5"), Some(4.5));
+        assert_eq!(parse_timecode("12.75"), Some(12.75));
+        assert_eq!(parse_timecode("12,75"), Some(12.75));
+        assert_eq!(parse_timecode("00:60.00"), None);
+        assert_eq!(parse_timecode("not a time"), None);
+    }
 
     #[test]
     fn wait_countdown_hides_after_deadline_even_if_runtime_phase_is_not_cleared() {

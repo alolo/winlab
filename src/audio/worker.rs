@@ -21,11 +21,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub(crate) const WORKER_PROTOCOL_VERSION: u32 = 4;
+pub(crate) const WORKER_PROTOCOL_VERSION: u32 = 5;
 const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_FORCE_EXIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -38,6 +38,14 @@ const MAX_AUTOMATIC_RECOVERY_ATTEMPTS: u8 = 5;
 /// Delays from recovery-cycle start / previous attempt to attempts 1..=5.
 /// The cumulative window is approximately 19 seconds.
 const RECOVERY_ATTEMPT_DELAYS_SECS: [u64; 5] = [1, 1, 2, 5, 10];
+
+fn unix_micros_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
 
 #[cfg(target_os = "windows")]
 mod windows_worker_job {
@@ -315,7 +323,16 @@ enum WorkerCommand {
         cues: Vec<AudioPlayRequest>,
     },
     Stop(Uuid),
+    StopTimed {
+        id: Uuid,
+        request_id: Uuid,
+        requested_at_unix_micros: u64,
+    },
     StopAll,
+    StopAllTimed {
+        request_id: Uuid,
+        requested_at_unix_micros: u64,
+    },
     Pause(Uuid),
     Seek {
         id: Uuid,
@@ -1369,7 +1386,13 @@ pub(crate) fn spawn_audio_worker(
                         WorkerCommand::PlayBatch { transaction_id, cues }
                     },
                     AudioCommand::Stop(id) => WorkerCommand::Stop(id),
+                    AudioCommand::StopTimed { id, request_id, requested_at_unix_micros } => {
+                        WorkerCommand::StopTimed { id, request_id, requested_at_unix_micros }
+                    },
                     AudioCommand::StopAll => WorkerCommand::StopAll,
+                    AudioCommand::StopAllTimed { request_id, requested_at_unix_micros } => {
+                        WorkerCommand::StopAllTimed { request_id, requested_at_unix_micros }
+                    },
                     AudioCommand::Pause(id) => WorkerCommand::Pause(id),
                     AudioCommand::Seek { id, position_secs } => {
                         WorkerCommand::Seek { id, position_secs }
@@ -1704,6 +1727,27 @@ fn schedule_recovery_after_reconnect(
 
 fn endpoint_worker_key(backend: AudioBackend, endpoint_id: &str) -> String {
     format!("{}::{}", backend.short_label(), endpoint_id)
+}
+
+/// Explicit routing to the already-active global endpoint must reuse the
+/// global Worker. A stable ID is authoritative; the display name is used only
+/// for legacy routes that do not yet have a stable endpoint ID.
+fn explicit_endpoint_matches_global(
+    requested_backend: AudioBackend,
+    requested_endpoint_id: Option<&str>,
+    requested_device_name: Option<&str>,
+    global_backend: AudioBackend,
+    global_endpoint_id: &str,
+    global_device_name: &str,
+) -> bool {
+    if requested_backend != global_backend {
+        return false;
+    }
+
+    match requested_endpoint_id {
+        Some(requested_id) => requested_id == global_endpoint_id,
+        None => requested_device_name.is_some_and(|name| name == global_device_name),
+    }
 }
 
 fn endpoint_preferences_key(backend: AudioBackend, device_name: &str) -> String {
@@ -2675,34 +2719,52 @@ pub(crate) fn run_audio_worker_manager(
                     || output_device_id.is_some()
                 {
                     let backend = output_backend.unwrap_or(global_backend);
-                    let registered_by_id = output_device_id
-                        .as_deref()
-                        .and_then(|id| registry_endpoints.iter().find(|ep| ep.id == id))
-                        .filter(|endpoint| endpoint.backend == backend);
-                    let requested_name = output_device
-                        .as_deref()
-                        .or_else(|| registered_by_id.map(|endpoint| endpoint.device_name.as_str()));
-                    let registered = registered_by_id.or_else(|| {
-                        requested_name.and_then(|device_name| {
-                            registry_endpoints.iter().find(|endpoint| {
-                                endpoint.backend == backend
-                                    && endpoint.device_name == device_name
-                                    && endpoint.availability.is_available()
-                            })
-                        })
-                    });
-                    let resolved_name = registered
-                        .map(|endpoint| endpoint.device_name.clone())
-                        .or_else(|| output_device.clone())
-                        .unwrap_or_else(|| "Unavailable endpoint".to_string());
-                    let endpoint_id = registered
-                        .map(|endpoint| endpoint.id.clone())
-                        .or(output_device_id)
-                        .unwrap_or_else(|| {
-                            format!("{}:name:{}", backend.short_label(), resolved_name)
+                    if explicit_endpoint_matches_global(
+                        backend,
+                        output_device_id.as_deref(),
+                        output_device.as_deref(),
+                        global_backend,
+                        &global_endpoint_id,
+                        &global_device_name,
+                    ) {
+                        // Global Default and an explicit route to that exact
+                        // same endpoint are one Worker, not two startup paths.
+                        (
+                            global_backend,
+                            global_endpoint_id.clone(),
+                            global_device_name.clone(),
+                            global_key.clone(),
+                        )
+                    } else {
+                        let registered_by_id = output_device_id
+                            .as_deref()
+                            .and_then(|id| registry_endpoints.iter().find(|ep| ep.id == id))
+                            .filter(|endpoint| endpoint.backend == backend);
+                        let requested_name = output_device.as_deref().or_else(|| {
+                            registered_by_id.map(|endpoint| endpoint.device_name.as_str())
                         });
-                    let key = endpoint_worker_key(backend, &endpoint_id);
-                    (backend, endpoint_id, resolved_name, key)
+                        let registered = registered_by_id.or_else(|| {
+                            requested_name.and_then(|device_name| {
+                                registry_endpoints.iter().find(|endpoint| {
+                                    endpoint.backend == backend
+                                        && endpoint.device_name == device_name
+                                        && endpoint.availability.is_available()
+                                })
+                            })
+                        });
+                        let resolved_name = registered
+                            .map(|endpoint| endpoint.device_name.clone())
+                            .or_else(|| output_device.clone())
+                            .unwrap_or_else(|| "Unavailable endpoint".to_string());
+                        let endpoint_id = registered
+                            .map(|endpoint| endpoint.id.clone())
+                            .or(output_device_id)
+                            .unwrap_or_else(|| {
+                                format!("{}:name:{}", backend.short_label(), resolved_name)
+                            });
+                        let key = endpoint_worker_key(backend, &endpoint_id);
+                        (backend, endpoint_id, resolved_name, key)
+                    }
                 } else if let Some(global) = workers.get(&global_key) {
                     (
                         global.backend,
@@ -3125,11 +3187,51 @@ pub(crate) fn run_audio_worker_manager(
                 // the UI relies on that event to settle Cue state and position.
                 send_to_worker(&workers, &key, AudioCommand::Stop(id));
             }
+            Ok(AudioCommand::StopTimed {
+                id,
+                request_id,
+                requested_at_unix_micros,
+            }) => {
+                let manager_elapsed_us = unix_micros_now().saturating_sub(requested_at_unix_micros);
+                let key = cue_owners
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| global_key.clone());
+                info!(
+                    "STOP_LATENCY: request_id={}, cue_id={}, stage=worker_manager_received, request_to_manager_us={}, endpoint='{}'",
+                    request_id, id, manager_elapsed_us, key
+                );
+                send_to_worker(
+                    &workers,
+                    &key,
+                    AudioCommand::StopTimed {
+                        id,
+                        request_id,
+                        requested_at_unix_micros,
+                    },
+                );
+            }
             Ok(AudioCommand::StopAll) => {
                 for worker in workers.values() {
                     let _ = worker.command_tx.send(AudioCommand::StopAll);
                 }
                 // Individual Stopped events remove ownership as they arrive.
+            }
+            Ok(AudioCommand::StopAllTimed {
+                request_id,
+                requested_at_unix_micros,
+            }) => {
+                let manager_elapsed_us = unix_micros_now().saturating_sub(requested_at_unix_micros);
+                info!(
+                    "STOP_LATENCY: request_id={}, scope=all, stage=worker_manager_received, request_to_manager_us={}, endpoint_workers={}",
+                    request_id, manager_elapsed_us, workers.len()
+                );
+                for worker in workers.values() {
+                    let _ = worker.command_tx.send(AudioCommand::StopAllTimed {
+                        request_id,
+                        requested_at_unix_micros,
+                    });
+                }
             }
             Ok(AudioCommand::Pause(id)) => {
                 let key = cue_owners
@@ -4123,7 +4225,20 @@ pub(crate) fn run_worker_child_stdio() -> Result<()> {
     }
 
     let registry = match config.registry_endpoints {
-        Some(endpoints) => crate::audio::device_registry::DeviceRegistry::from_endpoints(endpoints),
+        Some(endpoints) => {
+            if !config.include_full_device_metadata {
+                info!(
+                    "GO_DEVICE_REGISTRY: using cached snapshot with {} endpoint(s); device enumeration skipped",
+                    endpoints.len()
+                );
+            }
+            crate::audio::device_registry::DeviceRegistry::from_endpoints(endpoints)
+        }
+        None if !config.include_full_device_metadata => {
+            anyhow::bail!(
+                "Per-Cue audio Worker requires a cached device-registry snapshot; device enumeration is disabled on the GO path"
+            );
+        }
         None => crate::audio::device_registry::DeviceRegistry::from_scan(
             AudioEngine::scan_output_endpoints(),
         ),
@@ -4348,8 +4463,30 @@ fn handle_worker_command(
             engine.send(AudioCommand::Stop(id));
             None
         }
+        WorkerCommand::StopTimed {
+            id,
+            request_id,
+            requested_at_unix_micros,
+        } => {
+            engine.send(AudioCommand::StopTimed {
+                id,
+                request_id,
+                requested_at_unix_micros,
+            });
+            None
+        }
         WorkerCommand::StopAll => {
             engine.send(AudioCommand::StopAll);
+            None
+        }
+        WorkerCommand::StopAllTimed {
+            request_id,
+            requested_at_unix_micros,
+        } => {
+            engine.send(AudioCommand::StopAllTimed {
+                request_id,
+                requested_at_unix_micros,
+            });
             None
         }
         WorkerCommand::Pause(id) => {
@@ -4699,7 +4836,8 @@ mod protocol_tests {
 #[cfg(test)]
 mod worker_manager_identity_tests {
     use super::{
-        endpoint_worker_key, position_update_matches_owner, worker_identity_matches_request,
+        endpoint_worker_key, explicit_endpoint_matches_global, position_update_matches_owner,
+        worker_identity_matches_request,
     };
     use crate::audio::engine::PositionUpdate;
     use crate::audio::worker::WorkerEngineMetadata;
@@ -4784,6 +4922,54 @@ mod worker_manager_identity_tests {
             &metadata,
             AudioBackend::Asio,
             "cpal:asio:tascam",
+            "TASCAM US-366",
+        ));
+    }
+
+    #[test]
+    fn explicit_global_endpoint_reuses_global_worker_by_stable_id() {
+        assert!(explicit_endpoint_matches_global(
+            AudioBackend::Asio,
+            Some("endpoint-a"),
+            Some("TASCAM US-366"),
+            AudioBackend::Asio,
+            "endpoint-a",
+            "TASCAM US-366",
+        ));
+    }
+
+    #[test]
+    fn legacy_explicit_global_endpoint_reuses_global_worker_by_exact_name() {
+        assert!(explicit_endpoint_matches_global(
+            AudioBackend::Asio,
+            None,
+            Some("TASCAM US-366"),
+            AudioBackend::Asio,
+            "endpoint-a",
+            "TASCAM US-366",
+        ));
+    }
+
+    #[test]
+    fn explicit_route_with_different_stable_id_does_not_alias_global_by_name() {
+        assert!(!explicit_endpoint_matches_global(
+            AudioBackend::Asio,
+            Some("endpoint-b"),
+            Some("TASCAM US-366"),
+            AudioBackend::Asio,
+            "endpoint-a",
+            "TASCAM US-366",
+        ));
+    }
+
+    #[test]
+    fn explicit_route_on_another_backend_does_not_alias_global_worker() {
+        assert!(!explicit_endpoint_matches_global(
+            AudioBackend::Wasapi,
+            Some("endpoint-a"),
+            Some("TASCAM US-366"),
+            AudioBackend::Asio,
+            "endpoint-a",
             "TASCAM US-366",
         ));
     }

@@ -26,13 +26,41 @@ use std::mem::MaybeUninit;
 use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+fn unix_micros_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Store a floating-point playback position without taking a lock in the audio
+/// source's `next()` path. The position is observational state, so relaxed
+/// ordering is sufficient; no other data is published through this atomic.
+#[inline]
+fn atomic_store_f64(target: &AtomicU64, value: f64) {
+    target.store(value.to_bits(), Ordering::Relaxed);
+}
+
+/// Read a playback position published by an audio source.
+#[inline]
+fn atomic_load_f64(source: &AtomicU64) -> f64 {
+    f64::from_bits(source.load(Ordering::Relaxed))
+}
+
 type SharedOutputSettings = Arc<RwLock<Vec<OutputChannelSetting>>>;
+
+/// Sample one ChannelRouter frame out of every N frames for low-overhead profiling.
+const CHANNEL_ROUTER_PROFILE_STRIDE: u64 = 1_024;
+/// Sample one complete endpoint-mix frame out of every N frames.
+const MIXER_OUTPUT_PROFILE_STRIDE: u64 = 1_024;
 type OutputSettingsByDevice = Arc<RwLock<HashMap<String, SharedOutputSettings>>>;
 const AUDIO_MANAGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_MANAGER_FORCE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -92,7 +120,7 @@ pub enum AudioCommand {
         loop_enabled: bool,
         loop_start: f64,
         loop_end: f64,
-        loop_count: i32, // -1 = бесконечный, >0 = число повторов
+        loop_count: i32, // -1 = бесконечный, >0 = общее число проходов вместе с первым
     },
     /// Internal child-Worker command: prepare several cues and arm them against
     /// one output sample-frame clock. A batch is created from an explicit launch
@@ -112,7 +140,16 @@ pub enum AudioCommand {
         transaction_id: Uuid,
     },
     Stop(Uuid),
+    StopTimed {
+        id: Uuid,
+        request_id: Uuid,
+        requested_at_unix_micros: u64,
+    },
     StopAll,
+    StopAllTimed {
+        request_id: Uuid,
+        requested_at_unix_micros: u64,
+    },
     Pause(Uuid),
     Seek {
         id: Uuid,
@@ -632,12 +669,27 @@ impl AudioEngine {
         if backend == AudioBackend::DirectSound {
             #[cfg(target_os = "windows")]
             {
-                let selected_directsound_name = selected_device_id
+                let selected_endpoint = selected_device_id
                     .and_then(|id| device_registry.find_available_by_id(id))
                     .filter(|endpoint| endpoint.backend == AudioBackend::DirectSound)
+                    .cloned()
+                    .or_else(|| {
+                        selected_device.and_then(|name| {
+                            device_registry
+                                .find_available_by_backend_name(AudioBackend::DirectSound, name)
+                                .cloned()
+                        })
+                    });
+                let selected_directsound_name = selected_endpoint
+                    .as_ref()
                     .map(|endpoint| endpoint.device_name.clone())
                     .or_else(|| selected_device.map(str::to_string));
-                let mut engine = Self::new_directsound(selected_directsound_name, performance)?;
+                let mut engine = Self::new_directsound(
+                    selected_directsound_name,
+                    selected_endpoint,
+                    performance,
+                    include_full_device_metadata,
+                )?;
                 engine.device_registry = device_registry;
                 for device_name in &engine.output_devices {
                     let channels = engine
@@ -685,6 +737,21 @@ impl AudioEngine {
                 .and_then(|device_id| host.device_by_id(device_id));
             if let Some(device) = by_id {
                 device
+            } else if !include_full_device_metadata {
+                // Per-Cue Workers are created from GO. Never enumerate devices
+                // on this path: use the cached stable ID, or accept the cached
+                // default endpoint by name, otherwise fail fast and ask for a
+                // registry refresh instead of blocking the launch transaction.
+                let default_device = host.default_output_device();
+                match (default_device, selected_device) {
+                    (Some(device), Some(selected_name))
+                        if device.to_string() == selected_name => device,
+                    _ => anyhow::bail!(
+                        "Selected {} endpoint ID '{}' could not be resolved from the cached device ID without scanning devices. Refresh the device registry or reselect the output.",
+                        backend.label(),
+                        selected_id
+                    ),
+                }
             } else if let Some(selected_name) = selected_device {
                 host.output_devices()?
                     .find(|device| device.to_string() == selected_name)
@@ -704,21 +771,37 @@ impl AudioEngine {
                 );
             }
         } else if let Some(selected_name) = selected_device {
-            host.output_devices()?
-                .find(|device| device.to_string() == selected_name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Selected {} output device '{}' is no longer available",
-                        backend.label(),
-                        selected_name
-                    )
-                })?
+            if !include_full_device_metadata {
+                host.default_output_device()
+                    .filter(|device| device.to_string() == selected_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Selected {} endpoint '{}' has no stable cached ID and is not the current default output; refusing to scan devices during GO",
+                            backend.label(),
+                            selected_name
+                        )
+                    })?
+            } else {
+                host.output_devices()?
+                    .find(|device| device.to_string() == selected_name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Selected {} output device '{}' is no longer available",
+                            backend.label(),
+                            selected_name
+                        )
+                    })?
+            }
         } else {
             host.default_output_device()
                 .or_else(|| {
-                    host.output_devices()
-                        .ok()
-                        .and_then(|mut devices| devices.next())
+                    include_full_device_metadata
+                        .then(|| {
+                            host.output_devices()
+                                .ok()
+                                .and_then(|mut devices| devices.next())
+                        })
+                        .flatten()
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!("No output audio device found for {}", backend.label())
@@ -963,7 +1046,9 @@ impl AudioEngine {
     #[cfg(target_os = "windows")]
     fn new_directsound(
         selected_device: Option<String>,
+        selected_endpoint: Option<AudioEndpoint>,
         performance: AudioPerformanceSettings,
+        include_full_device_metadata: bool,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = bounded::<AudioCommand>(256);
         let (pos_tx, pos_rx) = bounded::<PositionUpdate>(1024);
@@ -976,6 +1061,8 @@ impl AudioEngine {
         let audio_thread = std::thread::spawn(move || {
             audio_worker_directsound(
                 selected_device,
+                selected_endpoint,
+                include_full_device_metadata,
                 cmd_rx,
                 pos_tx,
                 worker_output_settings,
@@ -2340,6 +2427,45 @@ struct DynamicFade {
     custom_fade_points: Vec<[f32; 2]>,
 }
 
+const STOP_DECLICK_FADE_MS: f64 = 5.0;
+
+/// Shared control between the audio worker and one Cue's render source.
+/// The stop ramp is applied sample-by-sample after channel mapping/resampling.
+#[derive(Clone)]
+struct StopFadeControl {
+    requested: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+}
+
+impl StopFadeControl {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            completed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn request(&self) {
+        if !self.completed.load(Ordering::Acquire) {
+            self.requested.store(true, Ordering::Release);
+        }
+    }
+
+    fn complete_without_render(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+
+    fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
+}
+
+struct PendingStopCompletion {
+    request_id: Uuid,
+    cue_id: Option<Uuid>,
+    requested_at: Instant,
+}
+
 struct ActivePlayer {
     id: Uuid,
     generation: u64,
@@ -2352,7 +2478,11 @@ struct ActivePlayer {
     volume_automation_enabled: bool,
     volume_automation: Vec<[f64; 2]>,
     time_pitch: Arc<RwLock<TimePitchSettings>>,
-    position_state: Arc<RwLock<f64>>,
+    position_state: Arc<AtomicU64>,
+    prefetch_underrun_count: Arc<AtomicU64>,
+    last_prefetch_underrun_count: u64,
+    prefetch_underrun_frame_count: Arc<AtomicU64>,
+    last_prefetch_underrun_frame_count: u64,
     automation_update_tx: Sender<VolumeAutomationUpdate>,
     automation_update_rx: Receiver<VolumeAutomationUpdate>,
     fade_in_secs: f64,
@@ -2368,11 +2498,32 @@ struct ActivePlayer {
     mixer: rodio::mixer::Mixer,
     output_settings: SharedOutputSettings,
     loop_enabled: bool,
+    loop_runtime_active: bool,
     loop_start: f64,
     loop_end: f64,
-    loops_remaining: i32, // -1 = inf
+    loops_remaining: Arc<AtomicI32>, // -1 = infinite; finite count includes initial pass
+    /// Producer-side count: decoder has prepared a loop repeat, not yet rendered it.
+    loop_iterations: Arc<AtomicU64>,
+    last_reported_loop_iterations: u64,
+    /// Render-side count: the PCM consumer has crossed an audible loop boundary.
+    render_loop_iterations: Arc<AtomicU64>,
+    last_reported_render_loop_iterations: u64,
+    render_loop_boundary_frame: Arc<AtomicU64>,
+    render_loop_boundary_position_bits: Arc<AtomicU64>,
+    render_loop_boundary_endpoint_frame: Arc<AtomicU64>,
+    render_loop_fingerprint: Arc<AtomicU64>,
+    render_loop_fingerprint_iteration: Arc<AtomicU64>,
+    last_reported_render_loop_fingerprint_iteration: u64,
+    loop_pcm_capture: Arc<LoopPcmCapture>,
+    last_reported_loop_pcm_capture_iteration: u64,
+    playback_elapsed_frames: Arc<AtomicU64>,
+    render_loop_remaining_state: Arc<AtomicI32>,
+    source_sample_rate: u32,
     paused_at: Option<f64>,
     dynamic_fade: Option<DynamicFade>,
+    stop_fade: StopFadeControl,
+    stopping: bool,
+    pending_stop_completions: Vec<PendingStopCompletion>,
     /// Set by the render source on its first scheduled output frame for a batch Cue.
     start_frame_observed: Option<Arc<AtomicU64>>,
     start_frame_reported: bool,
@@ -2382,7 +2533,7 @@ struct ActivePlayer {
 impl ActivePlayer {
     fn current_pos(&self) -> f64 {
         self.paused_at
-            .unwrap_or_else(|| *self.position_state.read())
+            .unwrap_or_else(|| atomic_load_f64(&self.position_state))
     }
 }
 
@@ -2437,14 +2588,14 @@ fn volume_automation_gain_at(position_secs: f64, points: &[[f64; 2]], enabled: b
 /// the next frame boundary without restarting playback.
 struct VolumeAutomationSource<S> {
     source: S,
-    start_secs: f64,
     channels: u64,
-    sample_rate: f64,
     sample_index: u64,
+    position_state: Arc<AtomicU64>,
     current_gain: f32,
     enabled: bool,
     points: Vec<[f64; 2]>,
     updates: Receiver<VolumeAutomationUpdate>,
+    retired_points_tx: Sender<Vec<[f64; 2]>>,
 }
 
 impl<S> VolumeAutomationSource<S>
@@ -2453,24 +2604,32 @@ where
 {
     fn new(
         source: S,
-        start_secs: f64,
         enabled: bool,
         points: Vec<[f64; 2]>,
         updates: Receiver<VolumeAutomationUpdate>,
+        retired_points_tx: Sender<Vec<[f64; 2]>>,
+        position_state: Arc<AtomicU64>,
     ) -> Self {
         let channels = source.channels().get().max(1) as u64;
-        let sample_rate = source.sample_rate().get().max(1) as f64;
         Self {
             source,
-            start_secs,
             channels,
-            sample_rate,
             sample_index: 0,
+            position_state,
             current_gain: 1.0,
             enabled,
             points,
             updates,
+            retired_points_tx,
         }
+    }
+}
+
+fn retire_automation_points(retired_points_tx: &Sender<Vec<[f64; 2]>>, points: Vec<[f64; 2]>) {
+    if let Err(error) = retired_points_tx.try_send(points) {
+        // The control loop drains this bounded queue every worker tick. On an
+        // exceptional overflow/disconnect, leak rather than free on callback.
+        std::mem::forget(error.into_inner());
     }
 }
 
@@ -2483,13 +2642,15 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.source.next()?;
         let channel_index = self.sample_index % self.channels;
-        let frame_index = self.sample_index / self.channels;
         if channel_index == 0 {
             while let Ok(update) = self.updates.try_recv() {
                 self.enabled = update.enabled;
-                self.points = update.points;
+                let previous_points = std::mem::replace(&mut self.points, update.points);
+                // The audio render thread must not free an automation Vec. The
+                // Worker control loop owns the receiver and drops retired arrays.
+                retire_automation_points(&self.retired_points_tx, previous_points);
             }
-            let position_secs = self.start_secs + frame_index as f64 / self.sample_rate;
+            let position_secs = atomic_load_f64(&self.position_state);
             self.current_gain =
                 volume_automation_gain_at(position_secs, &self.points, self.enabled);
         }
@@ -2499,6 +2660,16 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.source.size_hint()
+    }
+}
+
+impl<S> Drop for VolumeAutomationSource<S> {
+    fn drop(&mut self) {
+        let points = std::mem::take(&mut self.points);
+        retire_automation_points(&self.retired_points_tx, points);
+        while let Ok(update) = self.updates.try_recv() {
+            retire_automation_points(&self.retired_points_tx, update.points);
+        }
     }
 }
 
@@ -2617,9 +2788,9 @@ where
     }
 }
 
-/// Counts complete interleaved output frames as the final mixed stream is
-/// consumed. The increment happens after each frame, so all cue sources polled
-/// while mixing that frame observe the same frame index.
+/// Counts complete interleaved frames delivered to the endpoint. The transport
+/// gate is upstream of this wrapper, so silent Pause All frames still advance
+/// the endpoint clock while the underlying Cue mixer remains frozen.
 struct SampleFrameClockSource<S> {
     source: S,
     frame_clock: Arc<AtomicU64>,
@@ -2683,6 +2854,104 @@ where
         &mut self,
         position: Duration,
     ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.source.try_seek(position)
+    }
+}
+
+/// Freezes the complete endpoint mix at one shared sample boundary.
+///
+/// This wrapper is placed after the mixer and before metering/frame counting.
+/// While paused it emits silence without polling the mixer, so no individual
+/// Cue source advances. Because the wrapper is shared by the whole endpoint,
+/// Pause All / Resume All cannot introduce per-Sink start/stop offsets.
+struct OutputTransportGateSource<S> {
+    source: S,
+    paused: Arc<AtomicBool>,
+    channels: usize,
+    channel_index: usize,
+    frame_paused: bool,
+}
+
+impl<S> OutputTransportGateSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(source: S, paused: Arc<AtomicBool>) -> Self {
+        let channels = source.channels().get().max(1) as usize;
+        Self {
+            source,
+            paused,
+            channels,
+            channel_index: 0,
+            frame_paused: false,
+        }
+    }
+}
+
+impl<S> Iterator for OutputTransportGateSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Latch the transport state once per complete interleaved frame. A
+        // Pause/Resume arriving between L and R must not split that frame.
+        if self.channel_index == 0 {
+            self.frame_paused = self.paused.load(Ordering::Acquire);
+        }
+
+        let sample = if self.frame_paused {
+            // Do not advance the mixer while the transport is globally paused.
+            0.0
+        } else {
+            self.source.next()?
+        };
+
+        self.channel_index += 1;
+        if self.channel_index >= self.channels {
+            self.channel_index = 0;
+        }
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // The gate can emit silence indefinitely while paused, independent of
+        // the wrapped mixer's current size hint.
+        (0, None)
+    }
+}
+
+impl<S> Source for OutputTransportGateSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        if self.frame_paused {
+            None
+        } else {
+            self.source.current_span_len()
+        }
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.channel_index = 0;
+        self.frame_paused = self.paused.load(Ordering::Acquire);
         self.source.try_seek(position)
     }
 }
@@ -2751,6 +3020,378 @@ fn sanitize_time_pitch_settings(settings: &mut TimePitchSettings) {
 /// Streaming phase-vocoder transform. Playback speed and pitch are independent:
 /// speed changes the analysis hop, while pitch shifts spectral bins. This keeps
 /// multichannel interleaving intact and supports automation without restarting a cue.
+
+#[derive(Debug)]
+struct LoopSeekFailure {
+    input_frame: AtomicU64,
+    media_frame: AtomicU64,
+}
+
+/// Maps the monotonically increasing decoded-frame index to the file's media
+/// timeline. This lets automation and the UI playhead wrap with the audio while
+/// the PCM stream itself remains continuous.
+#[derive(Clone)]
+struct LoopTimeline {
+    initial_start_frame: u64,
+    loop_start_frame: u64,
+    loop_end_frame: u64,
+    initial_loops_remaining: i32,
+    failure: Arc<LoopSeekFailure>,
+}
+
+impl LoopTimeline {
+    fn media_frame_at_input_frame(&self, input_frame: f64) -> f64 {
+        let input_frame = input_frame.max(0.0);
+        let failure_at = self.failure.input_frame.load(Ordering::Acquire);
+        if failure_at != u64::MAX && input_frame >= failure_at as f64 {
+            let failure_media = self.failure.media_frame.load(Ordering::Acquire) as f64;
+            return failure_media + (input_frame - failure_at as f64);
+        }
+
+        let loop_len = self.loop_end_frame.saturating_sub(self.loop_start_frame) as f64;
+        if loop_len <= 0.0 {
+            return self.initial_start_frame as f64 + input_frame;
+        }
+
+        let first_pass_frames = self.loop_end_frame.saturating_sub(self.initial_start_frame) as f64;
+        if input_frame < first_pass_frames {
+            return self.initial_start_frame as f64 + input_frame;
+        }
+
+        let after_first_pass = input_frame - first_pass_frames;
+        if self.initial_loops_remaining == -1 {
+            return self.loop_start_frame as f64 + after_first_pass.rem_euclid(loop_len);
+        }
+
+        // loop_count is the total number of passes, including the first pass.
+        // Therefore count=2 means one additional traversal of the loop region.
+        let additional_passes = self.initial_loops_remaining.saturating_sub(1).max(0) as f64;
+        let repeated_frames = loop_len * additional_passes;
+        if after_first_pass < repeated_frames {
+            self.loop_start_frame as f64 + after_first_pass.rem_euclid(loop_len)
+        } else {
+            self.loop_end_frame as f64 + (after_first_pass - repeated_frames)
+        }
+    }
+
+    fn media_secs_at_input_frame(&self, input_frame: f64, sample_rate: f64) -> f64 {
+        self.media_frame_at_input_frame(input_frame) / sample_rate.max(1.0)
+    }
+
+    fn loops_remaining_at_input_frame(&self, input_frame: f64) -> i32 {
+        let input_frame = input_frame.max(0.0);
+        let failure_at = self.failure.input_frame.load(Ordering::Acquire);
+        if failure_at != u64::MAX && input_frame >= failure_at as f64 {
+            return 1;
+        }
+        if self.initial_loops_remaining == -1 {
+            return -1;
+        }
+
+        let first_pass_frames = self.loop_end_frame.saturating_sub(self.initial_start_frame) as f64;
+        if input_frame < first_pass_frames {
+            return self.initial_loops_remaining;
+        }
+
+        let loop_len = self.loop_end_frame.saturating_sub(self.loop_start_frame) as f64;
+        if loop_len <= 0.0 {
+            return 1;
+        }
+        let after_first_pass = input_frame - first_pass_frames;
+        let completed_additional_passes = (after_first_pass / loop_len).floor() as i32 + 1;
+        self.initial_loops_remaining
+            .saturating_sub(completed_additional_passes)
+            .max(1)
+    }
+}
+
+fn should_apply_loop_fade_out(
+    loop_runtime_active: bool,
+    rendered_loops_remaining: i32,
+    end_secs: f64,
+    loop_end_secs: f64,
+) -> bool {
+    !loop_runtime_active
+        || rendered_loops_remaining == 1
+        || (end_secs > 0.0 && end_secs < loop_end_secs)
+}
+
+fn seconds_to_source_frame(seconds: f64, sample_rate: u32) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    let frames = (seconds * sample_rate.max(1) as f64).round();
+    if !frames.is_finite() || frames <= 0.0 {
+        0
+    } else {
+        frames.min(u64::MAX as f64) as u64
+    }
+}
+
+/// A seekable decoder wrapper that emits a continuous sequence of source frames.
+/// Loop boundaries are exclusive at loop_end and inclusive at loop_start.
+/// `loop_count` is the total number of passes; -1 means infinite.
+struct LoopingSource<S> {
+    source: S,
+    channels: usize,
+    sample_rate: u32,
+    initial_start_frame: u64,
+    initial_seek_done: bool,
+    media_frame_position: u64,
+    channel_index: usize,
+    frames_emitted: u64,
+    loop_start_frame: u64,
+    loop_end_frame: u64,
+    loop_active: bool,
+    source_failed: bool,
+    loops_remaining: Arc<AtomicI32>,
+    loop_iterations: Arc<AtomicU64>,
+    timeline: Option<LoopTimeline>,
+    file_label: String,
+}
+
+impl<S> LoopingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(
+        source: S,
+        offset_secs: f64,
+        loop_start_secs: f64,
+        loop_end_secs: f64,
+        loop_enabled: bool,
+        loops_remaining: Arc<AtomicI32>,
+        loop_iterations: Arc<AtomicU64>,
+        file_label: String,
+    ) -> Self {
+        let channels = source.channels().get().max(1) as usize;
+        let sample_rate = source.sample_rate().get().max(1);
+        let initial_start_frame = seconds_to_source_frame(offset_secs, sample_rate);
+        let loop_start_frame = seconds_to_source_frame(loop_start_secs, sample_rate);
+        let loop_end_frame = seconds_to_source_frame(loop_end_secs, sample_rate);
+        let initial_loops_remaining = loops_remaining.load(Ordering::Acquire);
+        let loop_active = loop_enabled
+            && loop_end_frame > loop_start_frame
+            && (initial_loops_remaining == -1 || initial_loops_remaining > 1);
+        let timeline = loop_active.then(|| LoopTimeline {
+            initial_start_frame,
+            loop_start_frame,
+            loop_end_frame,
+            initial_loops_remaining,
+            failure: Arc::new(LoopSeekFailure {
+                input_frame: AtomicU64::new(u64::MAX),
+                media_frame: AtomicU64::new(0),
+            }),
+        });
+
+        if timeline.is_some() {
+            info!(
+                "AUDIO_LOOP_SOURCE_ARMED: file='{}', offset_frame={}, loop_start_frame={}, loop_end_frame={}, loop_count={}, source_rate={} Hz, channels={}",
+                file_label,
+                initial_start_frame,
+                loop_start_frame,
+                loop_end_frame,
+                initial_loops_remaining,
+                sample_rate,
+                channels
+            );
+        }
+
+        Self {
+            source,
+            channels,
+            sample_rate,
+            initial_start_frame,
+            initial_seek_done: false,
+            media_frame_position: 0,
+            channel_index: 0,
+            frames_emitted: 0,
+            loop_start_frame,
+            loop_end_frame,
+            loop_active,
+            source_failed: false,
+            loops_remaining,
+            loop_iterations,
+            timeline,
+            file_label,
+        }
+    }
+
+    fn initialize_decoder_position(&mut self) -> bool {
+        if self.initial_seek_done {
+            return !self.source_failed;
+        }
+        self.initial_seek_done = true;
+
+        if self.initial_start_frame == 0 {
+            self.media_frame_position = 0;
+            return true;
+        }
+
+        let target = Duration::from_secs_f64(
+            self.initial_start_frame as f64 / self.sample_rate.max(1) as f64,
+        );
+        match self.source.try_seek(target) {
+            Ok(()) => {
+                self.media_frame_position = self.initial_start_frame;
+                true
+            }
+            Err(error) if error.source_intact() => {
+                // Some decoders do not support random access. Preserve the old
+                // skip-duration behavior by decoding forward on this producer thread.
+                let samples_to_skip = self
+                    .initial_start_frame
+                    .saturating_mul(self.channels as u64);
+                for _ in 0..samples_to_skip {
+                    if self.source.next().is_none() {
+                        self.source_failed = true;
+                        warn!(
+                            "AUDIO_SOURCE_OFFSET_UNAVAILABLE: file='{}', requested_frame={}, reason='{}'",
+                            self.file_label, self.initial_start_frame, error
+                        );
+                        return false;
+                    }
+                }
+                self.media_frame_position = self.initial_start_frame;
+                true
+            }
+            Err(error) => {
+                self.source_failed = true;
+                error!(
+                    "AUDIO_SOURCE_OFFSET_FAILED: file='{}', requested_frame={}, reason='{}'",
+                    self.file_label, self.initial_start_frame, error
+                );
+                false
+            }
+        }
+    }
+
+    fn begin_next_loop_pass(&mut self) {
+        if !self.loop_active || self.media_frame_position < self.loop_end_frame {
+            return;
+        }
+
+        let remaining = self.loops_remaining.load(Ordering::Acquire);
+        if remaining != -1 && remaining <= 1 {
+            self.loop_active = false;
+            return;
+        }
+
+        let target =
+            Duration::from_secs_f64(self.loop_start_frame as f64 / self.sample_rate.max(1) as f64);
+        match self.source.try_seek(target) {
+            Ok(()) => {
+                if remaining > 1 {
+                    self.loops_remaining.fetch_sub(1, Ordering::AcqRel);
+                }
+                self.media_frame_position = self.loop_start_frame;
+                self.loop_iterations.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) if error.source_intact() => {
+                if let Some(timeline) = &self.timeline {
+                    timeline
+                        .failure
+                        .media_frame
+                        .store(self.media_frame_position, Ordering::Relaxed);
+                    timeline
+                        .failure
+                        .input_frame
+                        .store(self.frames_emitted, Ordering::Release);
+                }
+                self.loops_remaining.store(1, Ordering::Release);
+                self.loop_active = false;
+                warn!(
+                    "AUDIO_LOOP_SEEK_UNSUPPORTED: file='{}', loop_start_frame={}, loop_end_frame={}, reason='{}'; playback will continue without further repeats",
+                    self.file_label,
+                    self.loop_start_frame,
+                    self.loop_end_frame,
+                    error
+                );
+            }
+            Err(error) => {
+                if let Some(timeline) = &self.timeline {
+                    timeline
+                        .failure
+                        .media_frame
+                        .store(self.media_frame_position, Ordering::Relaxed);
+                    timeline
+                        .failure
+                        .input_frame
+                        .store(self.frames_emitted, Ordering::Release);
+                }
+                self.loops_remaining.store(1, Ordering::Release);
+                self.loop_active = false;
+                self.source_failed = true;
+                error!(
+                    "AUDIO_LOOP_SEEK_FAILED: file='{}', loop_start_frame={}, loop_end_frame={}, reason='{}'; decoder can no longer continue safely",
+                    self.file_label,
+                    self.loop_start_frame,
+                    self.loop_end_frame,
+                    error
+                );
+            }
+        }
+    }
+}
+
+impl<S> Iterator for LoopingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.initialize_decoder_position() || self.source_failed {
+            return None;
+        }
+
+        if self.channel_index == 0 {
+            self.begin_next_loop_pass();
+            if self.source_failed {
+                return None;
+            }
+        }
+
+        let sample = self.source.next()?;
+        self.channel_index += 1;
+        if self.channel_index >= self.channels {
+            self.channel_index = 0;
+            self.media_frame_position = self.media_frame_position.saturating_add(1);
+            self.frames_emitted = self.frames_emitted.saturating_add(1);
+        }
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl<S> Source for LoopingSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        if self.timeline.is_some() {
+            None
+        } else {
+            self.source.total_duration()
+        }
+    }
+}
+
 struct SpeedPitchSource<S> {
     source: S,
     channels: usize,
@@ -2764,7 +3405,18 @@ struct SpeedPitchSource<S> {
     flush_remaining: usize,
     finished: bool,
     passthrough: bool,
+    settings_neutral: bool,
+    last_speed: f32,
+    last_pitch_cents: f32,
+    last_pitch_shift_changes_speed: bool,
+    last_preserve_pitch_on_speed_change: bool,
     passthrough_sample_index: u64,
+    /// Cumulative decoded input frame at the start of the current output hop.
+    output_hop_start_input_cursor: f64,
+    output_hop_speed: f32,
+    loop_timeline: Option<LoopTimeline>,
+    producer_loop_remaining_state: Arc<AtomicI32>,
+    output_hop_sample_index: u64,
     output_samples: VecDeque<f32>,
     input_frame: Vec<Complex<f32>>,
     window: Vec<f32>,
@@ -2779,18 +3431,37 @@ struct SpeedPitchSource<S> {
     fft_forward: Arc<dyn Fft<f32>>,
     fft_inverse: Arc<dyn Fft<f32>>,
     settings: Arc<RwLock<TimePitchSettings>>,
-    position_state: Arc<RwLock<f64>>,
+    position_state: Arc<AtomicU64>,
 }
 
 impl<S> SpeedPitchSource<S>
 where
     S: Source<Item = f32>,
 {
+    #[cfg(test)]
     fn new(
         source: S,
         start_secs: f64,
         settings: Arc<RwLock<TimePitchSettings>>,
-        position_state: Arc<RwLock<f64>>,
+        position_state: Arc<AtomicU64>,
+    ) -> Self {
+        Self::new_with_loop(
+            source,
+            start_secs,
+            settings,
+            position_state,
+            None,
+            Arc::new(AtomicI32::new(0)),
+        )
+    }
+
+    fn new_with_loop(
+        source: S,
+        start_secs: f64,
+        settings: Arc<RwLock<TimePitchSettings>>,
+        position_state: Arc<AtomicU64>,
+        loop_timeline: Option<LoopTimeline>,
+        producer_loop_remaining_state: Arc<AtomicI32>,
     ) -> Self {
         let channels = source.channels().get().max(1) as usize;
         let sample_rate = source.sample_rate().get().max(1) as f64;
@@ -2804,14 +3475,37 @@ where
             })
             .collect();
         let bins = TIME_PITCH_FFT_SIZE;
-        *position_state.write() = start_secs.max(0.0);
-        let passthrough = {
+        let initial_media_position = loop_timeline
+            .as_ref()
+            .map(|timeline| timeline.media_secs_at_input_frame(0.0, sample_rate))
+            .unwrap_or_else(|| start_secs.max(0.0));
+        atomic_store_f64(&position_state, initial_media_position);
+        if let Some(timeline) = &loop_timeline {
+            producer_loop_remaining_state.store(
+                timeline.loops_remaining_at_input_frame(0.0),
+                Ordering::Release,
+            );
+        }
+        let (
+            settings_neutral,
+            last_speed,
+            last_pitch_cents,
+            last_pitch_shift_changes_speed,
+            last_preserve_pitch_on_speed_change,
+        ) = {
             let initial = settings.read();
-            initial.speed_automation_enabled == false
-                && initial.pitch_automation_enabled == false
-                && (initial.speed - 1.0).abs() < 0.0001
-                && initial.pitch_cents.abs() < 0.0001
+            (
+                !initial.speed_automation_enabled
+                    && !initial.pitch_automation_enabled
+                    && (initial.speed - 1.0).abs() < 0.0001
+                    && initial.pitch_cents.abs() < 0.0001,
+                initial.speed,
+                initial.pitch_cents,
+                initial.pitch_shift_changes_speed,
+                initial.preserve_pitch_on_speed_change,
+            )
         };
+        let passthrough = settings_neutral;
         Self {
             source,
             channels,
@@ -2825,7 +3519,17 @@ where
             flush_remaining: 0,
             finished: false,
             passthrough,
+            settings_neutral,
+            last_speed,
+            last_pitch_cents,
+            last_pitch_shift_changes_speed,
+            last_preserve_pitch_on_speed_change,
             passthrough_sample_index: 0,
+            output_hop_start_input_cursor: 0.0,
+            output_hop_speed: 1.0,
+            loop_timeline,
+            producer_loop_remaining_state,
+            output_hop_sample_index: 0,
             output_samples: VecDeque::with_capacity(TIME_PITCH_HOP * channels),
             input_frame: vec![Complex::new(0.0, 0.0); TIME_PITCH_FFT_SIZE],
             window,
@@ -2844,27 +3548,46 @@ where
         }
     }
 
+    fn media_position_at_input_frame(&self, input_frame: f64) -> f64 {
+        self.loop_timeline
+            .as_ref()
+            .map(|timeline| timeline.media_secs_at_input_frame(input_frame, self.sample_rate))
+            .unwrap_or_else(|| self.start_secs + input_frame.max(0.0) / self.sample_rate)
+    }
+
     fn available_end_frame(&self) -> u64 {
         self.input_start_frame + (self.input_samples.len() / self.channels) as u64
     }
 
     fn fill_input_until(&mut self, required_end_frame: u64) {
         while !self.input_eof && self.available_end_frame() < required_end_frame {
-            let mut frame = Vec::with_capacity(self.channels);
+            // This method runs from the audio source's `next()` path. Read directly
+            // into the preallocated VecDeque instead of allocating a temporary Vec
+            // for every interleaved frame.
+            let mut samples_read = 0;
             for _ in 0..self.channels {
                 match self.source.next() {
-                    Some(sample) => frame.push(sample),
+                    Some(sample) => {
+                        self.input_samples.push_back(sample);
+                        samples_read += 1;
+                    }
                     None => {
                         self.input_eof = true;
                         break;
                     }
                 }
             }
-            if frame.is_empty() {
+
+            if samples_read == 0 {
                 break;
             }
-            frame.resize(self.channels, 0.0);
-            self.input_samples.extend(frame);
+
+            // Preserve the previous behavior for a decoder that ends partway
+            // through an interleaved frame: pad the final frame with silence.
+            while samples_read < self.channels {
+                self.input_samples.push_back(0.0);
+                samples_read += 1;
+            }
         }
     }
 
@@ -2926,7 +3649,7 @@ where
         let available_end = self.available_end_frame();
 
         if self.input_eof && available_end == 0 {
-            *self.position_state.write() = self.start_secs;
+            atomic_store_f64(&self.position_state, self.start_secs);
             self.finished = true;
             return;
         }
@@ -2949,32 +3672,57 @@ where
             return;
         }
 
-        let settings = self.settings.read().clone();
-        let media_time = self.start_secs + self.input_cursor / self.sample_rate;
-        let speed = automation_value_at(
-            media_time,
-            &settings.speed_automation,
-            settings.speed_automation_enabled,
-            settings.speed,
-        )
-        .clamp(0.1, 4.0);
-        let pitch_cents = automation_value_at(
-            media_time,
-            &settings.pitch_automation,
-            settings.pitch_automation_enabled,
-            settings.pitch_cents,
-        )
-        .clamp(-2400.0, 2400.0);
+        let media_time = self.media_position_at_input_frame(self.input_cursor);
+        // Never wait for a UI/control-thread settings write from the audio
+        // source. If a writer currently owns the lock, reuse the last complete
+        // scalar settings for this analysis hop.
+        let refreshed_settings = self.settings.try_read().map(|settings| {
+            let speed = automation_value_at(
+                media_time,
+                &settings.speed_automation,
+                settings.speed_automation_enabled,
+                settings.speed,
+            )
+            .clamp(0.1, 4.0);
+            let pitch_cents = automation_value_at(
+                media_time,
+                &settings.pitch_automation,
+                settings.pitch_automation_enabled,
+                settings.pitch_cents,
+            )
+            .clamp(-2400.0, 2400.0);
+            (
+                speed,
+                pitch_cents,
+                settings.pitch_shift_changes_speed,
+                settings.preserve_pitch_on_speed_change,
+            )
+        });
+        let (speed, pitch_cents, pitch_shift_changes_speed, preserve_pitch_on_speed_change) =
+            if let Some(refreshed) = refreshed_settings {
+                self.last_speed = refreshed.0;
+                self.last_pitch_cents = refreshed.1;
+                self.last_pitch_shift_changes_speed = refreshed.2;
+                self.last_preserve_pitch_on_speed_change = refreshed.3;
+                refreshed
+            } else {
+                (
+                    self.last_speed,
+                    self.last_pitch_cents,
+                    self.last_pitch_shift_changes_speed,
+                    self.last_preserve_pitch_on_speed_change,
+                )
+            };
         let pitch_factor = 2.0_f32.powf(pitch_cents / 1200.0);
         let effective_speed = (speed
-            * if settings.pitch_shift_changes_speed {
+            * if pitch_shift_changes_speed {
                 pitch_factor
             } else {
                 1.0
             })
         .clamp(0.1, 4.0);
         let effective_pitch = pitch_factor
-            * if settings.preserve_pitch_on_speed_change {
+            * if preserve_pitch_on_speed_change {
                 1.0
             } else {
                 speed
@@ -2985,7 +3733,10 @@ where
             .map(|previous| (self.input_cursor - previous).max(0.001))
             .unwrap_or(TIME_PITCH_HOP as f64 * effective_speed as f64);
 
-        *self.position_state.write() = media_time;
+        self.output_hop_start_input_cursor = self.input_cursor;
+        self.output_hop_speed = effective_speed;
+        self.output_hop_sample_index = 0;
+        atomic_store_f64(&self.position_state, media_time);
 
         let forward = self.fft_forward.clone();
         let inverse = self.fft_inverse.clone();
@@ -3094,24 +3845,29 @@ where
             let at_block_boundary =
                 self.passthrough_sample_index % (TIME_PITCH_HOP * self.channels) as u64 == 0;
             if at_block_boundary {
-                let settings = self.settings.read().clone();
-                let still_neutral = !settings.speed_automation_enabled
-                    && !settings.pitch_automation_enabled
-                    && (settings.speed - 1.0).abs() < 0.0001
-                    && settings.pitch_cents.abs() < 0.0001;
-                if !still_neutral {
-                    self.start_secs += self.passthrough_sample_index as f64
-                        / self.channels as f64
-                        / self.sample_rate;
+                let refreshed_neutral = self.settings.try_read().map(|settings| {
+                    !settings.speed_automation_enabled
+                        && !settings.pitch_automation_enabled
+                        && (settings.speed - 1.0).abs() < 0.0001
+                        && settings.pitch_cents.abs() < 0.0001
+                });
+                if let Some(still_neutral) = refreshed_neutral {
+                    self.settings_neutral = still_neutral;
+                }
+                if !self.settings_neutral {
+                    let consumed_frames = self.passthrough_sample_index / self.channels as u64;
                     self.passthrough_sample_index = 0;
-                    self.input_start_frame = 0;
-                    self.input_cursor = 0.0;
+                    self.input_start_frame = consumed_frames;
+                    self.input_cursor = consumed_frames as f64;
+                    self.output_hop_start_input_cursor = self.input_cursor;
                     self.previous_input_cursor = None;
                     self.input_eof = false;
                     self.flush_remaining = 0;
                     self.finished = false;
                     self.phase_initialized = false;
-                    *self.position_state.write() = self.start_secs;
+                    let current_media_position =
+                        self.media_position_at_input_frame(self.input_cursor);
+                    atomic_store_f64(&self.position_state, current_media_position);
                     self.passthrough = false;
                 }
             }
@@ -3120,14 +3876,22 @@ where
                 if sample.is_some() {
                     if self.passthrough_sample_index % self.channels as u64 == 0 {
                         let frame = self.passthrough_sample_index / self.channels as u64;
-                        *self.position_state.write() =
-                            self.start_secs + frame as f64 / self.sample_rate;
+                        let input_frame = (frame + 1) as f64;
+                        let media_position = self.media_position_at_input_frame(input_frame);
+                        atomic_store_f64(&self.position_state, media_position);
+                        let loops_remaining = self
+                            .loop_timeline
+                            .as_ref()
+                            .map(|timeline| timeline.loops_remaining_at_input_frame(input_frame))
+                            .unwrap_or(0);
+                        self.producer_loop_remaining_state
+                            .store(loops_remaining, Ordering::Release);
                     }
                     self.passthrough_sample_index = self.passthrough_sample_index.wrapping_add(1);
                 } else {
                     let frames = self.passthrough_sample_index / self.channels as u64;
-                    *self.position_state.write() =
-                        self.start_secs + frames as f64 / self.sample_rate;
+                    let media_position = self.media_position_at_input_frame(frames as f64);
+                    atomic_store_f64(&self.position_state, media_position);
                     self.finished = true;
                 }
                 return sample;
@@ -3138,10 +3902,27 @@ where
             self.generate_hop();
         }
         let sample = self.output_samples.pop_front();
+        if sample.is_some() {
+            if self.output_hop_sample_index % self.channels as u64 == 0 {
+                let frame_index = self.output_hop_sample_index / self.channels as u64;
+                let input_frame = self.output_hop_start_input_cursor
+                    + (frame_index + 1) as f64 * self.output_hop_speed as f64;
+                let media_position = self.media_position_at_input_frame(input_frame);
+                atomic_store_f64(&self.position_state, media_position);
+                let loops_remaining = self
+                    .loop_timeline
+                    .as_ref()
+                    .map(|timeline| timeline.loops_remaining_at_input_frame(input_frame))
+                    .unwrap_or(0);
+                self.producer_loop_remaining_state
+                    .store(loops_remaining, Ordering::Release);
+            }
+            self.output_hop_sample_index = self.output_hop_sample_index.wrapping_add(1);
+        }
         if self.finished && self.output_samples.is_empty() {
             let final_position =
-                self.start_secs + self.available_end_frame() as f64 / self.sample_rate;
-            *self.position_state.write() = final_position;
+                self.media_position_at_input_frame(self.available_end_frame() as f64);
+            atomic_store_f64(&self.position_state, final_position);
         }
         sample
     }
@@ -3172,6 +3953,842 @@ where
     }
 }
 
+const PCM_PREFETCH_CHUNK_FRAMES: usize = 512;
+const PCM_PREFETCH_BUFFER_COUNT: usize = 8;
+const PCM_LOOP_FINGERPRINT_FRAMES: usize = 128;
+const PCM_FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const PCM_FNV1A64_PRIME: u64 = 0x100000001b3;
+
+// Keep the loop-boundary sample capture fixed-size and lock-free in the render
+// path. Four source frames before and eight after each rendered wrap are enough
+// to identify whether the PCM itself changes at the boundary.
+const PCM_LOOP_CAPTURE_PRE_FRAMES: usize = 4;
+const PCM_LOOP_CAPTURE_POST_FRAMES: usize = 8;
+const PCM_LOOP_CAPTURE_MAX_CHANNELS: usize = 32;
+const PCM_LOOP_CAPTURE_SAMPLE_COUNT: usize =
+    (PCM_LOOP_CAPTURE_PRE_FRAMES + PCM_LOOP_CAPTURE_POST_FRAMES) * PCM_LOOP_CAPTURE_MAX_CHANNELS;
+const PCM_LOOP_CAPTURE_STATUS_PENDING: u32 = 0;
+const PCM_LOOP_CAPTURE_STATUS_VALID: u32 = 1;
+const PCM_LOOP_CAPTURE_STATUS_UNDERRUN: u32 = 2;
+const PCM_LOOP_CAPTURE_STATUS_UNSUPPORTED_CHANNELS: u32 = 3;
+const PCM_LOOP_CAPTURE_STATUS_INCOMPLETE: u32 = 4;
+
+/// Fixed-size handoff from the render source to the Worker control loop.
+/// The render source writes atomics only; formatting and logging happen on
+/// the Worker thread.
+struct LoopPcmCapture {
+    samples: [AtomicU32; PCM_LOOP_CAPTURE_SAMPLE_COUNT],
+    channels: AtomicU32,
+    pre_frames_valid: AtomicU32,
+    post_samples_captured: AtomicU32,
+    iteration: AtomicU64,
+    source_elapsed_frame: AtomicU64,
+    source_media_frame: AtomicU64,
+    endpoint_render_frame: AtomicU64,
+    status: AtomicU32,
+    completed_iteration: AtomicU64,
+    acknowledged_iteration: AtomicU64,
+    dropped_captures: AtomicU64,
+}
+
+impl LoopPcmCapture {
+    fn new() -> Self {
+        Self {
+            samples: std::array::from_fn(|_| AtomicU32::new(0)),
+            channels: AtomicU32::new(0),
+            pre_frames_valid: AtomicU32::new(0),
+            post_samples_captured: AtomicU32::new(0),
+            iteration: AtomicU64::new(0),
+            source_elapsed_frame: AtomicU64::new(0),
+            source_media_frame: AtomicU64::new(0),
+            endpoint_render_frame: AtomicU64::new(u64::MAX),
+            status: AtomicU32::new(PCM_LOOP_CAPTURE_STATUS_PENDING),
+            completed_iteration: AtomicU64::new(0),
+            acknowledged_iteration: AtomicU64::new(0),
+            dropped_captures: AtomicU64::new(0),
+        }
+    }
+}
+
+struct PcmPrefetchChunk {
+    samples: Vec<f32>,
+    /// Media position after each complete interleaved frame in `samples`.
+    /// This preserves loop wraps and non-linear Time/Pitch movement inside a chunk.
+    frame_end_positions: Vec<u64>,
+    frame_loop_remaining: Vec<i32>,
+    start_position_bits: u64,
+    end_position_bits: u64,
+    start_loop_remaining: i32,
+    eof: bool,
+}
+
+static PCM_BUFFER_REAPER: OnceLock<Option<Sender<PcmPrefetchChunk>>> = OnceLock::new();
+
+/// Buffers retired by a render-thread source drop are released by this helper
+/// thread rather than deallocated inside the native audio callback.
+fn pcm_buffer_reaper() -> Option<&'static Sender<PcmPrefetchChunk>> {
+    PCM_BUFFER_REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = bounded::<PcmPrefetchChunk>(2_048);
+            match thread::Builder::new()
+                .name("tasq-pcm-buffer-reaper".to_string())
+                .spawn(move || {
+                    while let Ok(chunk) = receiver.recv() {
+                        drop(chunk);
+                    }
+                }) {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    error!("Could not start PCM buffer reaper thread: {error}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn retire_pcm_buffer(chunk: PcmPrefetchChunk) {
+    if let Some(reaper) = pcm_buffer_reaper() {
+        if let Err(error) = reaper.try_send(chunk) {
+            // The reaper is normally available. If it has disconnected, leak
+            // the complete chunk rather than free either Vec on the callback.
+            std::mem::forget(error.into_inner());
+        }
+    } else {
+        // Thread creation failure is exceptional. Avoid a render-thread free.
+        std::mem::forget(chunk);
+    }
+}
+
+fn prefetch_chunk_frame_start_position(chunk: &PcmPrefetchChunk, frame_index: usize) -> f64 {
+    if frame_index == 0 {
+        return f64::from_bits(chunk.start_position_bits);
+    }
+    chunk
+        .frame_end_positions
+        .get(frame_index - 1)
+        .copied()
+        .map(f64::from_bits)
+        .unwrap_or_else(|| f64::from_bits(chunk.end_position_bits))
+}
+
+fn prefetch_chunk_frame_start_loop_remaining(chunk: &PcmPrefetchChunk, frame_index: usize) -> i32 {
+    if frame_index == 0 {
+        return chunk.start_loop_remaining;
+    }
+    chunk
+        .frame_loop_remaining
+        .get(frame_index - 1)
+        .copied()
+        .unwrap_or(chunk.start_loop_remaining)
+}
+
+/// SPSC-style chunk prefetch: decoding and time/pitch processing run on a
+/// producer thread; the render thread only reads preallocated PCM chunks.
+struct PcmPrefetchSource {
+    channels: std::num::NonZeroU16,
+    sample_rate: std::num::NonZeroU32,
+    total_duration: Option<Duration>,
+    ready_rx: Receiver<PcmPrefetchChunk>,
+    /// The producer holds a guard receiver so queued chunks are drained there
+    /// if the Cue is stopped while data remains buffered.
+    free_tx: Sender<PcmPrefetchChunk>,
+    current_chunk: Option<PcmPrefetchChunk>,
+    current_index: usize,
+    producer_finished: Arc<AtomicBool>,
+    render_position_state: Arc<AtomicU64>,
+    underrun_count: Arc<AtomicU64>,
+    playback_elapsed_frames: Arc<AtomicU64>,
+    render_loop_remaining_state: Arc<AtomicI32>,
+    /// Number of complete source frames that had to be replaced by silence.
+    underrun_frame_count: Arc<AtomicU64>,
+    /// Remaining channels in the current underrun-silence frame. This prevents
+    /// a newly arrived chunk from being consumed halfway through an interleaved frame.
+    underrun_silence_samples_remaining: usize,
+    underrun_active: bool,
+    /// Render-side loop diagnostics. These are updated without logging or allocation.
+    loop_diagnostics_enabled: bool,
+    render_loop_iterations: Arc<AtomicU64>,
+    render_loop_boundary_frame: Arc<AtomicU64>,
+    render_loop_boundary_position_bits: Arc<AtomicU64>,
+    render_loop_boundary_endpoint_frame: Arc<AtomicU64>,
+    endpoint_frame_clock: Option<Arc<AtomicU64>>,
+    render_loop_fingerprint: Arc<AtomicU64>,
+    render_loop_fingerprint_iteration: Arc<AtomicU64>,
+    loop_pcm_capture: Arc<LoopPcmCapture>,
+    loop_capture_pre_samples: [f32; PCM_LOOP_CAPTURE_PRE_FRAMES * PCM_LOOP_CAPTURE_MAX_CHANNELS],
+    loop_capture_pre_frames: usize,
+    loop_capture_pre_write_frame: usize,
+    loop_capture_active: bool,
+    loop_capture_iteration: u64,
+    loop_capture_post_samples_written: usize,
+    last_render_media_position: Option<f64>,
+    loop_fingerprint_active: bool,
+    loop_fingerprint_samples_remaining: usize,
+    loop_fingerprint_hash: u64,
+    loop_fingerprint_iteration: u64,
+    consumer_finished: bool,
+}
+
+impl PcmPrefetchSource {
+    fn begin_loop_pcm_capture(
+        &mut self,
+        iteration: u64,
+        source_elapsed_frame: u64,
+        source_media_frame: u64,
+        endpoint_render_frame: u64,
+    ) {
+        if self.loop_capture_active {
+            self.invalidate_loop_pcm_capture(PCM_LOOP_CAPTURE_STATUS_INCOMPLETE);
+        }
+        let completed = self
+            .loop_pcm_capture
+            .completed_iteration
+            .load(Ordering::Acquire);
+        let acknowledged = self
+            .loop_pcm_capture
+            .acknowledged_iteration
+            .load(Ordering::Acquire);
+        if completed > acknowledged {
+            // Do not overwrite a capture before the Worker has consumed it.
+            self.loop_pcm_capture
+                .dropped_captures
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let channel_count = self.channels.get().max(1) as usize;
+        self.loop_pcm_capture
+            .channels
+            .store(channel_count as u32, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .pre_frames_valid
+            .store(0, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .post_samples_captured
+            .store(0, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .iteration
+            .store(iteration, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .source_elapsed_frame
+            .store(source_elapsed_frame, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .source_media_frame
+            .store(source_media_frame, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .endpoint_render_frame
+            .store(endpoint_render_frame, Ordering::Relaxed);
+
+        if channel_count > PCM_LOOP_CAPTURE_MAX_CHANNELS {
+            self.loop_pcm_capture.status.store(
+                PCM_LOOP_CAPTURE_STATUS_UNSUPPORTED_CHANNELS,
+                Ordering::Relaxed,
+            );
+            self.loop_pcm_capture
+                .completed_iteration
+                .store(iteration, Ordering::Release);
+            return;
+        }
+
+        let pre_frames = self
+            .loop_capture_pre_frames
+            .min(PCM_LOOP_CAPTURE_PRE_FRAMES);
+        let missing_pre_frames = PCM_LOOP_CAPTURE_PRE_FRAMES - pre_frames;
+        let oldest_pre_frame = if pre_frames == PCM_LOOP_CAPTURE_PRE_FRAMES {
+            self.loop_capture_pre_write_frame
+        } else {
+            0
+        };
+
+        // Store the pre-boundary frames right-aligned so the post-boundary
+        // region always starts at the same fixed offset in the shared buffer.
+        for destination_frame in 0..PCM_LOOP_CAPTURE_PRE_FRAMES {
+            for channel in 0..channel_count {
+                let sample = if destination_frame < missing_pre_frames {
+                    0.0
+                } else {
+                    let chronological_frame = destination_frame - missing_pre_frames;
+                    let source_frame = if pre_frames == PCM_LOOP_CAPTURE_PRE_FRAMES {
+                        (oldest_pre_frame + chronological_frame) % PCM_LOOP_CAPTURE_PRE_FRAMES
+                    } else {
+                        chronological_frame
+                    };
+                    self.loop_capture_pre_samples
+                        [source_frame * PCM_LOOP_CAPTURE_MAX_CHANNELS + channel]
+                };
+                let sample_index = destination_frame * channel_count + channel;
+                self.loop_pcm_capture.samples[sample_index]
+                    .store(sample.to_bits(), Ordering::Relaxed);
+            }
+        }
+
+        self.loop_pcm_capture
+            .pre_frames_valid
+            .store(pre_frames as u32, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .status
+            .store(PCM_LOOP_CAPTURE_STATUS_PENDING, Ordering::Relaxed);
+        self.loop_capture_active = true;
+        self.loop_capture_iteration = iteration;
+        self.loop_capture_post_samples_written = 0;
+    }
+
+    fn invalidate_loop_pcm_capture(&mut self, status: u32) {
+        if !self.loop_capture_active {
+            return;
+        }
+
+        self.loop_pcm_capture.post_samples_captured.store(
+            self.loop_capture_post_samples_written as u32,
+            Ordering::Relaxed,
+        );
+        self.loop_pcm_capture
+            .status
+            .store(status, Ordering::Relaxed);
+        self.loop_pcm_capture
+            .completed_iteration
+            .store(self.loop_capture_iteration, Ordering::Release);
+        self.loop_capture_active = false;
+    }
+
+    fn record_loop_pcm_capture_sample(&mut self, sample: f32) {
+        if !self.loop_diagnostics_enabled && !self.loop_capture_active {
+            return;
+        }
+        let channel_count = self.channels.get().max(1) as usize;
+        if channel_count > PCM_LOOP_CAPTURE_MAX_CHANNELS {
+            return;
+        }
+
+        if self.loop_capture_active {
+            let post_sample_count = PCM_LOOP_CAPTURE_POST_FRAMES * channel_count;
+            if self.loop_capture_post_samples_written < post_sample_count {
+                let sample_index = PCM_LOOP_CAPTURE_PRE_FRAMES * channel_count
+                    + self.loop_capture_post_samples_written;
+                self.loop_pcm_capture.samples[sample_index]
+                    .store(sample.to_bits(), Ordering::Relaxed);
+                self.loop_capture_post_samples_written += 1;
+
+                if self.loop_capture_post_samples_written >= post_sample_count {
+                    self.loop_pcm_capture.post_samples_captured.store(
+                        self.loop_capture_post_samples_written as u32,
+                        Ordering::Relaxed,
+                    );
+                    self.loop_pcm_capture
+                        .status
+                        .store(PCM_LOOP_CAPTURE_STATUS_VALID, Ordering::Relaxed);
+                    self.loop_pcm_capture
+                        .completed_iteration
+                        .store(self.loop_capture_iteration, Ordering::Release);
+                    self.loop_capture_active = false;
+                }
+            }
+            return;
+        }
+
+        let channel_index = self.current_index % channel_count;
+        let sample_index =
+            self.loop_capture_pre_write_frame * PCM_LOOP_CAPTURE_MAX_CHANNELS + channel_index;
+        self.loop_capture_pre_samples[sample_index] = sample;
+        if channel_index + 1 >= channel_count {
+            self.loop_capture_pre_write_frame =
+                (self.loop_capture_pre_write_frame + 1) % PCM_LOOP_CAPTURE_PRE_FRAMES;
+            self.loop_capture_pre_frames =
+                (self.loop_capture_pre_frames + 1).min(PCM_LOOP_CAPTURE_PRE_FRAMES);
+        }
+    }
+
+    fn new<S>(
+        mut source: S,
+        producer_position_state: Arc<AtomicU64>,
+        render_position_state: Arc<AtomicU64>,
+        underrun_count: Arc<AtomicU64>,
+        playback_elapsed_frames: Arc<AtomicU64>,
+        producer_loop_remaining_state: Arc<AtomicI32>,
+        render_loop_remaining_state: Arc<AtomicI32>,
+        underrun_frame_count: Arc<AtomicU64>,
+        loop_diagnostics_enabled: bool,
+        render_loop_iterations: Arc<AtomicU64>,
+        render_loop_boundary_frame: Arc<AtomicU64>,
+        render_loop_boundary_position_bits: Arc<AtomicU64>,
+        render_loop_boundary_endpoint_frame: Arc<AtomicU64>,
+        endpoint_frame_clock: Option<Arc<AtomicU64>>,
+        render_loop_fingerprint: Arc<AtomicU64>,
+        render_loop_fingerprint_iteration: Arc<AtomicU64>,
+        loop_pcm_capture: Arc<LoopPcmCapture>,
+        pump_during_wait: &mut dyn FnMut(),
+    ) -> Option<Self>
+    where
+        S: Source<Item = f32> + Send + 'static,
+    {
+        // Initialize the retirement worker before the source can be dropped by
+        // the native render callback.
+        let _ = pcm_buffer_reaper();
+        let channels = source.channels();
+        let sample_rate = source.sample_rate();
+        let total_duration = source.total_duration();
+        let channel_count = channels.get().max(1) as usize;
+        let chunk_capacity = PCM_PREFETCH_CHUNK_FRAMES.saturating_mul(channel_count);
+        let (free_tx, free_rx) = bounded::<PcmPrefetchChunk>(PCM_PREFETCH_BUFFER_COUNT);
+        let (ready_tx, ready_rx) = bounded::<PcmPrefetchChunk>(PCM_PREFETCH_BUFFER_COUNT);
+        for _ in 0..PCM_PREFETCH_BUFFER_COUNT {
+            if free_tx
+                .send(PcmPrefetchChunk {
+                    samples: Vec::with_capacity(chunk_capacity),
+                    frame_end_positions: Vec::with_capacity(PCM_PREFETCH_CHUNK_FRAMES),
+                    frame_loop_remaining: Vec::with_capacity(PCM_PREFETCH_CHUNK_FRAMES),
+                    start_position_bits: 0.0_f64.to_bits(),
+                    end_position_bits: 0.0_f64.to_bits(),
+                    start_loop_remaining: 0,
+                    eof: false,
+                })
+                .is_err()
+            {
+                return None;
+            }
+        }
+
+        let producer_finished = Arc::new(AtomicBool::new(false));
+        let producer_finished_thread = producer_finished.clone();
+        let producer_position_state_thread = producer_position_state.clone();
+        let producer_loop_remaining_state_thread = producer_loop_remaining_state.clone();
+        // Keep the queue alive until the producer can drain it after the
+        // consumer drops its receiver during Stop or natural completion.
+        let ready_rx_guard = ready_rx.clone();
+        let producer = thread::Builder::new()
+            .name("tasq-pcm-prefetch".to_string())
+            .spawn(move || {
+                loop {
+                    let mut chunk = match free_rx.recv() {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    };
+                    chunk.samples.clear();
+                    chunk.frame_end_positions.clear();
+                    chunk.frame_loop_remaining.clear();
+                    let start_position = atomic_load_f64(&producer_position_state_thread);
+                    let start_loop_remaining =
+                        producer_loop_remaining_state_thread.load(Ordering::Acquire);
+                    let mut eof = false;
+                    for _ in 0..PCM_PREFETCH_CHUNK_FRAMES {
+                        let mut frame_samples = 0usize;
+                        let mut frame_eof = false;
+                        for _ in 0..channel_count {
+                            match source.next() {
+                                Some(sample) => {
+                                    chunk.samples.push(sample);
+                                    frame_samples += 1;
+                                }
+                                None => {
+                                    frame_eof = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if frame_samples == 0 {
+                            eof = true;
+                            break;
+                        }
+
+                        if frame_samples < channel_count {
+                            chunk
+                                .samples
+                                .extend(std::iter::repeat(0.0).take(channel_count - frame_samples));
+                            frame_eof = true;
+                        }
+
+                        // Store the exact media position after this output frame.
+                        // A chunk can cross a loop boundary, so start/end interpolation
+                        // would otherwise move the playhead through the wrong timeline.
+                        chunk
+                            .frame_end_positions
+                            .push(atomic_load_f64(&producer_position_state_thread).to_bits());
+                        chunk
+                            .frame_loop_remaining
+                            .push(producer_loop_remaining_state_thread.load(Ordering::Acquire));
+
+                        if frame_eof {
+                            eof = true;
+                            break;
+                        }
+                    }
+                    let end_position = atomic_load_f64(&producer_position_state_thread);
+                    chunk.start_position_bits = start_position.to_bits();
+                    chunk.end_position_bits = end_position.to_bits();
+                    chunk.start_loop_remaining = start_loop_remaining;
+                    chunk.eof = eof;
+
+                    if !chunk.samples.is_empty() {
+                        if let Err(error) = ready_tx.send(chunk) {
+                            drop(error.0);
+                            break;
+                        }
+                    } else {
+                        drop(chunk);
+                    }
+
+                    if eof {
+                        producer_finished_thread.store(true, Ordering::Release);
+                        // Close the producer side so an empty/short source can
+                        // report EOF immediately after any final queued chunk.
+                        drop(ready_tx);
+                        // Keep the guard receiver alive until the Cue drops its
+                        // free-buffer sender. Returned buffers and queued tail
+                        // chunks are then released on this producer thread.
+                        while let Ok(returned) = free_rx.recv() {
+                            drop(returned);
+                        }
+                        while let Ok(queued) = ready_rx_guard.try_recv() {
+                            drop(queued);
+                        }
+                        return;
+                    }
+                }
+
+                producer_finished_thread.store(true, Ordering::Release);
+                while let Ok(queued) = ready_rx_guard.try_recv() {
+                    drop(queued);
+                }
+            });
+        if let Err(error) = producer {
+            error!("Could not start PCM prefetch thread: {error}");
+            return None;
+        }
+
+        // Prime at least one chunk before attaching the source to the output
+        // mixer. While waiting, continue pumping DirectSound's queued output so
+        // a long PlayBatch preparation cannot starve already-playing Cue.
+        let prime_started = Instant::now();
+        let first_chunk = loop {
+            match ready_rx.try_recv() {
+                Ok(chunk) => break chunk,
+                Err(_) if producer_finished.load(Ordering::Acquire) && ready_rx.is_empty() => {
+                    warn!("PCM prefetch source ended before producing its first chunk");
+                    return None;
+                }
+                Err(_) => {
+                    pump_during_wait();
+                    if prime_started.elapsed() >= Duration::from_secs(5) {
+                        warn!(
+                            "PCM prefetch could not prime its first audio chunk within 5 seconds"
+                        );
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+
+        Some(Self {
+            channels,
+            sample_rate,
+            total_duration,
+            ready_rx,
+            free_tx,
+            current_chunk: Some(first_chunk),
+            current_index: 0,
+            producer_finished,
+            render_position_state,
+            underrun_count,
+            playback_elapsed_frames,
+            render_loop_remaining_state,
+            underrun_frame_count,
+            underrun_silence_samples_remaining: 0,
+            underrun_active: false,
+            loop_diagnostics_enabled,
+            render_loop_iterations,
+            render_loop_boundary_frame,
+            render_loop_boundary_position_bits,
+            render_loop_boundary_endpoint_frame,
+            endpoint_frame_clock,
+            render_loop_fingerprint,
+            render_loop_fingerprint_iteration,
+            loop_pcm_capture,
+            loop_capture_pre_samples: [0.0; PCM_LOOP_CAPTURE_PRE_FRAMES
+                * PCM_LOOP_CAPTURE_MAX_CHANNELS],
+            loop_capture_pre_frames: 0,
+            loop_capture_pre_write_frame: 0,
+            loop_capture_active: false,
+            loop_capture_iteration: 0,
+            loop_capture_post_samples_written: 0,
+            last_render_media_position: None,
+            loop_fingerprint_active: false,
+            loop_fingerprint_samples_remaining: 0,
+            loop_fingerprint_hash: PCM_FNV1A64_OFFSET_BASIS,
+            loop_fingerprint_iteration: 0,
+            consumer_finished: false,
+        })
+    }
+}
+
+impl Iterator for PcmPrefetchSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.consumer_finished {
+            return None;
+        }
+
+        // If an underrun began at the start of an interleaved frame, finish
+        // that entire frame with silence before trying the ready queue again.
+        // Otherwise a chunk arriving between channel reads could shift channel
+        // alignment (for example, silence on L followed by new PCM on R).
+        if self.underrun_silence_samples_remaining > 0 {
+            self.invalidate_loop_pcm_capture(PCM_LOOP_CAPTURE_STATUS_UNDERRUN);
+            self.underrun_silence_samples_remaining -= 1;
+            return Some(0.0);
+        }
+
+        if self.current_chunk.is_none() {
+            match self.ready_rx.try_recv() {
+                Ok(chunk) => {
+                    self.current_chunk = Some(chunk);
+                    self.current_index = 0;
+                    self.underrun_active = false;
+                }
+                Err(_)
+                    if self.producer_finished.load(Ordering::Acquire)
+                        && self.ready_rx.is_empty() =>
+                {
+                    self.consumer_finished = true;
+                    return None;
+                }
+                Err(_) => {
+                    // Count every silent source frame, including one-frame
+                    // scheduling gaps. The previous 32-frame threshold hid
+                    // short gaps that are still enough to desynchronize Cue.
+                    self.invalidate_loop_pcm_capture(PCM_LOOP_CAPTURE_STATUS_UNDERRUN);
+                    self.underrun_frame_count.fetch_add(1, Ordering::Relaxed);
+                    // Do not publish a fingerprint that includes synthetic silence.
+                    self.loop_fingerprint_active = false;
+                    if !self.underrun_active {
+                        self.underrun_count.fetch_add(1, Ordering::Relaxed);
+                        self.underrun_active = true;
+                    }
+                    let channel_count = self.channels.get() as usize;
+                    self.underrun_silence_samples_remaining = channel_count.saturating_sub(1);
+                    self.playback_elapsed_frames.fetch_add(1, Ordering::Relaxed);
+                    return Some(0.0);
+                }
+            }
+        }
+
+        if self.current_index % self.channels.get() as usize == 0 {
+            let frame_index = self.current_index / self.channels.get() as usize;
+            let (position, loop_remaining) = match self.current_chunk.as_ref() {
+                Some(chunk) => (
+                    prefetch_chunk_frame_start_position(chunk, frame_index),
+                    prefetch_chunk_frame_start_loop_remaining(chunk, frame_index),
+                ),
+                None => return Some(0.0),
+            };
+            if self.loop_diagnostics_enabled {
+                if let Some(previous_position) = self.last_render_media_position {
+                    // Playback speed is always positive. A backwards media-time
+                    // transition therefore marks a Loop wrap, not a producer event.
+                    if position + 1.0e-9 < previous_position {
+                        let source_elapsed_frame =
+                            self.playback_elapsed_frames.load(Ordering::Relaxed);
+                        self.render_loop_boundary_frame
+                            .store(source_elapsed_frame, Ordering::Release);
+                        self.render_loop_boundary_position_bits
+                            .store(position.to_bits(), Ordering::Release);
+                        let source_media_frame = if position.is_finite() && position > 0.0 {
+                            (position * f64::from(self.sample_rate.get())).round() as u64
+                        } else {
+                            0
+                        };
+                        let endpoint_render_frame = self
+                            .endpoint_frame_clock
+                            .as_ref()
+                            .map(|clock| clock.load(Ordering::Relaxed))
+                            .unwrap_or(u64::MAX);
+                        self.render_loop_boundary_endpoint_frame
+                            .store(endpoint_render_frame, Ordering::Release);
+                        // Publish the iteration only after its boundary metadata
+                        // is visible to the worker thread.
+                        let iteration =
+                            self.render_loop_iterations.fetch_add(1, Ordering::AcqRel) + 1;
+                        self.begin_loop_pcm_capture(
+                            iteration,
+                            source_elapsed_frame,
+                            source_media_frame,
+                            endpoint_render_frame,
+                        );
+                        // Fingerprint the first 128 rendered source frames after
+                        // the wrap to distinguish timing drift from decoder/seek
+                        // returning different PCM content.
+                        self.loop_fingerprint_active = true;
+                        self.loop_fingerprint_samples_remaining =
+                            PCM_LOOP_FINGERPRINT_FRAMES * self.channels.get() as usize;
+                        self.loop_fingerprint_hash = PCM_FNV1A64_OFFSET_BASIS;
+                        self.loop_fingerprint_iteration = iteration;
+                    }
+                }
+                self.last_render_media_position = Some(position);
+            }
+            atomic_store_f64(&self.render_position_state, position);
+            self.render_loop_remaining_state
+                .store(loop_remaining, Ordering::Release);
+        }
+
+        let sample = self
+            .current_chunk
+            .as_ref()
+            .and_then(|chunk| chunk.samples.get(self.current_index))
+            .copied();
+        let Some(sample) = sample else {
+            self.consumer_finished = true;
+            return None;
+        };
+        if self.loop_fingerprint_active {
+            self.loop_fingerprint_hash ^= sample.to_bits() as u64;
+            self.loop_fingerprint_hash = self.loop_fingerprint_hash.wrapping_mul(PCM_FNV1A64_PRIME);
+            self.loop_fingerprint_samples_remaining =
+                self.loop_fingerprint_samples_remaining.saturating_sub(1);
+            if self.loop_fingerprint_samples_remaining == 0 {
+                self.render_loop_fingerprint
+                    .store(self.loop_fingerprint_hash, Ordering::Release);
+                self.render_loop_fingerprint_iteration
+                    .store(self.loop_fingerprint_iteration, Ordering::Release);
+                self.loop_fingerprint_active = false;
+            }
+        }
+        self.record_loop_pcm_capture_sample(sample);
+        self.current_index += 1;
+        if self.current_index % self.channels.get() as usize == 0 {
+            self.playback_elapsed_frames.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let chunk_finished = self
+            .current_chunk
+            .as_ref()
+            .is_some_and(|chunk| self.current_index >= chunk.samples.len());
+        if chunk_finished {
+            if let Some(mut completed) = self.current_chunk.take() {
+                let eof = completed.eof;
+                // Publish the exact chunk-end state once. Inside a chunk, the
+                // next frame's start metadata already carries the previous
+                // frame's end position and remaining-loop count.
+                atomic_store_f64(
+                    &self.render_position_state,
+                    f64::from_bits(completed.end_position_bits),
+                );
+                self.render_loop_remaining_state.store(
+                    completed
+                        .frame_loop_remaining
+                        .last()
+                        .copied()
+                        .unwrap_or(completed.start_loop_remaining),
+                    Ordering::Release,
+                );
+                completed.samples.clear();
+                completed.frame_end_positions.clear();
+                completed.frame_loop_remaining.clear();
+                self.current_index = 0;
+                if eof {
+                    self.consumer_finished = true;
+                }
+                if let Err(error) = self.free_tx.try_send(completed) {
+                    retire_pcm_buffer(error.into_inner());
+                }
+            }
+        }
+
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl Source for PcmPrefetchSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.total_duration
+    }
+}
+
+impl Drop for PcmPrefetchSource {
+    fn drop(&mut self) {
+        if let Some(chunk) = self.current_chunk.take() {
+            retire_pcm_buffer(chunk);
+        }
+        // The producer's guard receiver owns any still-queued chunks and drains
+        // them on its own thread after free_tx disconnects.
+    }
+}
+
+const CHANNEL_ROUTER_SETTINGS_REFRESH_FRAMES: usize = 64;
+
+/// Per-Cue routing snapshot used by the audio source. The vectors are allocated
+/// when the source is prepared and are only updated in place, so rendering does
+/// not need to clone route data or wait for a UI/control-thread write lock.
+struct CachedChannelRoute {
+    active: bool,
+    master_enabled: bool,
+    output_channel: usize,
+    explicit_destinations: bool,
+    output_channels: Vec<usize>,
+    gain_linear: f32,
+}
+
+#[derive(Clone, Copy)]
+struct CachedOutputChannelSetting {
+    active: bool,
+    gain_linear: f32,
+}
+
+#[allow(dead_code)]
+struct ChannelRouterRetiredBuffers {
+    input_frame: Vec<f32>,
+    output_frame: Vec<f32>,
+    cached_routes: Vec<CachedChannelRoute>,
+    cached_output_settings: Vec<CachedOutputChannelSetting>,
+    cached_output_gains: Vec<f32>,
+    routes: Arc<RwLock<Vec<ChannelRoute>>>,
+    output_settings: SharedOutputSettings,
+    output_gains: Arc<RwLock<Vec<f32>>>,
+}
+
+static CHANNEL_ROUTER_REAPER: OnceLock<Option<Sender<ChannelRouterRetiredBuffers>>> =
+    OnceLock::new();
+
+fn channel_router_reaper() -> Option<&'static Sender<ChannelRouterRetiredBuffers>> {
+    CHANNEL_ROUTER_REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = bounded::<ChannelRouterRetiredBuffers>(256);
+            match thread::Builder::new()
+                .name("tasq-channel-router-reaper".to_string())
+                .spawn(move || {
+                    while let Ok(buffers) = receiver.recv() {
+                        drop(buffers);
+                    }
+                }) {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    error!("Could not start ChannelRouter buffer reaper thread: {error}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 struct ChannelRouter<S> {
     source: S,
     input_channels: usize,
@@ -3182,12 +4799,19 @@ struct ChannelRouter<S> {
     routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_settings: SharedOutputSettings,
     output_gains: Arc<RwLock<Vec<f32>>>,
+    cached_routes: Vec<CachedChannelRoute>,
+    cached_output_settings: Vec<CachedOutputChannelSetting>,
+    cached_output_gains: Vec<f32>,
+    frames_until_settings_refresh: usize,
+    profile: Option<Arc<AudioStreamHealth>>,
+    profile_frame_counter: u64,
 }
 
 impl<S> ChannelRouter<S>
 where
     S: Source,
 {
+    #[cfg(test)]
     fn new(
         source: S,
         routes: Arc<RwLock<Vec<ChannelRoute>>>,
@@ -3195,6 +4819,25 @@ where
         output_gains: Arc<RwLock<Vec<f32>>>,
         output_channels: usize,
     ) -> Self {
+        Self::new_with_profile(
+            source,
+            routes,
+            output_settings,
+            output_gains,
+            output_channels,
+            None,
+        )
+    }
+
+    fn new_with_profile(
+        source: S,
+        routes: Arc<RwLock<Vec<ChannelRoute>>>,
+        output_settings: SharedOutputSettings,
+        output_gains: Arc<RwLock<Vec<f32>>>,
+        output_channels: usize,
+        profile: Option<Arc<AudioStreamHealth>>,
+    ) -> Self {
+        let _ = channel_router_reaper();
         let input_channels = source.channels().get().max(1) as usize;
         let output_channels = output_channels.max(1);
         {
@@ -3234,20 +4877,84 @@ where
                     route.output_channel = primary;
                 }
             }
-            let output_state = output_settings
-                .read()
-                .iter()
-                .map(|setting| (setting.active, setting.gain_db))
-                .collect::<Vec<_>>();
-            let cue_gains = output_gains.read().clone();
-            info!(
-                "ChannelRouter configured: {} source channels -> {} hardware outputs; routes={:?}; output_settings(active,gain_db)={:?}; cue_output_gains_db={:?}",
-                input_channels,
-                output_channels,
-                &*route_list,
-                output_state,
-                cue_gains
-            );
+        }
+
+        let output_state = output_settings
+            .read()
+            .iter()
+            .map(|setting| (setting.active, setting.gain_db))
+            .collect::<Vec<_>>();
+        let cue_gains = output_gains.read().clone();
+        info!(
+            "ChannelRouter configured: {} source channels -> {} hardware outputs; output_settings(active,gain_db)={:?}; cue_output_gains_db={:?}",
+            input_channels, output_channels, output_state, cue_gains
+        );
+
+        // Build all render-side snapshots before the source is attached to the
+        // native output stream. Each route's destination capacity is bounded by
+        // the endpoint's output-channel count.
+        let cached_routes = {
+            let route_list = routes.read();
+            let mut cached = Vec::with_capacity(input_channels);
+            for source_index in 0..input_channels {
+                let fallback_output = source_index.min(output_channels - 1);
+                let route = route_list.get(source_index);
+                let active = route.map(|route| route.active).unwrap_or(true);
+                let master_enabled = route.map(|route| route.master_enabled).unwrap_or(true);
+                let output_channel = route
+                    .map(|route| route.output_channel.min(output_channels - 1))
+                    .unwrap_or(fallback_output);
+                let route_destinations = route.map(|route| route.output_channels.as_slice());
+                let explicit_destinations = route_destinations
+                    .map(|destinations| !destinations.is_empty())
+                    .unwrap_or(true);
+                let mut destinations = Vec::with_capacity(output_channels);
+                if let Some(route_destinations) = route_destinations {
+                    for &destination in route_destinations {
+                        if destination < output_channels && !destinations.contains(&destination) {
+                            destinations.push(destination);
+                        }
+                    }
+                } else {
+                    destinations.push(fallback_output);
+                }
+                cached.push(CachedChannelRoute {
+                    active,
+                    master_enabled,
+                    output_channel,
+                    explicit_destinations,
+                    output_channels: destinations,
+                    gain_linear: db_to_linear(route.map(|route| route.gain_db).unwrap_or(0.0)),
+                });
+            }
+            cached
+        };
+
+        let mut cached_output_settings = vec![
+            CachedOutputChannelSetting {
+                active: true,
+                gain_linear: 1.0,
+            };
+            output_channels
+        ];
+        if let Some(settings) = output_settings.try_read() {
+            for (cached, setting) in cached_output_settings.iter_mut().zip(settings.iter()) {
+                cached.active = setting.active;
+                cached.gain_linear = db_to_linear(setting.gain_db);
+            }
+        }
+
+        let mut cached_output_gains = vec![1.0; output_channels];
+        if let Some(gains) = output_gains.try_read() {
+            for (cached, gain) in cached_output_gains.iter_mut().zip(gains.iter()) {
+                *cached = db_to_linear(*gain);
+            }
+        }
+
+        if let Some(profile) = profile.as_ref() {
+            profile
+                .channel_router_active_instances
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Self {
@@ -3260,12 +4967,77 @@ where
             routes,
             output_settings,
             output_gains,
+            cached_routes,
+            cached_output_settings,
+            cached_output_gains,
+            frames_until_settings_refresh: 0,
+            profile,
+            profile_frame_counter: 0,
+        }
+    }
+
+    /// Refresh mutable routing and gain state without ever waiting in the audio
+    /// path. If the control thread currently owns a write lock, retain the last
+    /// complete snapshot and try again at the next refresh interval.
+    fn refresh_live_settings(&mut self) {
+        if let Some(routes) = self.routes.try_read() {
+            for source_index in 0..self.input_channels {
+                let cached = &mut self.cached_routes[source_index];
+                if let Some(route) = routes.get(source_index) {
+                    cached.active = route.active;
+                    cached.master_enabled = route.master_enabled;
+                    cached.output_channel = route.output_channel.min(self.output_channels - 1);
+                    cached.explicit_destinations = !route.output_channels.is_empty();
+                    cached.gain_linear = db_to_linear(route.gain_db);
+                    cached.output_channels.clear();
+                    if cached.explicit_destinations {
+                        for &destination in &route.output_channels {
+                            if destination < self.output_channels
+                                && !cached.output_channels.contains(&destination)
+                            {
+                                // Capacity was reserved to the endpoint's output
+                                // count during construction; no callback allocation.
+                                cached.output_channels.push(destination);
+                            }
+                        }
+                    }
+                } else {
+                    let fallback_output = source_index.min(self.output_channels - 1);
+                    cached.active = true;
+                    cached.master_enabled = true;
+                    cached.output_channel = fallback_output;
+                    cached.explicit_destinations = true;
+                    cached.gain_linear = 1.0;
+                    cached.output_channels.clear();
+                    cached.output_channels.push(fallback_output);
+                }
+            }
+        }
+
+        if let Some(settings) = self.output_settings.try_read() {
+            for (index, cached) in self.cached_output_settings.iter_mut().enumerate() {
+                if let Some(setting) = settings.get(index) {
+                    cached.active = setting.active;
+                    cached.gain_linear = db_to_linear(setting.gain_db);
+                } else {
+                    *cached = CachedOutputChannelSetting {
+                        active: true,
+                        gain_linear: 1.0,
+                    };
+                }
+            }
+        }
+
+        if let Some(gains) = self.output_gains.try_read() {
+            for (index, cached) in self.cached_output_gains.iter_mut().enumerate() {
+                *cached = db_to_linear(gains.get(index).copied().unwrap_or(0.0));
+            }
         }
     }
 
     fn mix_to_output(
         output_frame: &mut [f32],
-        output_settings: &[OutputChannelSetting],
+        output_settings: &[CachedOutputChannelSetting],
         output_gains: &[f32],
         output_index: usize,
         sample: f32,
@@ -3277,15 +5049,39 @@ where
         if setting.map(|setting| !setting.active).unwrap_or(false) {
             return;
         }
-        let device_gain = setting
-            .map(|setting| db_to_linear(setting.gain_db))
-            .unwrap_or(1.0);
-        let cue_gain = output_gains
-            .get(output_index)
-            .copied()
-            .map(db_to_linear)
-            .unwrap_or(1.0);
+        let device_gain = setting.map(|setting| setting.gain_linear).unwrap_or(1.0);
+        let cue_gain = output_gains.get(output_index).copied().unwrap_or(1.0);
         output_frame[output_index] += sample * device_gain * cue_gain;
+    }
+}
+
+impl<S> Drop for ChannelRouter<S> {
+    fn drop(&mut self) {
+        if let Some(profile) = self.profile.as_ref() {
+            profile
+                .channel_router_active_instances
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+
+        let retired = ChannelRouterRetiredBuffers {
+            input_frame: std::mem::take(&mut self.input_frame),
+            output_frame: std::mem::take(&mut self.output_frame),
+            cached_routes: std::mem::take(&mut self.cached_routes),
+            cached_output_settings: std::mem::take(&mut self.cached_output_settings),
+            cached_output_gains: std::mem::take(&mut self.cached_output_gains),
+            routes: self.routes.clone(),
+            output_settings: self.output_settings.clone(),
+            output_gains: self.output_gains.clone(),
+        };
+        if let Some(reaper) = channel_router_reaper() {
+            if let Err(error) = reaper.try_send(retired) {
+                // Queue overflow is exceptionally unlikely. Avoid freeing these
+                // buffers on the native callback thread if it does occur.
+                std::mem::forget(error.into_inner());
+            }
+        } else {
+            std::mem::forget(retired);
+        }
     }
 }
 
@@ -3297,34 +5093,45 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.output_index >= self.output_channels {
+            let profile_sample = if self.profile.is_some() {
+                let sample = self.profile_frame_counter % CHANNEL_ROUTER_PROFILE_STRIDE == 0;
+                self.profile_frame_counter = self.profile_frame_counter.wrapping_add(1);
+                sample
+            } else {
+                false
+            };
+
+            let source_started = profile_sample.then(Instant::now);
             for sample in &mut self.input_frame {
                 *sample = self.source.next()?;
             }
+            let source_elapsed_ns = source_started
+                .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+
+            let route_started = profile_sample.then(Instant::now);
             self.output_frame.fill(0.0);
 
-            let routes = self.routes.read();
-            let outputs = self.output_settings.read();
-            let output_gains = self.output_gains.read();
+            if self.frames_until_settings_refresh == 0 {
+                self.refresh_live_settings();
+                self.frames_until_settings_refresh =
+                    CHANNEL_ROUTER_SETTINGS_REFRESH_FRAMES.saturating_sub(1);
+            } else {
+                self.frames_until_settings_refresh -= 1;
+            }
+
             for (source_index, sample) in self.input_frame.iter().copied().enumerate() {
-                let fallback_output = source_index.min(self.output_channels - 1);
-                let fallback_route = ChannelRoute {
-                    active: true,
-                    master_enabled: true,
-                    output_channel: fallback_output,
-                    output_channels: vec![fallback_output],
-                    gain_db: 0.0,
-                };
-                let route = routes.get(source_index).unwrap_or(&fallback_route);
+                let route = &self.cached_routes[source_index];
                 if !route.active || !route.master_enabled {
                     continue;
                 }
 
-                let source_gain = db_to_linear(route.gain_db);
-                if route.output_channels.is_empty() {
+                let source_gain = route.gain_linear;
+                if !route.explicit_destinations {
                     Self::mix_to_output(
                         &mut self.output_frame,
-                        &outputs,
-                        &output_gains,
+                        &self.cached_output_settings,
+                        &self.cached_output_gains,
                         route.output_channel,
                         sample * source_gain,
                     );
@@ -3332,14 +5139,44 @@ where
                     for &output_index in &route.output_channels {
                         Self::mix_to_output(
                             &mut self.output_frame,
-                            &outputs,
-                            &output_gains,
+                            &self.cached_output_settings,
+                            &self.cached_output_gains,
                             output_index,
                             sample * source_gain,
                         );
                     }
                 }
             }
+
+            if profile_sample {
+                if let Some(profile) = self.profile.as_ref() {
+                    let route_elapsed_ns = route_started
+                        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                        .unwrap_or(0);
+                    let estimated_frames = CHANNEL_ROUTER_PROFILE_STRIDE;
+                    profile
+                        .channel_router_profile_samples
+                        .fetch_add(1, Ordering::Relaxed);
+                    profile
+                        .channel_router_profiled_frames
+                        .fetch_add(estimated_frames, Ordering::Relaxed);
+                    profile.channel_router_source_total_ns.fetch_add(
+                        source_elapsed_ns.saturating_mul(estimated_frames),
+                        Ordering::Relaxed,
+                    );
+                    profile
+                        .channel_router_source_max_ns
+                        .fetch_max(source_elapsed_ns, Ordering::Relaxed);
+                    profile.channel_router_route_total_ns.fetch_add(
+                        route_elapsed_ns.saturating_mul(estimated_frames),
+                        Ordering::Relaxed,
+                    );
+                    profile
+                        .channel_router_route_max_ns
+                        .fetch_max(route_elapsed_ns, Ordering::Relaxed);
+                }
+            }
+
             self.output_index = 0;
         }
 
@@ -3528,25 +5365,175 @@ impl Source for FrameAlignedPlayerQueue {
     }
 }
 
+/// Sample-accurate de-click ramp used by explicit Stop commands.
+/// It fades the final, already-routed output signal to zero over a short
+/// raised-cosine window, then ends the source. The control thread never
+/// changes Sink volume in small timer steps.
+struct StopFadeSource<S> {
+    inner: S,
+    control: StopFadeControl,
+    channels: usize,
+    fade_frames: u64,
+    fade_frame: u64,
+    channel_index: usize,
+    current_gain: f32,
+    fading: bool,
+    completion_pending: bool,
+}
+
+impl<S> StopFadeSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(inner: S, control: StopFadeControl) -> Self {
+        let channels = inner.channels().get().max(1) as usize;
+        let sample_rate = inner.sample_rate().get().max(1);
+        let fade_frames =
+            ((sample_rate as f64 * STOP_DECLICK_FADE_MS / 1_000.0).round() as u64).max(1);
+
+        Self {
+            inner,
+            control,
+            channels,
+            fade_frames,
+            fade_frame: 0,
+            channel_index: 0,
+            current_gain: 1.0,
+            fading: false,
+            completion_pending: false,
+        }
+    }
+}
+
+impl<S> Iterator for StopFadeSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Check completion only once per complete interleaved frame. Besides
+        // preventing a completion signal from truncating a multichannel frame,
+        // this avoids one Acquire atomic load for every output channel/sample.
+        if self.channel_index == 0 {
+            if self.control.is_completed() {
+                return None;
+            }
+
+            // This branch is reached only after the last sample of the fade has
+            // already been returned to the mixer.
+            if self.completion_pending {
+                self.control.completed.store(true, Ordering::Release);
+                return None;
+            }
+
+            // Start the ramp only at an output-frame boundary so every channel
+            // in an interleaved frame receives exactly the same gain.
+            if !self.fading && self.control.requested.load(Ordering::Acquire) {
+                self.fading = true;
+                self.fade_frame = 0;
+            }
+
+            self.current_gain = if self.fading {
+                if self.fade_frame + 1 >= self.fade_frames {
+                    0.0
+                } else {
+                    let denominator = self.fade_frames.saturating_sub(1).max(1) as f32;
+                    let progress = (self.fade_frame as f32 / denominator).clamp(0.0, 1.0);
+                    0.5 * (1.0 + (std::f32::consts::PI * progress).cos())
+                }
+            } else {
+                1.0
+            };
+        }
+
+        let sample = match self.inner.next() {
+            Some(sample) => sample,
+            None => {
+                if self.fading || self.control.requested.load(Ordering::Acquire) {
+                    self.control.completed.store(true, Ordering::Release);
+                }
+                return None;
+            }
+        };
+
+        let output = sample * self.current_gain;
+        self.channel_index += 1;
+
+        if self.channel_index >= self.channels {
+            self.channel_index = 0;
+            if self.fading {
+                self.fade_frame = self.fade_frame.saturating_add(1);
+                if self.fade_frame >= self.fade_frames {
+                    self.completion_pending = true;
+                }
+            }
+        }
+
+        Some(output)
+    }
+}
+
+impl<S> Source for StopFadeSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+}
+
 fn open_sink_at(
     mixer: &rodio::mixer::Mixer,
     file_path: &PathBuf,
     offset_secs: f64,
     initial_vol: f32,
+    loop_enabled: bool,
+    loop_start_secs: f64,
+    loop_end_secs: f64,
+    loops_remaining: Arc<AtomicI32>,
+    loop_iterations: Arc<AtomicU64>,
+    playback_elapsed_frames: Arc<AtomicU64>,
+    render_loop_remaining_state: Arc<AtomicI32>,
+    stop_fade: StopFadeControl,
     output_channels: usize,
     output_sample_rate: u32,
     routes: Arc<RwLock<Vec<ChannelRoute>>>,
     output_settings: SharedOutputSettings,
     output_gains: Arc<RwLock<Vec<f32>>>,
+    channel_router_profile: Option<Arc<AudioStreamHealth>>,
     automation_enabled: bool,
     automation_points: Vec<[f64; 2]>,
     automation_updates: Receiver<VolumeAutomationUpdate>,
+    retired_automation_points_tx: Sender<Vec<[f64; 2]>>,
     time_pitch: Arc<RwLock<TimePitchSettings>>,
-    position_state: Arc<RwLock<f64>>,
+    position_state: Arc<AtomicU64>,
+    prefetch_underrun_count: Arc<AtomicU64>,
+    prefetch_underrun_frame_count: Arc<AtomicU64>,
+    render_loop_iterations: Arc<AtomicU64>,
+    render_loop_boundary_frame: Arc<AtomicU64>,
+    render_loop_boundary_position_bits: Arc<AtomicU64>,
+    render_loop_boundary_endpoint_frame: Arc<AtomicU64>,
+    loop_pcm_capture: Arc<LoopPcmCapture>,
+    render_loop_fingerprint: Arc<AtomicU64>,
+    render_loop_fingerprint_iteration: Arc<AtomicU64>,
+    pump_during_prefetch: &mut dyn FnMut(),
     start_frame_gate: Option<Arc<AtomicU64>>,
     sample_frame_clock: Option<Arc<AtomicU64>>,
     start_frame_observed: Option<Arc<AtomicU64>>,
-) -> Option<rodio::Player> {
+) -> Option<(rodio::Player, u32)> {
     let file = std::fs::File::open(file_path).ok()?;
     let decoder = rodio::Decoder::try_from(file).ok()?;
     let source_channels = decoder.channels().get();
@@ -3559,22 +5546,80 @@ fn open_sink_at(
         output_channels,
         output_sample_rate
     );
-    let source = decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)));
-    let automated = VolumeAutomationSource::new(
+    let loop_count_at_start = loops_remaining.load(Ordering::Acquire);
+    let producer_initial_remaining = if loop_enabled && loop_end_secs > loop_start_secs {
+        loop_count_at_start
+    } else {
+        0
+    };
+    let producer_loop_remaining_state = Arc::new(AtomicI32::new(producer_initial_remaining));
+    let loop_source_active = loop_enabled
+        && loop_end_secs > loop_start_secs
+        && (loop_count_at_start == -1 || loop_count_at_start > 1);
+    let (source, loop_timeline): (Box<dyn Source<Item = f32> + Send>, Option<LoopTimeline>) =
+        if loop_source_active {
+            let looping = LoopingSource::new(
+                decoder,
+                offset_secs.max(0.0),
+                loop_start_secs,
+                loop_end_secs,
+                true,
+                loops_remaining,
+                loop_iterations,
+                file_path.display().to_string(),
+            );
+            let timeline = looping.timeline.clone();
+            (Box::new(looping), timeline)
+        } else {
+            (
+                Box::new(decoder.skip_duration(Duration::from_secs_f64(offset_secs.max(0.0)))),
+                None,
+            )
+        };
+    let producer_position_state = Arc::new(AtomicU64::new(offset_secs.max(0.0).to_bits()));
+    let transformed = SpeedPitchSource::new_with_loop(
         source,
         offset_secs.max(0.0),
+        time_pitch,
+        producer_position_state.clone(),
+        loop_timeline,
+        producer_loop_remaining_state.clone(),
+    );
+    let prefetched = PcmPrefetchSource::new(
+        transformed,
+        producer_position_state,
+        position_state.clone(),
+        prefetch_underrun_count,
+        playback_elapsed_frames,
+        producer_loop_remaining_state,
+        render_loop_remaining_state,
+        prefetch_underrun_frame_count,
+        loop_source_active,
+        render_loop_iterations,
+        render_loop_boundary_frame,
+        render_loop_boundary_position_bits,
+        render_loop_boundary_endpoint_frame,
+        sample_frame_clock.clone(),
+        render_loop_fingerprint,
+        render_loop_fingerprint_iteration,
+        loop_pcm_capture,
+        pump_during_prefetch,
+    )?;
+    let automated = VolumeAutomationSource::new(
+        prefetched,
         automation_enabled,
         automation_points,
         automation_updates,
+        retired_automation_points_tx,
+        position_state,
     );
-    let transformed =
-        SpeedPitchSource::new(automated, offset_secs.max(0.0), time_pitch, position_state);
-    let routed = ChannelRouter::new(
-        transformed,
+    let routed = ChannelRouter::new_with_profile(
+        automated,
         routes,
         output_settings,
         output_gains,
         output_channels,
+        channel_router_profile,
     );
     // Convert each Cue to the endpoint's exact channel/sample-rate layout
     // before applying the shared frame gate. This is important: the scheduler
@@ -3590,21 +5635,22 @@ fn open_sink_at(
     let (player, queue_source) = rodio::Player::new();
     player.set_volume(initial_vol);
     if let Some((start_frame_gate, sample_frame_clock)) = start_frame_gate.zip(sample_frame_clock) {
-        player.append(SampleScheduledSource::new(
+        let scheduled = SampleScheduledSource::new(
             endpoint_source,
             sample_frame_clock,
             start_frame_gate,
             start_frame_observed,
-        ));
+        );
+        player.append(StopFadeSource::new(scheduled, stop_fade.clone()));
     } else {
         // Normal single-Cue playback stays on the immediate, zero-extra-check path.
-        player.append(endpoint_source);
+        player.append(StopFadeSource::new(endpoint_source, stop_fade.clone()));
     }
     mixer.add(FrameAlignedPlayerQueue {
         inner: queue_source,
     });
     player.play();
-    Some(player)
+    Some((player, source_sample_rate))
 }
 
 /// Continuous multichannel test tone. `current_span_len = None` is deliberate:
@@ -3865,8 +5911,151 @@ struct DirectSoundInitInfo {
 struct AudioStreamHealth {
     /// Incremented once per native output callback, not per sample.
     callback_count: AtomicU64,
+    /// Cumulative callback execution time, updated without logging in the callback.
+    callback_total_ns: AtomicU64,
+    /// Longest observed callback execution time.
+    callback_max_ns: AtomicU64,
+    /// Number of callbacks whose processing time reached/exceeded their buffer period.
+    callback_over_budget_count: AtomicU64,
+    callback_last_frames: AtomicU64,
+    /// Low-overhead sampled timing for per-Cue source generation inside ChannelRouter.
+    channel_router_active_instances: AtomicU64,
+    channel_router_profile_samples: AtomicU64,
+    channel_router_profiled_frames: AtomicU64,
+    channel_router_source_total_ns: AtomicU64,
+    channel_router_source_max_ns: AtomicU64,
+    channel_router_route_total_ns: AtomicU64,
+    channel_router_route_max_ns: AtomicU64,
+    /// Sampled wall-time for rendering a complete endpoint frame from Rodio's mixer.
+    mixer_output_profile_samples: AtomicU64,
+    mixer_output_profiled_frames: AtomicU64,
+    mixer_output_total_ns: AtomicU64,
+    mixer_output_max_ns: AtomicU64,
+    /// Stop requests published by the audio control thread and acknowledged after
+    /// a subsequent output callback has rendered its complete buffer.
+    stop_request_generation: AtomicU64,
+    stop_callback_ack_generation: AtomicU64,
     /// Set by CPAL's stream-error callback; the control thread consumes it.
     stream_error: AtomicBool,
+}
+
+/// Samples the wall-time needed to pull one complete interleaved endpoint frame
+/// from Rodio's mixer. The timer is armed once every MIXER_OUTPUT_PROFILE_STRIDE
+/// frames and is accumulated outside the native callback's logging path.
+struct MixerOutputProfileSource<S> {
+    source: S,
+    health: Arc<AudioStreamHealth>,
+    channels: usize,
+    channel_index: usize,
+    frame_counter: u64,
+    frame_is_sampled: bool,
+    frame_started_at: Option<Instant>,
+}
+
+impl<S> MixerOutputProfileSource<S> {
+    fn new(source: S, health: Arc<AudioStreamHealth>, channels: usize) -> Self {
+        Self {
+            source,
+            health,
+            channels: channels.max(1),
+            channel_index: 0,
+            frame_counter: 0,
+            frame_is_sampled: false,
+            frame_started_at: None,
+        }
+    }
+}
+
+impl<S> Iterator for MixerOutputProfileSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.channel_index == 0 {
+            self.frame_is_sampled = self.frame_counter % MIXER_OUTPUT_PROFILE_STRIDE == 0;
+            self.frame_started_at = self.frame_is_sampled.then(Instant::now);
+        }
+
+        let Some(sample) = self.source.next() else {
+            self.frame_started_at = None;
+            self.frame_is_sampled = false;
+            return None;
+        };
+
+        self.channel_index += 1;
+        if self.channel_index >= self.channels {
+            self.channel_index = 0;
+
+            if self.frame_is_sampled {
+                if let Some(started_at) = self.frame_started_at.take() {
+                    let elapsed_ns = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    self.health
+                        .mixer_output_profile_samples
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.health
+                        .mixer_output_profiled_frames
+                        .fetch_add(MIXER_OUTPUT_PROFILE_STRIDE, Ordering::Relaxed);
+                    self.health.mixer_output_total_ns.fetch_add(
+                        elapsed_ns.saturating_mul(MIXER_OUTPUT_PROFILE_STRIDE),
+                        Ordering::Relaxed,
+                    );
+                    self.health
+                        .mixer_output_max_ns
+                        .fetch_max(elapsed_ns, Ordering::Relaxed);
+                }
+            }
+
+            self.frame_is_sampled = false;
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+        }
+
+        Some(sample)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.source.size_hint()
+    }
+}
+
+impl<S> Source for MixerOutputProfileSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.source.current_span_len()
+    }
+
+    fn channels(&self) -> std::num::NonZeroU16 {
+        self.source.channels()
+    }
+
+    fn sample_rate(&self) -> std::num::NonZeroU32 {
+        self.source.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+
+    fn try_seek(
+        &mut self,
+        position: Duration,
+    ) -> std::result::Result<(), rodio::source::SeekError> {
+        self.channel_index = 0;
+        self.frame_counter = 0;
+        self.frame_is_sampled = false;
+        self.frame_started_at = None;
+        self.source.try_seek(position)
+    }
+}
+
+struct PendingStopCallbackAck {
+    generation: u64,
+    request_id: Uuid,
+    cue_id: Option<Uuid>,
+    requested_at: Instant,
 }
 
 struct DeviceOutput {
@@ -3880,14 +6069,41 @@ struct DeviceOutput {
     /// Present for CPAL streams. DirectSound currently uses SDL's queued-output
     /// path and has no CPAL callback to monitor.
     stream_health: Option<Arc<AudioStreamHealth>>,
+    /// Present for CPAL endpoints. The final-mix gate pauses every Cue on the
+    /// endpoint together instead of toggling individual Rodio Sinks in sequence.
+    transport_paused: Option<Arc<AtomicBool>>,
     /// Monotonic count of output sample frames rendered by this endpoint.
     /// Cue sources in the same Worker read this clock to share an exact start frame.
     sample_frame_clock: Arc<AtomicU64>,
     last_callback_count: u64,
     last_callback_progress_at: Instant,
+    pending_stop_callback_acks: VecDeque<PendingStopCallbackAck>,
+    last_stop_callback_ack_generation: u64,
+    last_callback_metrics_at: Instant,
+    last_callback_metrics_count: u64,
+    last_callback_total_ns: u64,
+    last_callback_over_budget_count: u64,
     #[cfg(target_os = "windows")]
     directsound_source:
         Option<SampleFrameClockSource<OutputPeakMeterSource<rodio::mixer::MixerSource>>>,
+}
+
+#[inline]
+fn player_output_is_globally_paused(
+    streams: &HashMap<String, DeviceOutput>,
+    player: &ActivePlayer,
+) -> bool {
+    streams
+        .get(&player.output_device)
+        .and_then(|output| output.transport_paused.as_ref())
+        .is_some_and(|paused| paused.load(Ordering::Acquire))
+}
+
+#[inline]
+fn player_is_paused(streams: &HashMap<String, DeviceOutput>, player: &ActivePlayer) -> bool {
+    player.paused_at.is_some()
+        || player.sink.is_paused()
+        || player_output_is_globally_paused(streams, player)
 }
 
 const ASIO_STREAM_CALLBACK_STALL_TIMEOUT: Duration = Duration::from_millis(750);
@@ -4093,11 +6309,18 @@ fn build_device_output(
             )
         })?;
         let (mixer, source) = rodio::mixer::mixer(mixer_channels, mixer_sample_rate);
-        let metered_source = OutputPeakMeterSource::new(source, output_peak_meter.clone());
+        let stream_health = Arc::new(AudioStreamHealth::default());
+        let profiled_mixer_source =
+            MixerOutputProfileSource::new(source, stream_health.clone(), channels);
+        let transport_paused = Arc::new(AtomicBool::new(false));
+        let gated_source =
+            OutputTransportGateSource::new(profiled_mixer_source, transport_paused.clone());
+        let metered_source = OutputPeakMeterSource::new(gated_source, output_peak_meter.clone());
         let sample_frame_clock = Arc::new(AtomicU64::new(0));
+        // Keep the endpoint frame clock outside the gate: it continues to count
+        // silent hardware frames while the Cue mixer itself is frozen.
         let clocked_source =
             SampleFrameClockSource::new(metered_source, sample_frame_clock.clone(), channels);
-        let stream_health = Arc::new(AudioStreamHealth::default());
         let stream_config = cpal::StreamConfig {
             channels: config.channels(),
             sample_rate: config.sample_rate(),
@@ -4160,9 +6383,16 @@ fn build_device_output(
             performance,
             settings,
             stream_health: Some(stream_health),
+            transport_paused: Some(transport_paused),
             sample_frame_clock,
             last_callback_count: 0,
             last_callback_progress_at: Instant::now(),
+            pending_stop_callback_acks: VecDeque::new(),
+            last_stop_callback_ack_generation: 0,
+            last_callback_metrics_at: Instant::now(),
+            last_callback_metrics_count: 0,
+            last_callback_total_ns: 0,
+            last_callback_over_budget_count: 0,
             #[cfg(target_os = "windows")]
             directsound_source: None,
         });
@@ -4189,6 +6419,8 @@ fn build_metered_cpal_stream<S>(
 where
     S: Iterator<Item = f32> + Send + 'static,
 {
+    let callback_channels = stream_config.channels.max(1) as usize;
+    let callback_sample_rate = stream_config.sample_rate.max(1) as u64;
     macro_rules! build_output_stream {
         ($sample_type:ty) => {{
             let mut source = source;
@@ -4198,6 +6430,10 @@ where
                 .build_output_stream::<$sample_type, _, _>(
                     stream_config.clone(),
                     move |data: &mut [$sample_type], _| {
+                        let stop_generation_at_start = callback_health
+                            .stop_request_generation
+                            .load(Ordering::Acquire);
+                        let callback_started = Instant::now();
                         callback_health
                             .callback_count
                             .fetch_add(1, Ordering::Relaxed);
@@ -4207,6 +6443,36 @@ where
                                 .map(Sample::from_sample)
                                 .unwrap_or(<$sample_type>::EQUILIBRIUM);
                         });
+                        let elapsed_ns =
+                            callback_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                        callback_health
+                            .callback_total_ns
+                            .fetch_add(elapsed_ns, Ordering::Relaxed);
+                        callback_health
+                            .callback_max_ns
+                            .fetch_max(elapsed_ns, Ordering::Relaxed);
+                        let frames = data.len() / callback_channels;
+                        callback_health
+                            .callback_last_frames
+                            .store(frames as u64, Ordering::Relaxed);
+                        let budget_ns =
+                            (frames as u64).saturating_mul(1_000_000_000) / callback_sample_rate;
+                        if budget_ns > 0 && elapsed_ns >= budget_ns {
+                            callback_health
+                                .callback_over_budget_count
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Acknowledgement means a complete output buffer was rendered
+                        // after the control thread published the stop request. It does
+                        // not mean the physical DAC buffer has drained yet.
+                        let stop_generation_after_render = callback_health
+                            .stop_request_generation
+                            .load(Ordering::Acquire);
+                        if stop_generation_after_render == stop_generation_at_start {
+                            callback_health
+                                .stop_callback_ack_generation
+                                .store(stop_generation_after_render, Ordering::Release);
+                        }
                     },
                     move |_error| {
                         // Do not format or write logs from the native stream callback.
@@ -4299,9 +6565,27 @@ fn build_directsound_device_output(
     output_peak_meter: &Arc<AtomicU32>,
     performance: AudioPerformanceSettings,
 ) -> Option<DeviceOutput> {
+    let device_spec = directsound_device_spec(audio, device_name);
+    build_directsound_device_output_with_spec(
+        device_name,
+        settings_by_device,
+        output_peak_meter,
+        performance,
+        device_spec,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn build_directsound_device_output_with_spec(
+    device_name: &str,
+    settings_by_device: &OutputSettingsByDevice,
+    output_peak_meter: &Arc<AtomicU32>,
+    performance: AudioPerformanceSettings,
+    device_spec: (usize, u32),
+) -> Option<DeviceOutput> {
     use std::num::{NonZeroU16, NonZeroU32};
 
-    let (channels, preferred_rate) = directsound_device_spec(audio, device_name);
+    let (channels, preferred_rate) = device_spec;
     let channels_u8 = u8::try_from(channels).ok().filter(|value| *value > 0)?;
     let selected_device = (device_name != DIRECTSOUND_DEFAULT_DEVICE).then_some(device_name);
 
@@ -4393,9 +6677,16 @@ fn build_directsound_device_output(
             performance,
             settings,
             stream_health: None,
+            transport_paused: None,
             sample_frame_clock,
             last_callback_count: 0,
             last_callback_progress_at: Instant::now(),
+            pending_stop_callback_acks: VecDeque::new(),
+            last_stop_callback_ack_generation: 0,
+            last_callback_metrics_at: Instant::now(),
+            last_callback_metrics_count: 0,
+            last_callback_total_ns: 0,
+            last_callback_over_budget_count: 0,
             directsound_source: Some(source),
         });
     }
@@ -4676,6 +6967,8 @@ fn audio_worker(
 #[cfg(target_os = "windows")]
 fn audio_worker_directsound(
     selected_device: Option<String>,
+    selected_endpoint: Option<AudioEndpoint>,
+    include_full_device_metadata: bool,
     cmd_rx: Receiver<AudioCommand>,
     pos_tx: Sender<PositionUpdate>,
     output_settings_by_device: OutputSettingsByDevice,
@@ -4706,30 +6999,66 @@ fn audio_worker_directsound(
             );
         }
 
-        let output_devices = list_directsound_devices(&audio);
+        let scanned_devices =
+            include_full_device_metadata.then(|| list_directsound_devices(&audio));
         let current_device = match selected_device {
-            Some(selected) => output_devices
-                .iter()
-                .find(|device| {
-                    device.as_str() == selected
-                        || AudioEngine::normalize_device_name(device.as_str())
-                            == AudioEngine::normalize_device_name(&selected)
+            Some(selected) if include_full_device_metadata => scanned_devices
+                .as_ref()
+                .and_then(|devices| {
+                    devices
+                        .iter()
+                        .find(|device| {
+                            device.as_str() == selected
+                                || AudioEngine::normalize_device_name(device.as_str())
+                                    == AudioEngine::normalize_device_name(&selected)
+                        })
+                        .cloned()
                 })
-                .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "Selected DirectSound output device '{}' is no longer available",
                         selected
                     )
                 })?,
+            Some(selected) => {
+                let endpoint_matches = selected_endpoint.as_ref().is_some_and(|endpoint| {
+                    endpoint.backend == AudioBackend::DirectSound
+                        && endpoint.is_available()
+                        && endpoint.device_name == selected
+                });
+                if selected != DIRECTSOUND_DEFAULT_DEVICE && !endpoint_matches {
+                    anyhow::bail!(
+                        "Selected DirectSound endpoint '{}' is missing from the cached device registry; refusing to enumerate devices during GO",
+                        selected
+                    );
+                }
+                selected
+            }
             None => DIRECTSOUND_DEFAULT_DEVICE.to_string(),
         };
-        let initial_output = build_directsound_device_output(
-            &audio,
+        let output_devices = scanned_devices.unwrap_or_else(|| vec![current_device.clone()]);
+        let current_device_spec = if include_full_device_metadata
+            || current_device == DIRECTSOUND_DEFAULT_DEVICE
+        {
+            directsound_device_spec(&audio, &current_device)
+        } else {
+            let endpoint = selected_endpoint.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DirectSound endpoint '{}' has no cached channel metadata; refusing to scan devices during GO",
+                    current_device
+                )
+            })?;
+            (
+                endpoint.channels.max(1),
+                performance.sample_rate.unwrap_or(48_000).max(8_000),
+            )
+        };
+        let initial_output = build_directsound_device_output_with_spec(
             &current_device,
             &output_settings_by_device,
             &output_peak_meter,
             performance,
+            current_device_spec,
         )
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -4742,10 +7071,26 @@ fn audio_worker_directsound(
 
         let mut output_device_channels = HashMap::new();
         let mut output_device_channel_layouts = HashMap::new();
-        for name in &output_devices {
-            let (channels, _) = directsound_device_spec(&audio, name);
-            output_device_channels.insert(name.clone(), channels.max(1));
-            output_device_channel_layouts.insert(name.clone(), vec![channels.max(1)]);
+        if include_full_device_metadata {
+            for name in &output_devices {
+                let (channels, _) = directsound_device_spec(&audio, name);
+                output_device_channels.insert(name.clone(), channels.max(1));
+                output_device_channel_layouts.insert(name.clone(), vec![channels.max(1)]);
+            }
+        } else if let Some(endpoint) = selected_endpoint.as_ref() {
+            output_device_channels.insert(current_device.clone(), endpoint.channels.max(1));
+            output_device_channel_layouts.insert(
+                current_device.clone(),
+                if endpoint.channel_layouts.is_empty() {
+                    vec![endpoint.channels.max(1)]
+                } else {
+                    endpoint.channel_layouts.clone()
+                },
+            );
+        } else {
+            output_device_channels.insert(current_device.clone(), initial_output.channels.max(1));
+            output_device_channel_layouts
+                .insert(current_device.clone(), vec![initial_output.channels.max(1)]);
         }
 
         let ready = DirectSoundInitInfo {
@@ -4826,6 +7171,216 @@ fn detect_output_stream_failure(
     None
 }
 
+fn register_stop_callback_ack(
+    streams: &mut HashMap<String, DeviceOutput>,
+    device_names: impl IntoIterator<Item = String>,
+    request_id: Uuid,
+    cue_id: Option<Uuid>,
+    requested_at: Instant,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for device_name in device_names {
+        if !seen.insert(device_name.clone()) {
+            continue;
+        }
+        let Some(output) = streams.get_mut(&device_name) else {
+            continue;
+        };
+        let Some(health) = output.stream_health.as_ref() else {
+            #[cfg(target_os = "windows")]
+            if let OutputStreamHandle::DirectSound(queue) = &output._stream {
+                let queued_bytes = queue.queued_bytes() as u64;
+                let bytes_per_frame = (queue.channels.max(1) * std::mem::size_of::<f32>()) as u64;
+                let queued_frames = queued_bytes / bytes_per_frame.max(1);
+                let queued_ms = queued_frames as f64 * 1_000.0 / queue.sample_rate.max(1) as f64;
+                info!(
+                    "STOP_LATENCY: request_id={}, cue_id={:?}, endpoint='{}', stage=directsound_queue_observed, queued_bytes={}, queued_frames={}, queued_ms={:.2}",
+                    request_id,
+                    cue_id,
+                    device_name,
+                    queued_bytes,
+                    queued_frames,
+                    queued_ms
+                );
+            }
+            info!(
+                "STOP_LATENCY: request_id={}, cue_id={:?}, endpoint='{}', stage=callback_ack_unavailable, backend=DirectSound",
+                request_id, cue_id, device_name
+            );
+            continue;
+        };
+        if output
+            .pending_stop_callback_acks
+            .iter()
+            .any(|pending| pending.request_id == request_id)
+        {
+            continue;
+        }
+        let generation = health
+            .stop_request_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        output
+            .pending_stop_callback_acks
+            .push_back(PendingStopCallbackAck {
+                generation,
+                request_id,
+                cue_id,
+                requested_at,
+            });
+    }
+}
+
+fn poll_output_stream_diagnostics(streams: &mut HashMap<String, DeviceOutput>, now: Instant) {
+    for (device_name, output) in streams.iter_mut() {
+        let Some(health) = output.stream_health.as_ref() else {
+            continue;
+        };
+
+        let acknowledged_generation = health.stop_callback_ack_generation.load(Ordering::Acquire);
+        if acknowledged_generation > output.last_stop_callback_ack_generation {
+            while output
+                .pending_stop_callback_acks
+                .front()
+                .is_some_and(|pending| pending.generation <= acknowledged_generation)
+            {
+                if let Some(pending) = output.pending_stop_callback_acks.pop_front() {
+                    info!(
+                        "STOP_LATENCY: request_id={}, cue_id={:?}, endpoint='{}', stage=audio_callback_buffer_rendered, stop_to_callback_observed_us={}",
+                        pending.request_id,
+                        pending.cue_id,
+                        device_name,
+                        pending.requested_at.elapsed().as_micros()
+                    );
+                    output.last_stop_callback_ack_generation = pending.generation;
+                }
+            }
+            output.last_stop_callback_ack_generation = output
+                .last_stop_callback_ack_generation
+                .max(acknowledged_generation);
+        }
+
+        while output
+            .pending_stop_callback_acks
+            .front()
+            .is_some_and(|pending| pending.requested_at.elapsed() >= Duration::from_secs(2))
+        {
+            if let Some(pending) = output.pending_stop_callback_acks.pop_front() {
+                warn!(
+                    "STOP_LATENCY: request_id={}, cue_id={:?}, endpoint='{}', stage=audio_callback_ack_timeout, elapsed_us={}",
+                    pending.request_id,
+                    pending.cue_id,
+                    device_name,
+                    pending.requested_at.elapsed().as_micros()
+                );
+            }
+        }
+
+        if now.saturating_duration_since(output.last_callback_metrics_at) < Duration::from_secs(5) {
+            continue;
+        }
+
+        let callback_count = health.callback_count.load(Ordering::Relaxed);
+        let total_ns = health.callback_total_ns.load(Ordering::Relaxed);
+        let max_ns = health.callback_max_ns.load(Ordering::Relaxed);
+        let over_budget = health.callback_over_budget_count.load(Ordering::Relaxed);
+        let buffer_frames = health.callback_last_frames.load(Ordering::Relaxed);
+        let callback_delta = callback_count.saturating_sub(output.last_callback_metrics_count);
+        let total_delta_ns = total_ns.saturating_sub(output.last_callback_total_ns);
+        let over_budget_delta = over_budget.saturating_sub(output.last_callback_over_budget_count);
+        if callback_delta > 0 {
+            info!(
+                "AUDIO_CALLBACK_METRICS: endpoint='{}', callbacks={}, avg_processing_us={:.2}, max_processing_us_since_stream_open={}, over_budget_callbacks={}, buffer_frames={}, buffer_period_ms={:.2}, sample_rate={} Hz, channels={}",
+                device_name,
+                callback_delta,
+                total_delta_ns as f64 / callback_delta as f64 / 1_000.0,
+                max_ns / 1_000,
+                over_budget_delta,
+                buffer_frames,
+                buffer_frames as f64 * 1_000.0 / output.sample_rate.max(1) as f64,
+                output.sample_rate,
+                output.channels
+            );
+        }
+        let router_samples = health
+            .channel_router_profile_samples
+            .swap(0, Ordering::Relaxed);
+        let router_profiled_frames = health
+            .channel_router_profiled_frames
+            .swap(0, Ordering::Relaxed);
+        let router_source_total_ns = health
+            .channel_router_source_total_ns
+            .swap(0, Ordering::Relaxed);
+        let router_source_max_ns = health
+            .channel_router_source_max_ns
+            .swap(0, Ordering::Relaxed);
+        let router_route_total_ns = health
+            .channel_router_route_total_ns
+            .swap(0, Ordering::Relaxed);
+        let router_route_max_ns = health
+            .channel_router_route_max_ns
+            .swap(0, Ordering::Relaxed);
+        let router_active_instances = health
+            .channel_router_active_instances
+            .load(Ordering::Relaxed);
+
+        if router_samples > 0 && router_profiled_frames > 0 {
+            let router_estimated_ns = router_source_total_ns.saturating_add(router_route_total_ns);
+            let unattributed_ns = total_delta_ns.saturating_sub(router_estimated_ns);
+            info!(
+                "CHANNEL_ROUTER_PROFILE: endpoint='{}', active_instances={}, sampled_blocks={}, estimated_cue_frames={}, source_estimated_ms={:.2}, source_avg_us_per_cue_frame={:.3}, source_max_sample_us={:.2}, route_estimated_ms={:.2}, route_avg_us_per_cue_frame={:.3}, route_max_sample_us={:.2}, callback_total_ms={:.2}, callback_unattributed_ms={:.2}",
+                device_name,
+                router_active_instances,
+                router_samples,
+                router_profiled_frames,
+                router_source_total_ns as f64 / 1_000_000.0,
+                router_source_total_ns as f64 / router_profiled_frames as f64 / 1_000.0,
+                router_source_max_ns as f64 / 1_000.0,
+                router_route_total_ns as f64 / 1_000_000.0,
+                router_route_total_ns as f64 / router_profiled_frames as f64 / 1_000.0,
+                router_route_max_ns as f64 / 1_000.0,
+                total_delta_ns as f64 / 1_000_000.0,
+                unattributed_ns as f64 / 1_000_000.0,
+            );
+        }
+
+        let mixer_profile_samples = health
+            .mixer_output_profile_samples
+            .swap(0, Ordering::Relaxed);
+        let mixer_profiled_frames = health
+            .mixer_output_profiled_frames
+            .swap(0, Ordering::Relaxed);
+        let mixer_output_total_ns = health.mixer_output_total_ns.swap(0, Ordering::Relaxed);
+        let mixer_output_max_ns = health.mixer_output_max_ns.swap(0, Ordering::Relaxed);
+
+        if mixer_profile_samples > 0 && mixer_profiled_frames > 0 {
+            let router_estimated_ns = router_source_total_ns.saturating_add(router_route_total_ns);
+            let mixer_unattributed_ns = mixer_output_total_ns.saturating_sub(router_estimated_ns);
+            let post_mixer_ns = total_delta_ns.saturating_sub(mixer_output_total_ns);
+            info!(
+                "MIXER_OUTPUT_PROFILE: endpoint='{}', active_instances={}, sampled_frames={}, estimated_endpoint_frames={}, mixer_estimated_ms={:.2}, mixer_avg_us_per_endpoint_frame={:.3}, mixer_max_sample_us={:.2}, router_source_estimated_ms={:.2}, router_route_estimated_ms={:.2}, mixer_unattributed_ms={:.2}, post_mixer_estimated_ms={:.2}, callback_total_ms={:.2}",
+                device_name,
+                router_active_instances,
+                mixer_profile_samples,
+                mixer_profiled_frames,
+                mixer_output_total_ns as f64 / 1_000_000.0,
+                mixer_output_total_ns as f64 / mixer_profiled_frames as f64 / 1_000.0,
+                mixer_output_max_ns as f64 / 1_000.0,
+                router_source_total_ns as f64 / 1_000_000.0,
+                router_route_total_ns as f64 / 1_000_000.0,
+                mixer_unattributed_ns as f64 / 1_000_000.0,
+                post_mixer_ns as f64 / 1_000_000.0,
+                total_delta_ns as f64 / 1_000_000.0,
+            );
+        }
+
+        output.last_callback_metrics_count = callback_count;
+        output.last_callback_total_ns = total_ns;
+        output.last_callback_over_budget_count = over_budget;
+        output.last_callback_metrics_at = now;
+    }
+}
+
 fn audio_worker_loop(
     backend: AudioBackend,
     context: AudioOutputContext,
@@ -4842,6 +7397,7 @@ fn audio_worker_loop(
     streams.insert(initial_device_name.clone(), initial_output);
     let mut default_device_name = initial_device_name;
     let mut players: Vec<ActivePlayer> = Vec::new();
+    let (retired_automation_points_tx, retired_automation_points_rx) = bounded(1_024);
     let test_generation = Arc::new(AtomicU64::new(0));
     let tick = Duration::from_millis(5);
 
@@ -5096,6 +7652,7 @@ fn audio_worker_loop(
                     performance,
                     &test_generation,
                     &pos_tx,
+                    &retired_automation_points_tx,
                 ),
                 other => handle_command(
                     other,
@@ -5111,12 +7668,20 @@ fn audio_worker_loop(
                     &pos_tx,
                     None,
                     None,
+                    &retired_automation_points_tx,
                 ),
             }
         }
 
+        while let Ok(retired_points) = retired_automation_points_rx.try_recv() {
+            drop(retired_points);
+        }
+
+        let diagnostics_now = Instant::now();
+        poll_output_stream_diagnostics(&mut streams, diagnostics_now);
+
         if let Some((device_name, reason)) =
-            detect_output_stream_failure(backend, &mut streams, Instant::now())
+            detect_output_stream_failure(backend, &mut streams, diagnostics_now)
         {
             let message = format!(
                 "{} output stream '{}' failed: {}",
@@ -5141,8 +7706,50 @@ fn audio_worker_loop(
         }
 
         let mut finished_ids: Vec<(Uuid, u64)> = Vec::new();
+        let mut stopped_ids: Vec<(Uuid, u64)> = Vec::new();
+        let mut completed_stop_acks: Vec<(PendingStopCompletion, String)> = Vec::new();
         for player in &mut players {
-            if player.sink.is_paused() {
+            if player.stopping {
+                if player.stop_fade.is_completed() || player.sink.empty() {
+                    player.sink.stop();
+                    let device_name = player.output_device.clone();
+                    for pending in player.pending_stop_completions.drain(..) {
+                        completed_stop_acks.push((pending, device_name.clone()));
+                    }
+                    stopped_ids.push((player.id, player.generation));
+                }
+                continue;
+            }
+
+            let prefetch_underruns = player.prefetch_underrun_count.load(Ordering::Relaxed);
+            let prefetch_underrun_frames =
+                player.prefetch_underrun_frame_count.load(Ordering::Relaxed);
+            if prefetch_underruns > player.last_prefetch_underrun_count
+                || prefetch_underrun_frames > player.last_prefetch_underrun_frame_count
+            {
+                let new_episodes =
+                    prefetch_underruns.saturating_sub(player.last_prefetch_underrun_count);
+                let new_silent_frames = prefetch_underrun_frames
+                    .saturating_sub(player.last_prefetch_underrun_frame_count);
+                let sample_rate = player.source_sample_rate.max(1) as f64;
+                warn!(
+                    "AUDIO_PREFETCH_UNDERRUN: cue_id={}, generation={}, endpoint='{}', new_episodes={}, total_episodes={}, new_silent_frames={}, total_silent_frames={}, new_silence_ms={:.3}, total_silence_ms={:.3}, source_rate={} Hz",
+                    player.id,
+                    player.generation,
+                    player.output_device,
+                    new_episodes,
+                    prefetch_underruns,
+                    new_silent_frames,
+                    prefetch_underrun_frames,
+                    new_silent_frames as f64 * 1000.0 / sample_rate,
+                    prefetch_underrun_frames as f64 * 1000.0 / sample_rate,
+                    player.source_sample_rate
+                );
+                player.last_prefetch_underrun_count = prefetch_underruns;
+                player.last_prefetch_underrun_frame_count = prefetch_underrun_frames;
+            }
+
+            if player_is_paused(&streams, player) {
                 let _ = pos_tx.try_send(PositionUpdate {
                     id: player.id,
                     generation: player.generation,
@@ -5152,7 +7759,7 @@ fn audio_worker_loop(
                 continue;
             }
 
-            let mut pos = player.current_pos();
+            let pos = player.current_pos();
 
             if !player.start_frame_reported {
                 if let Some(observed) = &player.start_frame_observed {
@@ -5170,40 +7777,156 @@ fn audio_worker_loop(
                 }
             }
 
-            // Loop restart must use the same output device as the original cue.
-            let valid_loop = player.loop_enabled && player.loop_end > player.loop_start;
-            if valid_loop && pos >= player.loop_end {
-                if player.loops_remaining == -1 || player.loops_remaining > 1 {
-                    if player.loops_remaining > 1 {
-                        player.loops_remaining -= 1;
-                    }
-                    player.sink.stop();
-                    if let Some(new_sink) = open_sink_at(
-                        &player.mixer,
-                        &player.file,
-                        player.loop_start,
-                        player.current_volume,
-                        player.output_channels,
-                        player.output_sample_rate,
-                        player.channel_routes.clone(),
-                        player.output_settings.clone(),
-                        player.output_gains.clone(),
-                        player.volume_automation_enabled,
-                        player.volume_automation.clone(),
-                        player.automation_update_rx.clone(),
-                        player.time_pitch.clone(),
-                        player.position_state.clone(),
-                        None,
-                        None,
-                        None,
-                    ) {
-                        player.sink = new_sink;
-                        pos = player.loop_start;
+            // Loop boundaries are handled inside the continuous PCM source.
+            // The Worker never stops or recreates the Player/Sink for a repeat.
+            let completed_loops = player.loop_iterations.load(Ordering::Relaxed);
+            if completed_loops > player.last_reported_loop_iterations
+                && (completed_loops == 1
+                    || completed_loops.saturating_sub(player.last_reported_loop_iterations) >= 10)
+            {
+                info!(
+                    "AUDIO_LOOP_PRODUCER_PROGRESS: cue_id={}, generation={}, prepared_repeats={}, producer_loops_remaining={}",
+                    player.id,
+                    player.generation,
+                    completed_loops,
+                    player.loops_remaining.load(Ordering::Acquire)
+                );
+                player.last_reported_loop_iterations = completed_loops;
+            }
+
+            // This counter changes only when the render-side PCM consumer reaches
+            // a Loop wrap. It is deliberately separate from the producer counter
+            // above, which can run ahead by the entire prefetch queue.
+            let rendered_loops = player.render_loop_iterations.load(Ordering::Acquire);
+            if rendered_loops > player.last_reported_render_loop_iterations {
+                let new_repeats =
+                    rendered_loops.saturating_sub(player.last_reported_render_loop_iterations);
+                let boundary_frame = player.render_loop_boundary_frame.load(Ordering::Acquire);
+                let boundary_position = f64::from_bits(
+                    player
+                        .render_loop_boundary_position_bits
+                        .load(Ordering::Acquire),
+                );
+                let endpoint_render_frame = player
+                    .render_loop_boundary_endpoint_frame
+                    .load(Ordering::Acquire);
+                let endpoint_render_frame =
+                    (endpoint_render_frame != u64::MAX).then_some(endpoint_render_frame);
+                let source_media_frame = if boundary_position.is_finite() && boundary_position > 0.0
+                {
+                    (boundary_position * f64::from(player.source_sample_rate)).round() as u64
+                } else {
+                    0
+                };
+                info!(
+                    "AUDIO_LOOP_RENDERED: cue_id={}, generation={}, rendered_repeats={}, new_repeats={}, source_frame={}, source_media_frame={}, endpoint_render_frame={:?}, media_position_secs={:.6}, source_rate={} Hz, endpoint_rate={} Hz",
+                    player.id,
+                    player.generation,
+                    rendered_loops,
+                    new_repeats,
+                    boundary_frame,
+                    source_media_frame,
+                    endpoint_render_frame,
+                    boundary_position,
+                    player.source_sample_rate,
+                    player.output_sample_rate
+                );
+                player.last_reported_render_loop_iterations = rendered_loops;
+            }
+
+            let fingerprint_iteration = player
+                .render_loop_fingerprint_iteration
+                .load(Ordering::Acquire);
+            if fingerprint_iteration > player.last_reported_render_loop_fingerprint_iteration {
+                let fingerprint = player.render_loop_fingerprint.load(Ordering::Acquire);
+                let boundary_position = f64::from_bits(
+                    player
+                        .render_loop_boundary_position_bits
+                        .load(Ordering::Acquire),
+                );
+                let source_media_frame = if boundary_position.is_finite() && boundary_position > 0.0
+                {
+                    (boundary_position * f64::from(player.source_sample_rate)).round() as u64
+                } else {
+                    0
+                };
+                info!(
+                    "AUDIO_LOOP_PCM_FINGERPRINT: cue_id={}, generation={}, loop_iteration={}, source_media_frame={}, frames={}, fnv1a64=0x{:016x}",
+                    player.id,
+                    player.generation,
+                    fingerprint_iteration,
+                    source_media_frame,
+                    PCM_LOOP_FINGERPRINT_FRAMES,
+                    fingerprint
+                );
+                player.last_reported_render_loop_fingerprint_iteration = fingerprint_iteration;
+            }
+
+            let capture_iteration = player
+                .loop_pcm_capture
+                .completed_iteration
+                .load(Ordering::Acquire);
+            if capture_iteration > player.last_reported_loop_pcm_capture_iteration {
+                let capture = &player.loop_pcm_capture;
+                let channels = capture.channels.load(Ordering::Relaxed) as usize;
+                let pre_frames_valid = capture.pre_frames_valid.load(Ordering::Relaxed);
+                let post_samples_captured = capture.post_samples_captured.load(Ordering::Relaxed);
+                let capture_status = match capture.status.load(Ordering::Relaxed) {
+                    PCM_LOOP_CAPTURE_STATUS_VALID => "valid",
+                    PCM_LOOP_CAPTURE_STATUS_UNDERRUN => "underrun",
+                    PCM_LOOP_CAPTURE_STATUS_UNSUPPORTED_CHANNELS => "unsupported_channels",
+                    PCM_LOOP_CAPTURE_STATUS_INCOMPLETE => "incomplete",
+                    _ => "pending_or_unknown",
+                };
+                let endpoint_frame = capture.endpoint_render_frame.load(Ordering::Relaxed);
+                let endpoint_frame = (endpoint_frame != u64::MAX).then_some(endpoint_frame);
+                let (pre_samples_bits, post_samples_bits) =
+                    if channels > 0 && channels <= PCM_LOOP_CAPTURE_MAX_CHANNELS {
+                        let pre = (0..PCM_LOOP_CAPTURE_PRE_FRAMES * channels)
+                            .map(|index| {
+                                format!("{:08x}", capture.samples[index].load(Ordering::Relaxed))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let post_start = PCM_LOOP_CAPTURE_PRE_FRAMES * channels;
+                        let captured_post_samples = (post_samples_captured as usize)
+                            .min(PCM_LOOP_CAPTURE_POST_FRAMES * channels);
+                        let post = (0..captured_post_samples)
+                            .map(|index| {
+                                format!(
+                                    "{:08x}",
+                                    capture.samples[post_start + index].load(Ordering::Relaxed)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        (pre, post)
                     } else {
-                        finished_ids.push((player.id, player.generation));
-                        continue;
-                    }
-                }
+                        ("unavailable".to_string(), "unavailable".to_string())
+                    };
+
+                info!(
+                    "AUDIO_LOOP_PCM_WINDOW: cue_id={}, generation={}, loop_iteration={}, source_elapsed_frame={}, source_media_frame={}, endpoint_render_frame={:?}, source_rate={} Hz, endpoint_rate={} Hz, channels={}, pre_frames_valid={}, post_samples_captured={}, status={}, dropped_captures={}, pre_f32_bits=[{}], post_f32_bits=[{}]",
+                    player.id,
+                    player.generation,
+                    capture.iteration.load(Ordering::Relaxed),
+                    capture.source_elapsed_frame.load(Ordering::Relaxed),
+                    capture.source_media_frame.load(Ordering::Relaxed),
+                    endpoint_frame,
+                    player.source_sample_rate,
+                    player.output_sample_rate,
+                    channels,
+                    pre_frames_valid,
+                    post_samples_captured,
+                    capture_status,
+                    capture.dropped_captures.load(Ordering::Relaxed),
+                    pre_samples_bits,
+                    post_samples_bits
+                );
+                player.last_reported_loop_pcm_capture_iteration = capture_iteration;
+                capture
+                    .acknowledged_iteration
+                    .store(capture_iteration, Ordering::Release);
             }
 
             if (player.end_secs > 0.0 && pos >= player.end_secs) || player.sink.empty() {
@@ -5214,7 +7937,12 @@ fn audio_worker_loop(
 
             let mut state = CueState::Playing;
             let mut env = 1.0_f32;
-            let elapsed_from_start = (pos - player.start_secs).max(0.0);
+            let elapsed_from_start = if player.loop_runtime_active {
+                player.playback_elapsed_frames.load(Ordering::Relaxed) as f64
+                    / player.source_sample_rate.max(1) as f64
+            } else {
+                (pos - player.start_secs).max(0.0)
+            };
             if player.fade_in_secs > 0.0 && elapsed_from_start < player.fade_in_secs {
                 let t = (elapsed_from_start / player.fade_in_secs) as f32;
                 env *= player
@@ -5222,7 +7950,13 @@ fn audio_worker_loop(
                     .apply_with_points(t, &player.custom_fade_points);
                 state = CueState::FadingIn;
             }
-            if player.end_secs > 0.0 && player.fade_out_secs > 0.0 {
+            let is_final_loop_pass = should_apply_loop_fade_out(
+                player.loop_runtime_active,
+                player.render_loop_remaining_state.load(Ordering::Acquire),
+                player.end_secs,
+                player.loop_end,
+            );
+            if is_final_loop_pass && player.end_secs > 0.0 && player.fade_out_secs > 0.0 {
                 let remaining = (player.end_secs - pos).max(0.0);
                 if remaining < player.fade_out_secs {
                     let t = (remaining / player.fade_out_secs) as f32;
@@ -5240,8 +7974,16 @@ fn audio_worker_loop(
                     let should_stop = fade.stop_on_finish;
                     player.dynamic_fade = None;
                     if should_stop {
-                        player.sink.stop();
-                        finished_ids.push((player.id, player.generation));
+                        // The control-thread fade may finish between worker ticks.
+                        // Finish with the same sample-level de-click ramp used by Stop.
+                        player.stopping = true;
+                        player.stop_fade.request();
+                        let _ = pos_tx.try_send(PositionUpdate {
+                            id: player.id,
+                            generation: player.generation,
+                            position_secs: pos,
+                            state: CueState::Stopped,
+                        });
                         continue;
                     }
                 } else {
@@ -5275,6 +8017,10 @@ fn audio_worker_loop(
             });
         }
 
+        for (stopped_id, generation) in stopped_ids {
+            players.retain(|player| player.id != stopped_id || player.generation != generation);
+        }
+
         for (finished_id, generation) in finished_ids {
             players.retain(|player| player.id != finished_id || player.generation != generation);
             let _ = pos_tx.try_send(PositionUpdate {
@@ -5283,6 +8029,39 @@ fn audio_worker_loop(
                 position_secs: 0.0,
                 state: CueState::Stopped,
             });
+        }
+
+        let mut registered_stop_ack_keys = std::collections::HashSet::new();
+        for (pending, device_name) in completed_stop_acks {
+            let still_waiting_on_device = players.iter().any(|player| {
+                player.output_device == device_name
+                    && player
+                        .pending_stop_completions
+                        .iter()
+                        .any(|other| other.request_id == pending.request_id)
+            });
+            if still_waiting_on_device
+                || !registered_stop_ack_keys
+                    .insert((pending.request_id.clone(), device_name.clone()))
+            {
+                continue;
+            }
+
+            info!(
+                "STOP_LATENCY: request_id={}, cue_id={:?}, endpoint='{}', stage=stop_fade_rendered, stop_to_fade_complete_observed_us={}, fade_ms={:.2}",
+                pending.request_id,
+                pending.cue_id,
+                device_name,
+                pending.requested_at.elapsed().as_micros(),
+                STOP_DECLICK_FADE_MS
+            );
+            register_stop_callback_ack(
+                &mut streams,
+                std::iter::once(device_name),
+                pending.request_id.clone(),
+                pending.cue_id.clone(),
+                pending.requested_at.clone(),
+            );
         }
 
         #[cfg(target_os = "windows")]
@@ -5305,6 +8084,7 @@ fn handle_play_batch(
     performance: AudioPerformanceSettings,
     test_generation: &Arc<AtomicU64>,
     pos_tx: &Sender<PositionUpdate>,
+    retired_automation_points_tx: &Sender<Vec<[f64; 2]>>,
 ) {
     if cues.is_empty() {
         return;
@@ -5377,6 +8157,7 @@ fn handle_play_batch(
             pos_tx,
             Some(start_frame_gate.clone()),
             Some(transaction_id),
+            retired_automation_points_tx,
         );
     }
 
@@ -5438,6 +8219,7 @@ fn handle_command(
     pos_tx: &Sender<PositionUpdate>,
     scheduled_start_gate: Option<Arc<AtomicU64>>,
     launch_transaction_id: Option<Uuid>,
+    retired_automation_points_tx: &Sender<Vec<[f64; 2]>>,
 ) {
     match cmd {
         AudioCommand::Play {
@@ -5488,10 +8270,15 @@ fn handle_command(
                     return true;
                 }
                 replacing_existing = true;
+                // An explicit Stop is already fading sample-by-sample. Keep that
+                // short tail alive rather than cutting it off with a second GO.
+                if player.stopping {
+                    return true;
+                }
                 // Older restart tails are already near silence. Stop those and
                 // retain only the newest instance for one clean crossfade tail.
                 if Some(player.generation) != previous_generation
-                    || player.sink.is_paused()
+                    || player_is_paused(streams, player)
                     || player.current_volume <= 0.000_01
                 {
                     player.sink.stop();
@@ -5533,6 +8320,9 @@ fn handle_command(
             let sample_frame_clock = streams
                 .get(&device_name)
                 .map(|output| output.sample_frame_clock.clone());
+            let channel_router_profile = streams
+                .get(&device_name)
+                .and_then(|output| output.stream_health.clone());
             let start_frame_observed =
                 if scheduled_start_gate.is_some() && sample_frame_clock.is_some() {
                     Some(Arc::new(AtomicU64::new(u64::MAX)))
@@ -5564,36 +8354,20 @@ fn handle_command(
             }
             let (automation_update_tx, automation_update_rx) = unbounded();
             let time_pitch_state = Arc::new(RwLock::new(time_pitch));
-            let position_state = Arc::new(RwLock::new(start_secs.max(0.0)));
-            let Some(sink) = open_sink_at(
-                &mixer,
-                &file,
-                start_secs,
-                initial_volume,
-                output_channels,
-                sample_rate,
-                route_state.clone(),
-                output_settings.clone(),
-                output_gains_state.clone(),
-                volume_automation_enabled,
-                volume_automation.clone(),
-                automation_update_rx.clone(),
-                time_pitch_state.clone(),
-                position_state.clone(),
-                scheduled_start_gate.clone(),
-                sample_frame_clock,
-                start_frame_observed.clone(),
-            ) else {
-                warn!("Cannot open audio file for playback: {:?}", file);
-                return;
-            };
-            info!(
-                "Cue {} output device + decoder/sink prepared in {:.1} ms (device: {})",
-                id,
-                prepare_started.elapsed().as_secs_f64() * 1000.0,
-                device_name
-            );
-
+            let position_state = Arc::new(AtomicU64::new(start_secs.max(0.0).to_bits()));
+            let prefetch_underrun_count = Arc::new(AtomicU64::new(0));
+            let prefetch_underrun_frame_count = Arc::new(AtomicU64::new(0));
+            let loops_remaining_state = Arc::new(AtomicI32::new(loop_count));
+            let loop_iterations = Arc::new(AtomicU64::new(0));
+            let render_loop_iterations = Arc::new(AtomicU64::new(0));
+            let render_loop_boundary_frame = Arc::new(AtomicU64::new(0));
+            let render_loop_boundary_position_bits =
+                Arc::new(AtomicU64::new(start_secs.max(0.0).to_bits()));
+            let render_loop_boundary_endpoint_frame = Arc::new(AtomicU64::new(u64::MAX));
+            let loop_pcm_capture = Arc::new(LoopPcmCapture::new());
+            let render_loop_fingerprint = Arc::new(AtomicU64::new(0));
+            let render_loop_fingerprint_iteration = Arc::new(AtomicU64::new(0));
+            let playback_elapsed_frames = Arc::new(AtomicU64::new(0));
             let effective_end = end_secs
                 .unwrap_or(duration_secs)
                 .min(if duration_secs > 0.0 {
@@ -5606,6 +8380,69 @@ fn handle_command(
             } else {
                 effective_end
             };
+            let loop_runtime_active = loop_enabled
+                && effective_loop_end > loop_start
+                && (loop_count == -1 || loop_count > 1);
+            let render_loop_remaining_state = Arc::new(AtomicI32::new(if loop_runtime_active {
+                loop_count
+            } else {
+                0
+            }));
+            let mut pump_during_prefetch = || {
+                #[cfg(target_os = "windows")]
+                pump_directsound_queues(streams);
+            };
+            let stop_fade = StopFadeControl::new();
+            let sink_result = open_sink_at(
+                &mixer,
+                &file,
+                start_secs,
+                initial_volume,
+                loop_enabled,
+                loop_start,
+                effective_loop_end,
+                loops_remaining_state.clone(),
+                loop_iterations.clone(),
+                playback_elapsed_frames.clone(),
+                render_loop_remaining_state.clone(),
+                stop_fade.clone(),
+                output_channels,
+                sample_rate,
+                route_state.clone(),
+                output_settings.clone(),
+                output_gains_state.clone(),
+                channel_router_profile,
+                volume_automation_enabled,
+                volume_automation.clone(),
+                automation_update_rx.clone(),
+                retired_automation_points_tx.clone(),
+                time_pitch_state.clone(),
+                position_state.clone(),
+                prefetch_underrun_count.clone(),
+                prefetch_underrun_frame_count.clone(),
+                render_loop_iterations.clone(),
+                render_loop_boundary_frame.clone(),
+                render_loop_boundary_position_bits.clone(),
+                render_loop_boundary_endpoint_frame.clone(),
+                loop_pcm_capture.clone(),
+                render_loop_fingerprint.clone(),
+                render_loop_fingerprint_iteration.clone(),
+                &mut pump_during_prefetch,
+                scheduled_start_gate.clone(),
+                sample_frame_clock,
+                start_frame_observed.clone(),
+            );
+            drop(pump_during_prefetch);
+            let Some((sink, source_sample_rate)) = sink_result else {
+                warn!("Cannot open audio file for playback: {:?}", file);
+                return;
+            };
+            info!(
+                "Cue {} output device + decoder/sink prepared in {:.1} ms (device: {})",
+                id,
+                prepare_started.elapsed().as_secs_f64() * 1000.0,
+                device_name
+            );
 
             players.push(ActivePlayer {
                 id,
@@ -5624,6 +8461,10 @@ fn handle_command(
                 volume_automation,
                 time_pitch: time_pitch_state,
                 position_state,
+                prefetch_underrun_count,
+                last_prefetch_underrun_count: 0,
+                prefetch_underrun_frame_count,
+                last_prefetch_underrun_frame_count: 0,
                 automation_update_tx,
                 automation_update_rx,
                 fade_in_secs: effective_fade_in_secs,
@@ -5639,11 +8480,30 @@ fn handle_command(
                 mixer,
                 output_settings,
                 loop_enabled,
+                loop_runtime_active,
                 loop_start,
                 loop_end: effective_loop_end,
-                loops_remaining: loop_count,
+                loops_remaining: loops_remaining_state,
+                loop_iterations,
+                last_reported_loop_iterations: 0,
+                render_loop_iterations,
+                last_reported_render_loop_iterations: 0,
+                render_loop_boundary_frame,
+                render_loop_boundary_position_bits,
+                render_loop_boundary_endpoint_frame,
+                render_loop_fingerprint,
+                render_loop_fingerprint_iteration,
+                last_reported_render_loop_fingerprint_iteration: 0,
+                loop_pcm_capture,
+                last_reported_loop_pcm_capture_iteration: 0,
+                playback_elapsed_frames,
+                render_loop_remaining_state,
+                source_sample_rate,
                 paused_at: None,
                 dynamic_fade: None,
+                stop_fade,
+                stopping: false,
+                pending_stop_completions: Vec::new(),
                 start_frame_observed,
                 start_frame_reported: false,
                 launch_transaction_id,
@@ -5651,33 +8511,127 @@ fn handle_command(
         }
 
         AudioCommand::Stop(id) => {
-            for player in players.iter().filter(|player| player.id == id) {
+            for player in players.iter_mut().filter(|player| player.id == id) {
+                if player.stopping {
+                    continue;
+                }
                 let _ = pos_tx.try_send(PositionUpdate {
                     id: player.id,
                     generation: player.generation,
                     position_secs: player.current_pos(),
                     state: CueState::Stopped,
                 });
-                player.sink.stop();
+                player.stopping = true;
+                if player_is_paused(streams, player) {
+                    // A paused source cannot render a fade. It is already silent
+                    // at the source, so complete the stop without resuming audio.
+                    player.stop_fade.complete_without_render();
+                    player.sink.stop();
+                } else {
+                    player.stop_fade.request();
+                }
             }
-            players.retain(|player| player.id != id);
+        }
+
+        AudioCommand::StopTimed {
+            id,
+            request_id,
+            requested_at_unix_micros,
+        } => {
+            let elapsed_us = unix_micros_now().saturating_sub(requested_at_unix_micros);
+            let requested_at = Instant::now();
+            let mut matching_players = 0usize;
+            for player in players.iter_mut().filter(|player| player.id == id) {
+                matching_players += 1;
+                if !player.stopping {
+                    let _ = pos_tx.try_send(PositionUpdate {
+                        id: player.id,
+                        generation: player.generation,
+                        position_secs: player.current_pos(),
+                        state: CueState::Stopped,
+                    });
+                    player.stopping = true;
+                    if player_is_paused(streams, player) {
+                        player.stop_fade.complete_without_render();
+                        player.sink.stop();
+                    } else {
+                        player.stop_fade.request();
+                    }
+                }
+                player.pending_stop_completions.push(PendingStopCompletion {
+                    request_id: request_id.clone(),
+                    cue_id: Some(id),
+                    requested_at: requested_at.clone(),
+                });
+            }
+            info!(
+                "STOP_LATENCY: request_id={}, cue_id={}, stage=stop_fade_requested, request_to_engine_us={}, matching_players={}, fade_ms={:.2}",
+                request_id, id, elapsed_us, matching_players, STOP_DECLICK_FADE_MS
+            );
+        }
+
+        AudioCommand::StopAllTimed {
+            request_id,
+            requested_at_unix_micros,
+        } => {
+            let elapsed_us = unix_micros_now().saturating_sub(requested_at_unix_micros);
+            let requested_at = Instant::now();
+            let stopped = players.len();
+            for player in players.iter_mut() {
+                if !player.stopping {
+                    let _ = pos_tx.try_send(PositionUpdate {
+                        id: player.id,
+                        generation: player.generation,
+                        position_secs: player.current_pos(),
+                        state: CueState::Stopped,
+                    });
+                    player.stopping = true;
+                    if player_is_paused(streams, player) {
+                        player.stop_fade.complete_without_render();
+                        player.sink.stop();
+                    } else {
+                        player.stop_fade.request();
+                    }
+                }
+                player.pending_stop_completions.push(PendingStopCompletion {
+                    request_id: request_id.clone(),
+                    cue_id: None,
+                    requested_at: requested_at.clone(),
+                });
+            }
+            info!(
+                "STOP_LATENCY: request_id={}, scope=all, stage=stop_fade_requested, request_to_engine_us={}, matching_players={}, fade_ms={:.2}",
+                request_id, elapsed_us, stopped, STOP_DECLICK_FADE_MS
+            );
         }
 
         AudioCommand::StopAll => {
-            for player in players.iter() {
+            for player in players.iter_mut() {
+                if player.stopping {
+                    continue;
+                }
                 let _ = pos_tx.try_send(PositionUpdate {
                     id: player.id,
                     generation: player.generation,
                     position_secs: player.current_pos(),
                     state: CueState::Stopped,
                 });
-                player.sink.stop();
+                player.stopping = true;
+                if player_is_paused(streams, player) {
+                    player.stop_fade.complete_without_render();
+                    player.sink.stop();
+                } else {
+                    player.stop_fade.request();
+                }
             }
-            players.clear();
         }
 
         AudioCommand::Pause(id) => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 let position = player.current_pos();
                 player.sink.pause();
                 player.paused_at = Some(position);
@@ -5685,7 +8639,11 @@ fn handle_command(
         }
 
         AudioCommand::Seek { id, position_secs } => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 let min_position = player.start_secs.max(0.0);
                 let max_position = if player.end_secs > 0.0 {
                     (player.end_secs - 0.01).max(min_position)
@@ -5694,27 +8652,71 @@ fn handle_command(
                 };
                 let position = position_secs.clamp(min_position, max_position);
                 player.sink.stop();
-                if let Some(new_sink) = open_sink_at(
+                let endpoint_frame_clock = streams
+                    .get(&player.output_device)
+                    .map(|output| output.sample_frame_clock.clone());
+                let channel_router_profile = streams
+                    .get(&player.output_device)
+                    .and_then(|output| output.stream_health.clone());
+                let mut pump_during_prefetch = || {
+                    #[cfg(target_os = "windows")]
+                    pump_directsound_queues(streams);
+                };
+                let stop_fade = StopFadeControl::new();
+                // Use the loop count at the audible render position, not the
+                // producer's read-ahead count, which can be up to the prefetch
+                // queue ahead of what the operator has actually heard.
+                let loops_remaining_for_seek = Arc::new(AtomicI32::new(
+                    player.render_loop_remaining_state.load(Ordering::Acquire),
+                ));
+                let new_sink_result = open_sink_at(
                     &player.mixer,
                     &player.file,
                     position,
                     player.current_volume,
+                    player.loop_enabled,
+                    player.loop_start,
+                    player.loop_end,
+                    loops_remaining_for_seek.clone(),
+                    player.loop_iterations.clone(),
+                    player.playback_elapsed_frames.clone(),
+                    player.render_loop_remaining_state.clone(),
+                    stop_fade.clone(),
                     player.output_channels,
                     player.output_sample_rate,
                     player.channel_routes.clone(),
                     player.output_settings.clone(),
                     player.output_gains.clone(),
+                    channel_router_profile,
                     player.volume_automation_enabled,
                     player.volume_automation.clone(),
                     player.automation_update_rx.clone(),
+                    retired_automation_points_tx.clone(),
                     player.time_pitch.clone(),
                     player.position_state.clone(),
+                    player.prefetch_underrun_count.clone(),
+                    player.prefetch_underrun_frame_count.clone(),
+                    player.render_loop_iterations.clone(),
+                    player.render_loop_boundary_frame.clone(),
+                    player.render_loop_boundary_position_bits.clone(),
+                    player.render_loop_boundary_endpoint_frame.clone(),
+                    player.loop_pcm_capture.clone(),
+                    player.render_loop_fingerprint.clone(),
+                    player.render_loop_fingerprint_iteration.clone(),
+                    &mut pump_during_prefetch,
                     None,
+                    endpoint_frame_clock,
                     None,
-                    None,
-                ) {
+                );
+                drop(pump_during_prefetch);
+                if let Some((new_sink, source_sample_rate)) = new_sink_result {
                     new_sink.pause();
                     player.sink = new_sink;
+                    player.loops_remaining = loops_remaining_for_seek;
+                    player.source_sample_rate = source_sample_rate;
+                    player.stop_fade = stop_fade;
+                    player.stopping = false;
+                    player.pending_stop_completions.clear();
                     player.paused_at = Some(position);
                     player.dynamic_fade = None;
                 } else {
@@ -5724,7 +8726,28 @@ fn handle_command(
         }
 
         AudioCommand::PauseAll => {
-            for player in players.iter_mut() {
+            // CPAL endpoints pause the complete final mix at one shared sample
+            // boundary. Do not call Sink::pause() sequentially for those Cue:
+            // the native callback could run between calls and create phase drift.
+            for (device_name, output) in streams.iter_mut() {
+                if let Some(gate) = &output.transport_paused {
+                    let frame = output.sample_frame_clock.load(Ordering::Acquire);
+                    gate.store(true, Ordering::Release);
+                    info!(
+                        "AUDIO_TRANSPORT_PAUSE_ALL: endpoint='{}', endpoint_frame={}, active_cues={}",
+                        device_name,
+                        frame,
+                        players.iter().filter(|player| player.output_device.as_str() == device_name.as_str() && !player.stopping).count()
+                    );
+                }
+            }
+
+            // DirectSound uses a queued-output path without a CPAL callback
+            // gate. Keep its existing per-Sink pause behavior for now.
+            for player in players.iter_mut().filter(|player| !player.stopping) {
+                if player_output_is_globally_paused(streams, player) {
+                    continue;
+                }
                 let position = player.current_pos();
                 player.sink.pause();
                 player.paused_at = Some(position);
@@ -5732,21 +8755,86 @@ fn handle_command(
         }
 
         AudioCommand::Resume(id) => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            let gated_device = players
+                .iter()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+                .and_then(|player| {
+                    let output = streams.get(&player.output_device)?;
+                    let gate = output.transport_paused.as_ref()?;
+                    gate.load(Ordering::Acquire).then(|| {
+                        (
+                            player.output_device.clone(),
+                            player.generation,
+                            gate.clone(),
+                        )
+                    })
+                });
+
+            if let Some((device_name, selected_generation, gate)) = gated_device {
+                // Resume Selected while Pause All is active: keep the endpoint
+                // gate closed while individually pausing the other Cue on this
+                // endpoint, then release the gate once the selected Cue is ready.
+                for other in players.iter_mut().filter(|player| {
+                    player.output_device.as_str() == device_name.as_str()
+                        && !(player.id == id && player.generation == selected_generation)
+                        && !player.stopping
+                }) {
+                    if !other.sink.is_paused() {
+                        let position = other.current_pos();
+                        other.sink.pause();
+                        other.paused_at = Some(position);
+                    }
+                }
+
+                if let Some(player) = players
+                    .iter_mut()
+                    .rev()
+                    .find(|player| player.id == id && !player.stopping)
+                {
+                    player.paused_at = None;
+                    player.sink.play();
+                }
+
+                gate.store(false, Ordering::Release);
+            } else if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 player.paused_at = None;
                 player.sink.play();
             }
         }
 
         AudioCommand::ResumeAll => {
-            for player in players.iter_mut() {
+            // Prepare every Sink while the shared endpoint gates are still
+            // closed. Releasing each gate only after all Sinks are ready makes
+            // the next output sample the common resume point for that endpoint.
+            for player in players.iter_mut().filter(|player| !player.stopping) {
                 player.paused_at = None;
                 player.sink.play();
+            }
+            for (device_name, output) in streams.iter_mut() {
+                if let Some(gate) = &output.transport_paused {
+                    let frame = output.sample_frame_clock.load(Ordering::Acquire);
+                    gate.store(false, Ordering::Release);
+                    info!(
+                        "AUDIO_TRANSPORT_RESUME_ALL: endpoint='{}', endpoint_frame={}, active_cues={}",
+                        device_name,
+                        frame,
+                        players.iter().filter(|player| player.output_device.as_str() == device_name.as_str() && !player.stopping).count()
+                    );
+                }
             }
         }
 
         AudioCommand::SetVolume(id, volume) => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 player.base_volume = volume;
                 player.sink.set_volume(volume);
             }
@@ -5757,7 +8845,11 @@ fn handle_command(
             enabled,
             points,
         } => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 player.volume_automation_enabled = enabled;
                 player.volume_automation = points.clone();
                 // The source consumes updates at audio-frame boundaries without blocking.
@@ -5768,7 +8860,11 @@ fn handle_command(
         }
         AudioCommand::SetTimePitch { id, mut settings } => {
             sanitize_time_pitch_settings(&mut settings);
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 *player.time_pitch.write() = settings;
             }
         }
@@ -5781,7 +8877,11 @@ fn handle_command(
             curve,
             custom_fade_points,
         } => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 player.dynamic_fade = Some(DynamicFade {
                     start_vol: player.current_volume,
                     target_vol: target_volume,
@@ -5795,13 +8895,21 @@ fn handle_command(
         }
 
         AudioCommand::SetRouting { id, routes } => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 *player.channel_routes.write() = routes;
             }
         }
 
         AudioCommand::SetOutputGains { id, gains_db } => {
-            if let Some(player) = players.iter_mut().rev().find(|player| player.id == id) {
+            if let Some(player) = players
+                .iter_mut()
+                .rev()
+                .find(|player| player.id == id && !player.stopping)
+            {
                 let mut current = player.output_gains.write();
                 *current = gains_db;
                 current.resize(player.output_channels, 0.0);
@@ -5914,6 +9022,413 @@ mod channel_router_tests {
     use rodio::buffer::SamplesBuffer;
 
     #[test]
+    fn stop_fade_source_ramps_interleaved_audio_to_zero_without_channel_skew() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 2_u16;
+        let sample_rate = 48_000_u32;
+        let fade_frames =
+            ((sample_rate as f64 * STOP_DECLICK_FADE_MS / 1_000.0).round() as usize).max(1);
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(channels).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+            vec![0.75_f32; (fade_frames + 8) * channels as usize],
+        );
+        let control = StopFadeControl::new();
+        let mut faded = StopFadeSource::new(source, control.clone());
+
+        // Let one complete frame pass before requesting Stop.
+        assert_eq!(faded.next(), Some(0.75));
+        assert_eq!(faded.next(), Some(0.75));
+        control.request();
+
+        let tail = faded.by_ref().collect::<Vec<_>>();
+        assert_eq!(tail.len(), fade_frames * channels as usize);
+        assert_eq!(tail[0], 0.75);
+        assert_eq!(tail[1], 0.75);
+        assert_eq!(tail[tail.len() - 2], 0.0);
+        assert_eq!(tail[tail.len() - 1], 0.0);
+
+        let mut previous_gain = 1.0_f32;
+        for frame in 0..fade_frames {
+            let left = tail[frame * channels as usize];
+            let right = tail[frame * channels as usize + 1];
+            assert!((left - right).abs() <= f32::EPSILON);
+            let gain = left / 0.75;
+            assert!(
+                gain <= previous_gain + 1.0e-6,
+                "stop fade gain must not increase: previous={previous_gain}, current={gain}"
+            );
+            previous_gain = gain;
+        }
+
+        assert!(control.is_completed());
+        assert_eq!(faded.next(), None);
+    }
+
+    #[test]
+    fn stop_fade_request_mid_frame_waits_for_next_interleaved_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.5_f32; 2_000],
+        );
+        let control = StopFadeControl::new();
+        let mut faded = StopFadeSource::new(source, control.clone());
+
+        // Request Stop between the left and right samples of a stereo frame.
+        assert_eq!(faded.next(), Some(0.5));
+        control.request();
+        assert_eq!(faded.next(), Some(0.5));
+
+        let tail = faded.by_ref().collect::<Vec<_>>();
+        assert_eq!(tail.len() % 2, 0);
+        assert_eq!(tail[0], 0.5);
+        assert_eq!(tail[1], 0.5);
+        for frame in 0..(tail.len() / 2) {
+            assert!((tail[frame * 2] - tail[frame * 2 + 1]).abs() <= f32::EPSILON);
+        }
+        assert_eq!(tail[tail.len() - 2], 0.0);
+        assert_eq!(tail[tail.len() - 1], 0.0);
+        assert!(control.is_completed());
+    }
+
+    #[test]
+    fn stop_fade_completion_mid_wide_frame_waits_for_next_interleaved_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let channels = 128_usize;
+        let expected = (0..channels)
+            .map(|index| (index + 1) as f32 / channels as f32)
+            .collect::<Vec<_>>();
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(channels as u16).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            expected.clone(),
+        );
+        let control = StopFadeControl::new();
+        let mut faded = StopFadeSource::new(source, control.clone());
+
+        // Completing between two samples must not truncate the current
+        // 128-channel frame. The source ends at the next frame boundary.
+        assert_eq!(faded.next(), Some(expected[0]));
+        control.complete_without_render();
+        for expected_sample in expected.iter().skip(1) {
+            assert_eq!(faded.next(), Some(*expected_sample));
+        }
+        assert_eq!(faded.next(), None);
+    }
+
+    #[test]
+    fn stop_fade_source_passes_audio_unchanged_until_stop_is_requested() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let expected = vec![0.1_f32, -0.1, 0.2, -0.2];
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            expected.clone(),
+        );
+        let control = StopFadeControl::new();
+        let actual = StopFadeSource::new(source, control.clone()).collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert!(!control.is_completed());
+    }
+
+    #[test]
+    fn pcm_prefetch_source_preserves_interleaved_samples_and_reaches_eof() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let expected = vec![0.1_f32, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4];
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            expected.clone(),
+        );
+        let producer_position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let render_position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let underruns = Arc::new(AtomicU64::new(0));
+        let playback_elapsed_frames = Arc::new(AtomicU64::new(0));
+        let mut pump_during_wait = || {};
+        let mut prefetched = PcmPrefetchSource::new(
+            source,
+            producer_position,
+            render_position,
+            underruns.clone(),
+            playback_elapsed_frames.clone(),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            false,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(LoopPcmCapture::new()),
+            &mut pump_during_wait,
+        )
+        .expect("prefetch source should prime its first chunk");
+
+        let actual = (0..expected.len())
+            .map(|_| prefetched.next().expect("prefetched sample"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(prefetched.next(), None);
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
+        assert_eq!(playback_elapsed_frames.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn pcm_prefetch_underrun_finishes_the_interleaved_frame_before_resuming_pcm() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let (ready_tx, ready_rx) = bounded::<PcmPrefetchChunk>(2);
+        let (free_tx, _free_rx) = bounded::<PcmPrefetchChunk>(2);
+        let underruns = Arc::new(AtomicU64::new(0));
+        let underrun_frames = Arc::new(AtomicU64::new(0));
+        let playback_elapsed_frames = Arc::new(AtomicU64::new(0));
+        let mut source = PcmPrefetchSource {
+            channels: NonZeroU16::new(2).unwrap(),
+            sample_rate: NonZeroU32::new(48_000).unwrap(),
+            total_duration: None,
+            ready_rx,
+            free_tx,
+            current_chunk: None,
+            current_index: 0,
+            producer_finished: Arc::new(AtomicBool::new(false)),
+            render_position_state: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            underrun_count: underruns.clone(),
+            playback_elapsed_frames: playback_elapsed_frames.clone(),
+            render_loop_remaining_state: Arc::new(AtomicI32::new(-1)),
+            underrun_frame_count: underrun_frames.clone(),
+            underrun_silence_samples_remaining: 0,
+            underrun_active: false,
+            loop_diagnostics_enabled: false,
+            render_loop_iterations: Arc::new(AtomicU64::new(0)),
+            render_loop_boundary_frame: Arc::new(AtomicU64::new(0)),
+            render_loop_boundary_position_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            render_loop_boundary_endpoint_frame: Arc::new(AtomicU64::new(u64::MAX)),
+            endpoint_frame_clock: None,
+            render_loop_fingerprint: Arc::new(AtomicU64::new(0)),
+            render_loop_fingerprint_iteration: Arc::new(AtomicU64::new(0)),
+            loop_pcm_capture: Arc::new(LoopPcmCapture::new()),
+            loop_capture_pre_samples: [0.0; PCM_LOOP_CAPTURE_PRE_FRAMES
+                * PCM_LOOP_CAPTURE_MAX_CHANNELS],
+            loop_capture_pre_frames: 0,
+            loop_capture_pre_write_frame: 0,
+            loop_capture_active: false,
+            loop_capture_iteration: 0,
+            loop_capture_post_samples_written: 0,
+            last_render_media_position: None,
+            loop_fingerprint_active: false,
+            loop_fingerprint_samples_remaining: 0,
+            loop_fingerprint_hash: PCM_FNV1A64_OFFSET_BASIS,
+            loop_fingerprint_iteration: 0,
+            consumer_finished: false,
+        };
+
+        // The first channel is missing. A chunk becomes ready before the second
+        // channel is requested, but the remainder of this frame must stay silent.
+        assert_eq!(source.next(), Some(0.0));
+        assert!(ready_tx
+            .send(PcmPrefetchChunk {
+                samples: vec![0.25, -0.25],
+                frame_end_positions: vec![1.0_f64.to_bits()],
+                frame_loop_remaining: vec![-1],
+                start_position_bits: 0.0_f64.to_bits(),
+                end_position_bits: 1.0_f64.to_bits(),
+                start_loop_remaining: -1,
+                eof: true,
+            })
+            .is_ok());
+
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(source.next(), Some(0.25));
+        assert_eq!(source.next(), Some(-0.25));
+        assert_eq!(underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(underrun_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(playback_elapsed_frames.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pcm_prefetch_reports_loop_boundary_when_render_reaches_wrapped_pcm() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let (ready_tx, ready_rx) = bounded::<PcmPrefetchChunk>(2);
+        let (free_tx, _free_rx) = bounded::<PcmPrefetchChunk>(2);
+        assert!(ready_tx
+            .send(PcmPrefetchChunk {
+                samples: vec![0.1, -0.1],
+                frame_end_positions: vec![10.0_f64.to_bits()],
+                frame_loop_remaining: vec![-1],
+                start_position_bits: 9.9_f64.to_bits(),
+                end_position_bits: 10.0_f64.to_bits(),
+                start_loop_remaining: -1,
+                eof: false,
+            })
+            .is_ok());
+        let loop_samples = (0..PCM_LOOP_FINGERPRINT_FRAMES)
+            .flat_map(|_| [0.2_f32, -0.2_f32])
+            .collect::<Vec<_>>();
+        let loop_frame_end_positions = (1..=PCM_LOOP_FINGERPRINT_FRAMES)
+            .map(|frame| (5.0_f64 + frame as f64 / 48_000.0).to_bits())
+            .collect::<Vec<_>>();
+        assert!(ready_tx
+            .send(PcmPrefetchChunk {
+                samples: loop_samples.clone(),
+                frame_end_positions: loop_frame_end_positions,
+                frame_loop_remaining: vec![-1; PCM_LOOP_FINGERPRINT_FRAMES],
+                start_position_bits: 5.0_f64.to_bits(),
+                end_position_bits: (5.0_f64 + PCM_LOOP_FINGERPRINT_FRAMES as f64 / 48_000.0)
+                    .to_bits(),
+                start_loop_remaining: -1,
+                eof: false,
+            })
+            .is_ok());
+
+        let playback_elapsed_frames = Arc::new(AtomicU64::new(0));
+        let render_loop_iterations = Arc::new(AtomicU64::new(0));
+        let render_loop_boundary_frame = Arc::new(AtomicU64::new(0));
+        let render_loop_boundary_position_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let render_loop_boundary_endpoint_frame = Arc::new(AtomicU64::new(u64::MAX));
+        let endpoint_frame_clock = Arc::new(AtomicU64::new(42));
+        let loop_pcm_capture = Arc::new(LoopPcmCapture::new());
+        let render_loop_fingerprint = Arc::new(AtomicU64::new(0));
+        let render_loop_fingerprint_iteration = Arc::new(AtomicU64::new(0));
+        let mut source = PcmPrefetchSource {
+            channels: NonZeroU16::new(2).unwrap(),
+            sample_rate: NonZeroU32::new(48_000).unwrap(),
+            total_duration: None,
+            ready_rx,
+            free_tx,
+            current_chunk: None,
+            current_index: 0,
+            producer_finished: Arc::new(AtomicBool::new(true)),
+            render_position_state: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            underrun_count: Arc::new(AtomicU64::new(0)),
+            playback_elapsed_frames: playback_elapsed_frames.clone(),
+            render_loop_remaining_state: Arc::new(AtomicI32::new(-1)),
+            underrun_frame_count: Arc::new(AtomicU64::new(0)),
+            underrun_silence_samples_remaining: 0,
+            underrun_active: false,
+            loop_diagnostics_enabled: true,
+            render_loop_iterations: render_loop_iterations.clone(),
+            render_loop_boundary_frame: render_loop_boundary_frame.clone(),
+            render_loop_boundary_position_bits: render_loop_boundary_position_bits.clone(),
+            render_loop_boundary_endpoint_frame: render_loop_boundary_endpoint_frame.clone(),
+            endpoint_frame_clock: Some(endpoint_frame_clock.clone()),
+            render_loop_fingerprint: render_loop_fingerprint.clone(),
+            render_loop_fingerprint_iteration: render_loop_fingerprint_iteration.clone(),
+            loop_pcm_capture: loop_pcm_capture.clone(),
+            loop_capture_pre_samples: [0.0; PCM_LOOP_CAPTURE_PRE_FRAMES
+                * PCM_LOOP_CAPTURE_MAX_CHANNELS],
+            loop_capture_pre_frames: 0,
+            loop_capture_pre_write_frame: 0,
+            loop_capture_active: false,
+            loop_capture_iteration: 0,
+            loop_capture_post_samples_written: 0,
+            last_render_media_position: None,
+            loop_fingerprint_active: false,
+            loop_fingerprint_samples_remaining: 0,
+            loop_fingerprint_hash: PCM_FNV1A64_OFFSET_BASIS,
+            loop_fingerprint_iteration: 0,
+            consumer_finished: false,
+        };
+
+        assert_eq!(source.next(), Some(0.1));
+        assert_eq!(source.next(), Some(-0.1));
+        assert_eq!(playback_elapsed_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(render_loop_iterations.load(Ordering::Acquire), 0);
+
+        // The second chunk starts at 5.0s after the previous frame ended at 10.0s.
+        assert_eq!(source.next(), Some(0.2));
+        assert_eq!(render_loop_iterations.load(Ordering::Acquire), 1);
+        assert_eq!(render_loop_boundary_frame.load(Ordering::Acquire), 1);
+        assert_eq!(
+            render_loop_boundary_endpoint_frame.load(Ordering::Acquire),
+            42
+        );
+        assert!(
+            (f64::from_bits(render_loop_boundary_position_bits.load(Ordering::Acquire)) - 5.0)
+                .abs()
+                < f64::EPSILON
+        );
+        for expected in loop_samples.iter().skip(1) {
+            assert_eq!(source.next(), Some(*expected));
+        }
+        let expected_fingerprint = loop_samples
+            .iter()
+            .fold(PCM_FNV1A64_OFFSET_BASIS, |hash, sample| {
+                (hash ^ sample.to_bits() as u64).wrapping_mul(PCM_FNV1A64_PRIME)
+            });
+        assert_eq!(render_loop_fingerprint_iteration.load(Ordering::Acquire), 1);
+        assert_eq!(
+            render_loop_fingerprint.load(Ordering::Acquire),
+            expected_fingerprint
+        );
+
+        assert_eq!(
+            loop_pcm_capture.completed_iteration.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            loop_pcm_capture.status.load(Ordering::Relaxed),
+            PCM_LOOP_CAPTURE_STATUS_VALID
+        );
+        assert_eq!(loop_pcm_capture.channels.load(Ordering::Relaxed), 2);
+        assert_eq!(loop_pcm_capture.pre_frames_valid.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            loop_pcm_capture
+                .post_samples_captured
+                .load(Ordering::Relaxed),
+            (PCM_LOOP_CAPTURE_POST_FRAMES * 2) as u32
+        );
+        assert_eq!(
+            loop_pcm_capture
+                .source_elapsed_frame
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            loop_pcm_capture.source_media_frame.load(Ordering::Relaxed),
+            240_000
+        );
+        assert_eq!(
+            loop_pcm_capture
+                .endpoint_render_frame
+                .load(Ordering::Relaxed),
+            42
+        );
+        // The one available pre-boundary frame is right-aligned in the
+        // four-frame pre-window; the post-window begins at a fixed offset.
+        assert_eq!(
+            loop_pcm_capture.samples[6].load(Ordering::Relaxed),
+            0.1_f32.to_bits()
+        );
+        assert_eq!(
+            loop_pcm_capture.samples[7].load(Ordering::Relaxed),
+            (-0.1_f32).to_bits()
+        );
+        for (index, expected) in loop_samples
+            .iter()
+            .take(PCM_LOOP_CAPTURE_POST_FRAMES * 2)
+            .enumerate()
+        {
+            assert_eq!(
+                loop_pcm_capture.samples[PCM_LOOP_CAPTURE_PRE_FRAMES * 2 + index]
+                    .load(Ordering::Relaxed),
+                expected.to_bits()
+            );
+        }
+    }
+
+    #[test]
     fn sample_frame_clock_advances_once_per_complete_interleaved_frame() {
         use std::num::{NonZeroU16, NonZeroU32};
 
@@ -5936,6 +9451,73 @@ mod channel_router_tests {
             assert!(clocked.next().is_some());
         }
         assert_eq!(frame_clock.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn output_transport_gate_freezes_all_sources_without_stopping_output_clock() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.25_f32, 0.5, 0.75, 1.0],
+        );
+        let paused = Arc::new(AtomicBool::new(true));
+        let gated = OutputTransportGateSource::new(source, paused.clone());
+        let frame_clock = Arc::new(AtomicU64::new(0));
+        let mut output = SampleFrameClockSource::new(gated, frame_clock.clone(), 2);
+
+        // While paused, the endpoint emits silence and advances its output
+        // frame clock, but the underlying mixer/source is not polled.
+        assert_eq!(output.next(), Some(0.0));
+        assert_eq!(frame_clock.load(Ordering::Acquire), 0);
+        assert_eq!(output.next(), Some(0.0));
+        assert_eq!(frame_clock.load(Ordering::Acquire), 1);
+        assert_eq!(output.next(), Some(0.0));
+        assert_eq!(frame_clock.load(Ordering::Acquire), 1);
+        assert_eq!(output.next(), Some(0.0));
+        assert_eq!(frame_clock.load(Ordering::Acquire), 2);
+
+        // Repeated pause/resume cycles do not consume source samples. Once the
+        // shared gate opens, playback resumes at the exact original sample.
+        for _ in 0..100 {
+            paused.store(true, Ordering::Release);
+            assert_eq!(output.next(), Some(0.0));
+            assert_eq!(output.next(), Some(0.0));
+            paused.store(false, Ordering::Release);
+        }
+        assert_eq!(output.next(), Some(0.25));
+        assert_eq!(output.next(), Some(0.5));
+        assert_eq!(frame_clock.load(Ordering::Acquire), 103);
+    }
+
+    #[test]
+    fn output_transport_gate_never_splits_an_interleaved_frame() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let source = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            vec![0.25_f32, 0.5, 0.75, 1.0],
+        );
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut gated = OutputTransportGateSource::new(source, paused.clone());
+
+        // A pause arriving after the first channel takes effect only after
+        // the second channel of the same interleaved frame has been delivered.
+        assert_eq!(gated.next(), Some(0.25));
+        paused.store(true, Ordering::Release);
+        assert_eq!(gated.next(), Some(0.5));
+
+        // The next complete frame is silent. A resume between its channels
+        // cannot leak one channel early.
+        assert_eq!(gated.next(), Some(0.0));
+        paused.store(false, Ordering::Release);
+        assert_eq!(gated.next(), Some(0.0));
+
+        // The following frame resumes from the next untouched source frame.
+        assert_eq!(gated.next(), Some(0.75));
+        assert_eq!(gated.next(), Some(1.0));
     }
 
     #[test]
@@ -6198,6 +9780,97 @@ mod channel_router_tests {
     }
 
     #[test]
+    fn mixer_output_profile_samples_complete_endpoint_frames_without_changing_samples() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let health = Arc::new(AudioStreamHealth::default());
+        let expected = (0..4_096)
+            .map(|sample| sample as f32 / 4_096.0)
+            .collect::<Vec<_>>();
+        let input = SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(48_000).unwrap(),
+            expected.clone(),
+        );
+        let mut profiled = MixerOutputProfileSource::new(input, health.clone(), 2);
+
+        let actual = profiled.by_ref().collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            health.mixer_output_profile_samples.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            health.mixer_output_profiled_frames.load(Ordering::Relaxed),
+            2_048
+        );
+    }
+
+    #[test]
+    fn channel_router_profile_samples_one_frame_per_1024_output_frames() {
+        use std::num::{NonZeroU16, NonZeroU32};
+
+        let sample_rate = 48_000_u32;
+        let profile = Arc::new(AudioStreamHealth::default());
+        let routes = Arc::new(RwLock::new(vec![ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0],
+            gain_db: 0.0,
+        }]));
+        let settings = Arc::new(RwLock::new(vec![OutputChannelSetting::default(); 2]));
+        let gains = Arc::new(RwLock::new(vec![0.0; 2]));
+        let input = SamplesBuffer::new(
+            NonZeroU16::new(1).unwrap(),
+            NonZeroU32::new(sample_rate).unwrap(),
+            vec![0.25_f32; 2_048],
+        );
+
+        let mut router = ChannelRouter::new_with_profile(
+            input,
+            routes,
+            settings,
+            gains,
+            2,
+            Some(profile.clone()),
+        );
+
+        assert_eq!(
+            profile
+                .channel_router_active_instances
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let rendered = (0..4_096)
+            .map(|_| router.next().expect("router output sample"))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 4_096);
+        assert_eq!(
+            profile
+                .channel_router_profile_samples
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            profile
+                .channel_router_profiled_frames
+                .load(Ordering::Relaxed),
+            2_048
+        );
+
+        drop(router);
+        assert_eq!(
+            profile
+                .channel_router_active_instances
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
     fn output_mapping_settings_keys_are_scoped_by_backend() {
         let asio_key = AudioEngine::output_device_config_key_for_backend(
             AudioBackend::Asio,
@@ -6251,11 +9924,22 @@ mod channel_router_tests {
             vec![1.0_f32, 1.0, 1.0, 1.0, 1.0, 1.0],
         );
         let (_tx, rx) = unbounded();
-        let mut automated =
-            VolumeAutomationSource::new(source, 0.0, true, vec![[0.0, 1.0], [1.0, 0.0]], rx);
-        let output = (0..6)
-            .map(|_| automated.next().expect("automation sample"))
-            .collect::<Vec<_>>();
+        let (retired_tx, _retired_rx) = unbounded();
+        let position_state = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let mut automated = VolumeAutomationSource::new(
+            source,
+            true,
+            vec![[0.0, 1.0], [1.0, 0.0]],
+            rx,
+            retired_tx,
+            position_state.clone(),
+        );
+        let mut output = Vec::new();
+        for position in [0.0, 0.5, 1.0] {
+            atomic_store_f64(&position_state, position);
+            output.push(automated.next().expect("automation sample"));
+            output.push(automated.next().expect("automation sample"));
+        }
         assert_eq!(output, vec![1.0, 1.0, 0.5, 0.5, 0.0, 0.0]);
     }
 
@@ -6267,7 +9951,10 @@ mod channel_router_tests {
             vec![1.0_f32; 8],
         );
         let (tx, rx) = unbounded();
-        let mut automated = VolumeAutomationSource::new(source, 0.0, false, Vec::new(), rx);
+        let (retired_tx, _retired_rx) = unbounded();
+        let position_state = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let mut automated =
+            VolumeAutomationSource::new(source, false, Vec::new(), rx, retired_tx, position_state);
         assert_eq!(automated.next(), Some(1.0));
         tx.send(VolumeAutomationUpdate {
             enabled: true,
@@ -6484,6 +10171,76 @@ mod channel_router_tests {
             }
         }
         assert!(saw_selected_signal);
+    }
+
+    #[test]
+    fn channel_router_refreshes_live_routing_into_its_render_snapshot() {
+        let routes = Arc::new(RwLock::new(vec![ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0],
+            gain_db: 0.0,
+        }]));
+        let output_settings = Arc::new(RwLock::new(vec![
+            OutputChannelSetting::default(),
+            OutputChannelSetting::default(),
+        ]));
+        let output_gains = Arc::new(RwLock::new(vec![0.0, 0.0]));
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            vec![0.5_f32],
+        );
+        let mut router =
+            ChannelRouter::new(source, routes.clone(), output_settings, output_gains, 2);
+
+        routes.write()[0] = ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 1,
+            output_channels: vec![1],
+            gain_db: 0.0,
+        };
+        router.refresh_live_settings();
+
+        let frame = [
+            router.next().expect("left output sample"),
+            router.next().expect("right output sample"),
+        ];
+        assert_eq!(frame, [0.0, 0.5]);
+    }
+
+    #[test]
+    fn channel_router_keeps_last_snapshot_when_control_thread_holds_write_lock() {
+        let routes = Arc::new(RwLock::new(vec![ChannelRoute {
+            active: true,
+            master_enabled: true,
+            output_channel: 0,
+            output_channels: vec![0],
+            gain_db: 0.0,
+        }]));
+        let output_settings = Arc::new(RwLock::new(vec![
+            OutputChannelSetting::default(),
+            OutputChannelSetting::default(),
+        ]));
+        let output_gains = Arc::new(RwLock::new(vec![0.0, 0.0]));
+        let source = SamplesBuffer::new(
+            std::num::NonZeroU16::new(1).unwrap(),
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            vec![0.5_f32],
+        );
+        let mut router =
+            ChannelRouter::new(source, routes.clone(), output_settings, output_gains, 2);
+
+        let _write_guard = routes.write();
+        // This must return immediately instead of waiting for the writer.
+        router.refresh_live_settings();
+        let frame = [
+            router.next().expect("left output sample"),
+            router.next().expect("right output sample"),
+        ];
+        assert_eq!(frame, [0.5, 0.0]);
     }
 
     #[test]
@@ -6783,9 +10540,61 @@ mod time_pitch_tests {
             samples.clone(),
         );
         let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
-        let position = Arc::new(RwLock::new(0.0));
-        let output: Vec<f32> = SpeedPitchSource::new(source, 0.0, settings, position).collect();
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let output: Vec<f32> =
+            SpeedPitchSource::new(source, 0.0, settings, position.clone()).collect();
         assert_eq!(output, samples);
+        let expected_position = samples.len() as f64 / 48_000.0;
+        assert!((atomic_load_f64(&position) - expected_position).abs() < 1e-9);
+    }
+
+    struct PartialInterleavedSource {
+        samples: std::vec::IntoIter<f32>,
+    }
+
+    impl Iterator for PartialInterleavedSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.samples.next()
+        }
+    }
+
+    impl Source for PartialInterleavedSource {
+        fn current_span_len(&self) -> Option<usize> {
+            Some(self.samples.len())
+        }
+
+        fn channels(&self) -> std::num::NonZeroU16 {
+            std::num::NonZeroU16::new(2).unwrap()
+        }
+
+        fn sample_rate(&self) -> std::num::NonZeroU32 {
+            std::num::NonZeroU32::new(48_000).unwrap()
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[test]
+    fn phase_vocoder_input_refill_pads_a_partial_interleaved_frame() {
+        let source = PartialInterleavedSource {
+            samples: vec![0.1_f32, -0.1, 0.2].into_iter(),
+        };
+        let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let mut source = SpeedPitchSource::new(source, 0.0, settings, position);
+
+        source.fill_input_until(2);
+
+        assert!(source.input_eof);
+        assert_eq!(
+            source.input_samples.iter().copied().collect::<Vec<_>>(),
+            vec![0.1_f32, -0.1, 0.2, 0.0]
+        );
+        assert_eq!(source.available_end_frame(), 2);
     }
 
     #[test]
@@ -6802,10 +10611,346 @@ mod time_pitch_tests {
             speed: 2.0,
             ..TimePitchSettings::default()
         }));
-        let position = Arc::new(RwLock::new(0.0));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         let output: Vec<f32> = SpeedPitchSource::new(source, 0.0, settings, position).collect();
         assert!(!output.is_empty());
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    struct SeekableSamplesSource {
+        samples: Vec<f32>,
+        position: usize,
+        channels: std::num::NonZeroU16,
+        sample_rate: std::num::NonZeroU32,
+    }
+
+    impl Iterator for SeekableSamplesSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let sample = self.samples.get(self.position).copied();
+            if sample.is_some() {
+                self.position += 1;
+            }
+            sample
+        }
+    }
+
+    impl Source for SeekableSamplesSource {
+        fn current_span_len(&self) -> Option<usize> {
+            Some(self.samples.len().saturating_sub(self.position))
+        }
+
+        fn channels(&self) -> std::num::NonZeroU16 {
+            self.channels
+        }
+
+        fn sample_rate(&self) -> std::num::NonZeroU32 {
+            self.sample_rate
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            Some(Duration::from_secs_f64(
+                self.samples.len() as f64
+                    / self.channels.get() as f64
+                    / self.sample_rate.get() as f64,
+            ))
+        }
+
+        fn try_seek(&mut self, position: Duration) -> Result<(), rodio::source::SeekError> {
+            let frame = (position.as_secs_f64() * self.sample_rate.get() as f64).round() as usize;
+            self.position = frame
+                .saturating_mul(self.channels.get() as usize)
+                .min(self.samples.len());
+            Ok(())
+        }
+    }
+
+    struct NonSeekableSamplesSource {
+        samples: Vec<f32>,
+        position: usize,
+        channels: std::num::NonZeroU16,
+        sample_rate: std::num::NonZeroU32,
+    }
+
+    impl Iterator for NonSeekableSamplesSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let sample = self.samples.get(self.position).copied();
+            if sample.is_some() {
+                self.position += 1;
+            }
+            sample
+        }
+    }
+
+    impl Source for NonSeekableSamplesSource {
+        fn current_span_len(&self) -> Option<usize> {
+            Some(self.samples.len().saturating_sub(self.position))
+        }
+
+        fn channels(&self) -> std::num::NonZeroU16 {
+            self.channels
+        }
+
+        fn sample_rate(&self) -> std::num::NonZeroU32 {
+            self.sample_rate
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            Some(Duration::from_secs_f64(
+                self.samples.len() as f64
+                    / self.channels.get() as f64
+                    / self.sample_rate.get() as f64,
+            ))
+        }
+    }
+
+    fn test_seekable_source_with_channels(
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> SeekableSamplesSource {
+        SeekableSamplesSource {
+            samples,
+            position: 0,
+            channels: std::num::NonZeroU16::new(channels.max(1)).unwrap(),
+            sample_rate: std::num::NonZeroU32::new(sample_rate).unwrap(),
+        }
+    }
+
+    fn test_seekable_source(samples: Vec<f32>, sample_rate: u32) -> SeekableSamplesSource {
+        test_seekable_source_with_channels(samples, sample_rate, 1)
+    }
+
+    #[test]
+    fn finite_loop_repeats_region_then_continues_after_loop_end_without_stream_restart() {
+        let source = test_seekable_source(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 1);
+        let loops_remaining = Arc::new(AtomicI32::new(3));
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        let looping = LoopingSource::new(
+            source,
+            0.0,
+            1.0,
+            3.0,
+            true,
+            loops_remaining.clone(),
+            loop_iterations.clone(),
+            "test-finite-loop".to_string(),
+        );
+        let timeline = looping.timeline.clone();
+        let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let producer_remaining = Arc::new(AtomicI32::new(0));
+        let output = SpeedPitchSource::new_with_loop(
+            looping,
+            0.0,
+            settings,
+            position.clone(),
+            timeline,
+            producer_remaining.clone(),
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            output,
+            vec![0.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(producer_remaining.load(Ordering::Acquire), 1);
+        assert_eq!(loops_remaining.load(Ordering::Acquire), 1);
+        assert_eq!(loop_iterations.load(Ordering::Acquire), 2);
+        assert!((atomic_load_f64(&position) - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn infinite_loop_keeps_one_source_alive_and_wraps_at_exact_frame_boundary() {
+        let source = test_seekable_source(vec![0.0, 1.0, 2.0, 3.0, 4.0], 1);
+        let loops_remaining = Arc::new(AtomicI32::new(-1));
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        let looping = LoopingSource::new(
+            source,
+            0.0,
+            1.0,
+            3.0,
+            true,
+            loops_remaining.clone(),
+            loop_iterations.clone(),
+            "test-infinite-loop".to_string(),
+        );
+        let timeline = looping.timeline.clone();
+        let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let producer_remaining = Arc::new(AtomicI32::new(0));
+        let output = SpeedPitchSource::new_with_loop(
+            looping,
+            0.0,
+            settings,
+            position.clone(),
+            timeline,
+            producer_remaining.clone(),
+        )
+        .take(8)
+        .collect::<Vec<_>>();
+
+        assert_eq!(output, vec![0.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0]);
+        assert_eq!(producer_remaining.load(Ordering::Acquire), -1);
+        assert_eq!(loops_remaining.load(Ordering::Acquire), -1);
+        assert_eq!(loop_iterations.load(Ordering::Acquire), 3);
+        assert!((atomic_load_f64(&position) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn loop_source_honors_nonzero_initial_offset_before_repeating_region() {
+        let source = test_seekable_source(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 1);
+        let loops_remaining = Arc::new(AtomicI32::new(2));
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        let looping = LoopingSource::new(
+            source,
+            2.0,
+            1.0,
+            4.0,
+            true,
+            loops_remaining.clone(),
+            loop_iterations.clone(),
+            "test-offset-loop".to_string(),
+        );
+        let timeline = looping.timeline.clone();
+        let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let output = SpeedPitchSource::new_with_loop(
+            looping,
+            2.0,
+            settings,
+            position.clone(),
+            timeline,
+            Arc::new(AtomicI32::new(0)),
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(output, vec![2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(loops_remaining.load(Ordering::Acquire), 1);
+        assert_eq!(loop_iterations.load(Ordering::Acquire), 1);
+        assert!((atomic_load_f64(&position) - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stereo_loop_boundaries_never_split_interleaved_frames() {
+        let source = test_seekable_source_with_channels(
+            vec![0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0, 4.0, 14.0],
+            1,
+            2,
+        );
+        let loops_remaining = Arc::new(AtomicI32::new(2));
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        let looping = LoopingSource::new(
+            source,
+            0.0,
+            1.0,
+            3.0,
+            true,
+            loops_remaining,
+            loop_iterations,
+            "test-stereo-loop".to_string(),
+        );
+        let output = looping.collect::<Vec<_>>();
+        assert_eq!(
+            output,
+            vec![0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0, 4.0, 14.0,]
+        );
+    }
+
+    #[test]
+    fn loop_seek_unsupported_disables_repeats_but_keeps_source_playing() {
+        let source = NonSeekableSamplesSource {
+            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            position: 0,
+            channels: std::num::NonZeroU16::new(1).unwrap(),
+            sample_rate: std::num::NonZeroU32::new(1).unwrap(),
+        };
+        let loops_remaining = Arc::new(AtomicI32::new(2));
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        let looping = LoopingSource::new(
+            source,
+            0.0,
+            1.0,
+            3.0,
+            true,
+            loops_remaining.clone(),
+            loop_iterations.clone(),
+            "test-nonseekable-loop".to_string(),
+        );
+        let timeline = looping.timeline.clone();
+        let settings = Arc::new(RwLock::new(TimePitchSettings::default()));
+        let position = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        let producer_remaining = Arc::new(AtomicI32::new(0));
+        let output = SpeedPitchSource::new_with_loop(
+            looping,
+            0.0,
+            settings,
+            position.clone(),
+            timeline,
+            producer_remaining.clone(),
+        )
+        .collect::<Vec<_>>();
+
+        assert_eq!(output, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(producer_remaining.load(Ordering::Acquire), 1);
+        assert_eq!(loops_remaining.load(Ordering::Acquire), 1);
+        assert_eq!(loop_iterations.load(Ordering::Acquire), 0);
+        assert!((atomic_load_f64(&position) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn loop_timeline_maps_each_pass_and_the_final_tail() {
+        let timeline = LoopTimeline {
+            initial_start_frame: 0,
+            loop_start_frame: 2,
+            loop_end_frame: 5,
+            initial_loops_remaining: 3,
+            failure: Arc::new(LoopSeekFailure {
+                input_frame: AtomicU64::new(u64::MAX),
+                media_frame: AtomicU64::new(0),
+            }),
+        };
+        let mapped = (0..12)
+            .map(|frame| timeline.media_frame_at_input_frame(frame as f64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        let remaining = (0..12)
+            .map(|frame| timeline.loops_remaining_at_input_frame(frame as f64))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![3, 3, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn loop_fade_out_is_suppressed_until_the_final_pass() {
+        assert!(!should_apply_loop_fade_out(true, 3, 12.0, 12.0));
+        assert!(!should_apply_loop_fade_out(true, -1, 12.0, 12.0));
+        assert!(should_apply_loop_fade_out(true, 1, 12.0, 12.0));
+        assert!(should_apply_loop_fade_out(true, -1, 8.0, 12.0));
+        assert!(should_apply_loop_fade_out(false, 0, 12.0, 12.0));
+    }
+
+    #[test]
+    fn prefetch_frame_positions_preserve_a_loop_wrap_inside_one_chunk() {
+        let chunk = PcmPrefetchChunk {
+            samples: vec![0.0; 3],
+            frame_end_positions: vec![1.0_f64.to_bits(), 0.1_f64.to_bits(), 0.2_f64.to_bits()],
+            frame_loop_remaining: vec![2, 1, 1],
+            start_position_bits: 0.9_f64.to_bits(),
+            end_position_bits: 0.2_f64.to_bits(),
+            start_loop_remaining: 2,
+            eof: false,
+        };
+        assert!((prefetch_chunk_frame_start_position(&chunk, 0) - 0.9).abs() < f64::EPSILON);
+        assert!((prefetch_chunk_frame_start_position(&chunk, 1) - 1.0).abs() < f64::EPSILON);
+        assert!((prefetch_chunk_frame_start_position(&chunk, 2) - 0.1).abs() < f64::EPSILON);
+        assert_eq!(prefetch_chunk_frame_start_loop_remaining(&chunk, 0), 2);
+        assert_eq!(prefetch_chunk_frame_start_loop_remaining(&chunk, 2), 1);
     }
 
     #[test]
@@ -6825,3 +10970,8 @@ mod time_pitch_tests {
         assert_eq!(settings.pitch_automation[0], [0.0, 2400.0]);
     }
 }
+
+// Isolated test-only prototype: it is deliberately not wired into production playback.
+#[cfg(test)]
+#[path = "sparse_mixer.rs"]
+mod sparse_mixer_prototype;

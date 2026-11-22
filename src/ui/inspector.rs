@@ -98,7 +98,8 @@ impl Inspector {
                                 DragValue::new(&mut cue.pre_wait_secs)
                                     .range(0.0..=3600.0)
                                     .speed(0.1)
-                                    .suffix(" s"),
+                                    .custom_formatter(|value, _| crate::ui::cue_table::format_timecode(value))
+                                    .custom_parser(crate::ui::cue_table::parse_timecode),
                             );
                         });
                         Self::field(ui, "Post-Wait", |ui| {
@@ -106,7 +107,8 @@ impl Inspector {
                                 DragValue::new(&mut cue.post_wait_secs)
                                     .range(0.0..=3600.0)
                                     .speed(0.1)
-                                    .suffix(" s"),
+                                    .custom_formatter(|value, _| crate::ui::cue_table::format_timecode(value))
+                                    .custom_parser(crate::ui::cue_table::parse_timecode),
                             );
                         });
                         Self::field(ui, "Continue", |ui| {
@@ -393,6 +395,11 @@ CueType::Group { mode, children, fade_in_secs, fade_out_secs } => {
                     );
                 });
             });
+        }
+        GroupMode::Timeline => {
+            ui.label(RichText::new(
+                "Timeline: all children are scheduled from the group's GO time. Each Pre-Wait is an absolute offset; Post-Wait and Auto-Continue/Auto-Follow do not control the timeline. Edit event lengths and timing in the Timeline tab."
+            ).color(Theme::text_dim()).size(Theme::scaled_font_size(11.0)));
         }
     }
 

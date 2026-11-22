@@ -187,6 +187,8 @@ pub enum GroupMode {
     Playlist,
     /// Starts every child at once (each child still observes its own pre-wait).
     AllCues,
+    /// Starts each child at an absolute offset from the group's GO timestamp.
+    Timeline,
 }
 
 impl GroupMode {
@@ -195,10 +197,15 @@ impl GroupMode {
             GroupMode::Normal => "Normal",
             GroupMode::Playlist => "Playlist",
             GroupMode::AllCues => "All Cues",
+            GroupMode::Timeline => "Timeline",
         }
     }
-    pub const ALL: &'static [GroupMode] =
-        &[GroupMode::Normal, GroupMode::Playlist, GroupMode::AllCues];
+    pub const ALL: &'static [GroupMode] = &[
+        GroupMode::Normal,
+        GroupMode::Playlist,
+        GroupMode::AllCues,
+        GroupMode::Timeline,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -265,6 +272,7 @@ pub struct LoopRegion {
     pub enabled: bool,
     pub start_secs: f64,
     pub end_secs: f64,
+    /// -1 means infinite; positive values are total passes including the first.
     pub count: i32,
 }
 
