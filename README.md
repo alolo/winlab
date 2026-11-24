@@ -31,6 +31,9 @@ TaSQ развивается как инструмент для управлен�
 -   MIDI Time Code (MTC) Output Cue запланирован, но в версии 0.9.1
     Preview ещё не реализован.
 -   Экспорт текстовой партитуры в PDF/DOCX и редактирование шаблонов экспорта запланированы, но пока не реализованы.
+-   Собственные DSP-эффекты (Reverb, Delay, Compressor, Gate, Limiter),
+    FX Insert / Send / Return и универсальный MIDI Map Mode находятся
+    в дорожной карте и пока не реализованы.
 
 Подробное состояние функций и границы проведённого тестирования см. в
 [FEATURES.md](FEATURES.md).
@@ -51,7 +54,35 @@ TaSQ 0.9.1 планируется как **Preview Release**, а не как у�
 В частности, остаётся проблема производительности при высокой
 многоканальной нагрузке через Dante Virtual Soundcard. Sparse Mixer,
 который должен помочь с эффективностью многоканального суммирования,
-пока не интегрирован в рабочий Audio Engine.
+пока не интегрирован в рабочий Audio Engine. Stage 4.2b1, 4.2b2 и 4.2b3
+ранее прошли пользовательские Windows-проверки. Stage 4.2b4 — test-only
+Lifecycle & Stress Testing — также принят после Windows-проверки:
+Renderer — 9/9; Ownership — 15/15; Reaper — 7/7; Runtime Pump — 13/13;
+Runtime Contract — 19/19; Sparse Mixer — 11 passed, 1 intentionally
+ignored. Полная suite: 340 discovered, 338 passed, 0 failed,
+2 intentionally ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`
+и `cargo build` завершились успешно. Эти этапы остаются вне обычного
+воспроизведения: production Audio Engine и поведение DVS не менялись;
+проблема DVS не считается исправленной.
+
+**О маршрутизации:** для проектируемого Sparse Mixer 16 выходов —
+обязательный сценарий проверки, а не программный максимум. Искусственное
+ограничение в 16 выходов не планируется: число доступных направлений должно
+определяться выходными каналами выбранного endpoint и возможностями его
+драйвера/backend. Это архитектурная цель разработки, а не подтверждённая
+возможность текущей Preview-сборки; работа с большим числом каналов ещё
+должна пройти отдельные тесты.
+
+### Дальнейшая дорожная карта
+
+В планах — собственные кроссплатформенные DSP-эффекты Reverb, Delay,
+Compressor, Gate и Limiter; обработка Cue и Master Bus через Insert,
+Send и Return; сохранение хвостов Reverb/Delay после естественного
+окончания исходной Cue; а также универсальный MIDI Map Mode для
+фейдеров, потенциометров, кнопок, команд и параметров эффектов.
+Контроллеры не привязываются к конкретной марке. Gated Reverb и
+MIDI-панорамирование в текущий scope не входят. Эти возможности не
+доступны в Preview 0.9.1.
 
 ### Перед использованием
 
@@ -120,7 +151,11 @@ copy of your show project.
 -   MIDI Output and OSC Output.
 -   MIDI Time Code (MTC) Output Cue is planned but is not implemented in
     Preview 0.9.1.
--   Text Score export to PDF/DOCX and editable export templates are planned but not yet implemented.
+-   Text Score export to PDF/DOCX and editable export templates are
+    planned but not yet implemented.
+-   Native DSP effects (Reverb, Delay, Compressor, Gate, Limiter), FX
+    Insert / Send / Return, and a generic MIDI Map Mode are on the roadmap
+    and are not implemented yet.
 
 See [FEATURES.md](FEATURES.md) for the feature status and the scope of
 testing performed.
@@ -140,7 +175,34 @@ Known limitations and unfinished features are documented separately:
 One known issue is performance under high multichannel load with Dante
 Virtual Soundcard. The Sparse Mixer, which is intended to improve
 multichannel mixing efficiency, has not yet been integrated into the
-production Audio Engine.
+production Audio Engine. Stages 4.2b1, 4.2b2, and 4.2b3 previously passed
+user-run Windows validation. Stage 4.2b4 — test-only Lifecycle & Stress
+Testing — has also been accepted after Windows validation: Renderer 9/9;
+Ownership 15/15; Reaper 7/7; Runtime Pump 13/13; Runtime Contract 19/19;
+Sparse Mixer 11 passed and 1 intentionally ignored. The full suite
+reported 340 discovered, 338 passed, 0 failed, and 2 intentionally
+ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`, and `cargo build`
+succeeded. These stages remain outside normal playback: the production
+Audio Engine and DVS behavior have not changed, and the DVS issue is not
+considered fixed.
+
+**About routing scalability:** 16 output destinations are a mandatory
+validation scenario for the planned Sparse Mixer, not a software maximum.
+No artificial 16-output cap is intended. The number of available
+destinations should follow the output channels exposed by the selected
+endpoint and its driver/backend. This is an architectural development
+goal, not a verified capability of the current Preview build; higher
+channel counts still require dedicated testing.
+
+### Future Roadmap
+
+Planned work includes native cross-platform DSP effects (Reverb, Delay,
+Compressor, Gate, and Limiter); Cue and Master Bus Insert / Send / Return
+routing; Reverb/Delay tails that continue after a source Cue reaches
+natural EOF; and a controller-independent MIDI Map Mode for faders,
+knobs, buttons, commands, and effect parameters. The design is not tied
+to a specific controller brand. Gated Reverb and MIDI panning are outside
+the current scope. These features are not available in Preview 0.9.1.
 
 ### Before Using TaSQ
 

@@ -10975,3 +10975,28 @@ mod time_pitch_tests {
 #[cfg(test)]
 #[path = "sparse_mixer.rs"]
 mod sparse_mixer_prototype;
+
+// Stage 4.1 runtime contract model. Test-only: it is not connected to playback.
+#[cfg(test)]
+#[path = "sparse_runtime_contract.rs"]
+mod sparse_runtime_contract;
+
+// Stage 4.2a command pump. Test-only: no PCM rendering or production playback.
+#[cfg(test)]
+#[path = "sparse_runtime_pump.rs"]
+mod sparse_runtime_pump;
+
+// Stage 4.2b1 bounded Reaper handoff. Test-only: no production resource ownership.
+#[cfg(test)]
+#[path = "sparse_runtime_reaper.rs"]
+mod sparse_runtime_reaper;
+
+// Stage 4.2b2 move-only Cue source ownership. Test-only: no production playback integration.
+#[cfg(test)]
+#[path = "sparse_runtime_ownership.rs"]
+mod sparse_runtime_ownership;
+
+// Stage 4.2b3 sparse endpoint PCM renderer. Test-only: no production integration.
+#[cfg(test)]
+#[path = "sparse_runtime_renderer.rs"]
+mod sparse_runtime_renderer;

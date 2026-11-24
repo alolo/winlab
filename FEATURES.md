@@ -69,11 +69,37 @@ callback over-budget события в этом тесте не зарегист
 Следующие возможности не следует считать доступными в текущей
 Preview-сборке:
 
--   [ ] **Sparse Mixer** --- более эффективное суммирование аудио для
-    многоканальных конфигураций.
+-   [ ] **Sparse Mixer / Dynamic PCM Mixer** --- более эффективное
+    суммирование аудио для многоканальных конфигураций. Этапы Runtime
+    Contract (4.1) и Runtime Command Pump (4.2a) прошли отдельные
+    пользовательские unit-тесты, но остаются test-only и не подключены
+    к обычному воспроизведению. Stage 4.2b1 прошёл Windows-проверку:
+    7/7 новых тестов; полная suite — 313 passed, 2 намеренно ignored.
+    Stage 4.2b2 принят после Windows-проверки: Ownership 12/12; Reaper
+    7/7; Runtime Pump 12/12; Runtime Contract 19/19; Sparse Mixer
+    11 passed, 1 ignored; полная suite — 325 passed, 0 failed, 2 ignored.
+    Stage 4.2b3 также принят после Windows-проверки: Renderer 5/5;
+    Runtime Pump 13/13; Ownership 12/12; Reaper 7/7; Runtime Contract
+    19/19; Sparse Mixer 11 passed, 1 ignored; полная suite — 331 passed,
+    0 failed, 2 ignored. `cargo fmt --check`, `cargo check` и `cargo build`
+    прошли. Stage 4.2b4 Lifecycle & Stress Testing принят после
+    пользовательской Windows-проверки: Renderer 9/9; Ownership 15/15;
+    Reaper 7/7; Runtime Pump 13/13; Runtime Contract 19/19; Sparse Mixer
+    11 passed, 1 intentionally ignored; полная suite — 340 discovered,
+    338 passed, 0 failed, 2 intentionally ignored. `cargo fmt`,
+    `cargo fmt --check`, `cargo check` и `cargo build` прошли. Все этапы
+    остаются test-only и не подключены к обычному воспроизведению.
+    **Масштабирование Routing:** 16 output destinations — обязательный
+    тестовый сценарий, а не программный лимит. В Stage 4.2b3 синтетические тесты 16 / 32 / 64 / 128 destinations
+    прошли; это не подтверждение аппаратной поддержки. Искусственный
+    предел в 16 выходов не планируется; фактическое число должно
+    определяться возможностями endpoint/backend.
 -   [ ] **До 256 одновременно звучащих Audio Cue на одном endpoint** ---
     целевой показатель будущего движка. Это не реализованный лимит
     текущей версии и не ограничение общего количества Cue в проекте.
+    Одна Cue считается одним audio slot независимо от числа выходов,
+    на которые она маршрутизируется; число Cue slots не ограничивает
+    количество output destinations.
 -   [ ] **Межустройственная синхронизация** --- согласование
     воспроизведения между независимыми аудиоустройствами.
 -   [ ] **Playlist Random** --- случайный порядок воспроизведения Audio
@@ -104,6 +130,18 @@ Preview-сборке:
     шаблонов текстовой партитуры, включая выбор выводимых полей и
     настройки оформления. Точный состав настроек будет определён при
     проектировании.
+-   [ ] **Native DSP Effects & Routing** --- собственные Reverb, Delay,
+    Compressor, Gate и Limiter; Cue Insert / Send / FX Return и Master
+    Insert / Send / Return. Reverb/Delay tails должны продолжать звучать
+    после естественного окончания исходной Cue. Gated Reverb не входит
+    в согласованный scope; обязательная зависимость от VST не планируется.
+-   [ ] **Generic MIDI Learn / MIDI Map Mode** --- отдельный режим
+    назначения MIDI-сообщений на фейдеры, потенциометры, кнопки, команды
+    и параметры эффектов. Поддержка любого MIDI-контроллера, доступного
+    системе как MIDI input; конкретные типы сообщений и расширенная
+    обработка NRPN/RPN/SysEx будут определены при проектировании.
+    MIDI-панорамирование не планируется: физические выходы назначаются
+    через I/O Routing.
 
 ### 3. Что пока не заявляется как доступная возможность
 
@@ -115,6 +153,8 @@ Preview-сборке:
 -   MIDI Time Code (MTC) Output.
 -   Экспорт Text Score / Cue Sheet в PDF и DOCX.
 -   Редактирование пользовательских шаблонов Text Score.
+-   Native DSP Effects и Cue/Master FX routing.
+-   Generic MIDI Map Mode для параметров и элементов интерфейса.
 -   macOS-версия.
 
 ### 4. Как читать статусы
@@ -202,12 +242,38 @@ performance on every system.
 The following features should not be considered available in the current
 Preview build:
 
--   [ ] **Sparse Mixer** --- more efficient audio summing for
-    multichannel configurations.
+-   [ ] **Sparse Mixer / Dynamic PCM Mixer** --- more efficient audio
+    summing for multichannel configurations. The Runtime Contract (4.1)
+    and Runtime Command Pump (4.2a) have passed separate user-run unit
+    tests, but remain test-only and are not connected to normal playback.
+    Stage 4.2b1 passed user-run Windows validation: 7/7 new tests, with
+    313 passed and 2 intentionally ignored in the full suite. Stage 4.2b2
+    was accepted after Windows validation: Ownership 12/12; Reaper 7/7;
+    Runtime Pump 12/12; Runtime Contract 19/19; Sparse Mixer 11 passed
+    and 1 ignored; full suite 325 passed, 0 failed, and 2 ignored.
+    `cargo fmt --check`, `cargo check`, and `cargo build` succeeded.
+    Stage 4.2b3 was also accepted after user-run Windows validation:
+    Renderer 5/5; Runtime Pump 13/13; Ownership 12/12; Reaper 7/7;
+    Runtime Contract 19/19; Sparse Mixer 11 passed, 1 ignored; full suite
+    331 passed, 0 failed, 2 ignored. Stage 4.2b4 Lifecycle & Stress
+    Testing was accepted after user-run Windows validation: Renderer 9/9;
+    Ownership 15/15; Reaper 7/7; Runtime Pump 13/13; Runtime Contract
+    19/19; Sparse Mixer 11 passed and 1 intentionally ignored; the full
+    suite reported 340 discovered, 338 passed, 0 failed, and 2
+    intentionally ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`,
+    and `cargo build` succeeded. All these stages remain test-only and
+    are not connected to normal playback. **Routing scalability:** 16 output
+    destinations are a mandatory test scenario, not a software limit.
+    Stage 4.2b3 synthetic tests for 16 / 32 / 64 / 128 destinations passed;
+    this does not establish hardware support. No artificial 16-output cap
+    is intended; the actual count should follow endpoint/backend
+    capabilities.
 -   [ ] **Up to 256 simultaneously active Audio Cues on one endpoint**
     --- a target for the future engine. This is not an implemented limit
     in the current version and does not limit the total number of Cues
-    in a project.
+    in a project. One Cue occupies one audio slot regardless of how many
+    output destinations it uses; Cue-slot capacity does not cap routing
+    fan-out.
 -   [ ] **Inter-device synchronization** --- synchronization of playback
     across independent audio devices.
 -   [ ] **Playlist Random** --- randomized Audio Cue order in a Playlist
@@ -232,6 +298,24 @@ Preview build:
     scope includes Quarter Frame, Full Frame/Locate, frame-rate
     selection, and Timecode Offset. Transport behavior and the exact
     scope of the first implementation will be defined during design.
+-   [ ] **Text Score / Cue Sheet Export** --- export the project's text
+    score to PDF and DOCX.
+-   [ ] **Custom Export Templates** --- edit user-defined text-score
+    templates, including selected output fields and formatting options.
+    The exact settings will be defined during design.
+-   [ ] **Native DSP Effects & Routing** --- built-in Reverb, Delay,
+    Compressor, Gate, and Limiter; Cue Insert / Send / FX Return and
+    Master Insert / Send / Return. Reverb/Delay tails should continue
+    after the source Cue reaches natural EOF. Gated Reverb is outside
+    the agreed scope; a VST dependency is not planned for the initial
+    native-effects implementation.
+-   [ ] **Generic MIDI Learn / MIDI Map Mode** --- a dedicated mapping
+    mode for assigning MIDI messages to faders, knobs, buttons, commands,
+    and effect parameters. It should work with any controller exposed
+    by the system as a MIDI input device. The exact message matrix and
+    advanced NRPN/RPN/SysEx handling will be defined during design.
+    MIDI panning is not planned: physical output assignment remains in
+    I/O Routing.
 
 ### 3. Features Not Currently Available
 
@@ -242,6 +326,8 @@ Preview build:
 -   MIDI Time Code (MTC) Output.
 -   Text Score / Cue Sheet export to PDF and DOCX.
 -   Editing custom Text Score templates.
+-   Native DSP Effects and Cue/Master FX routing.
+-   Generic MIDI Map Mode for parameters and UI controls.
 -   macOS version.
 
 ### 4. Status Definitions
