@@ -11,6 +11,7 @@
 
 use super::db_to_linear;
 use super::sparse_runtime_contract::{CueKey, SlotError, SlotToken};
+use super::sparse_runtime_control::SparseCueRenderControl;
 use super::sparse_runtime_ownership::{
     AckReport, AddSourceError, CueSourceOwnership, CueSourcePayload, RetireAllReport, RetireStatus,
     RetryReport,
@@ -48,6 +49,7 @@ pub(crate) struct SparseCueRenderResources {
     input_frame: Vec<f32>,
     routes: Vec<SparseSourceChannelRoute>,
     cue_trim: f32,
+    control: Option<SparseCueRenderControl>,
     finished: bool,
 }
 
@@ -58,6 +60,7 @@ impl SparseCueRenderResources {
         routes: &[ChannelRoute],
         cue_output_gains_db: &[f32],
         cue_trim: f32,
+        control: Option<SparseCueRenderControl>,
     ) -> Self {
         let mut prepared_routes = Vec::with_capacity(source_channels);
 
@@ -119,12 +122,17 @@ impl SparseCueRenderResources {
             input_frame: vec![0.0; source_channels],
             routes: prepared_routes,
             cue_trim,
+            control,
             finished: false,
         }
     }
 
     fn is_finished(&self) -> bool {
         self.finished
+            || self
+                .control
+                .as_ref()
+                .is_some_and(SparseCueRenderControl::is_finished)
     }
 
     /// Pulls one complete source-channel frame and sums only configured routes.
@@ -141,23 +149,41 @@ impl SparseCueRenderResources {
             return;
         }
 
+        if let Some(control) = &self.control {
+            if !control.begin_endpoint_frame() {
+                self.finished = control.is_finished();
+                return;
+            }
+        }
+
         for sample in &mut self.input_frame {
             match source.next() {
                 Some(value) => *sample = value,
                 None => {
                     // Discard a partial final frame; never rotate channel phase.
+                    // Keep the source owned by its slot until the control side
+                    // transfers the complete payload to the Reaper.
                     self.finished = true;
+                    if let Some(control) = &self.control {
+                        control.mark_finished();
+                    }
                     return;
                 }
             }
         }
+
+        let control_gain = self
+            .control
+            .as_ref()
+            .map(SparseCueRenderControl::volume_gain)
+            .unwrap_or(1.0);
 
         for (sample, route) in self.input_frame.iter().copied().zip(self.routes.iter()) {
             if !route.active || !route.master_enabled {
                 continue;
             }
 
-            let source_gain = route.gain_linear * self.cue_trim * master_gain;
+            let source_gain = route.gain_linear * self.cue_trim * master_gain * control_gain;
             let routed_sample = sample * source_gain;
             if routed_sample == 0.0 {
                 continue;
@@ -242,6 +268,37 @@ impl SparseRuntimeRenderer {
     where
         S: Source<Item = f32> + Send + 'static,
     {
+        self.prepare_payload_inner(source, routes, cue_output_gains_db, cue_trim, None)
+    }
+
+    /// Prepares a Cue payload with an atomic control handle. This is the
+    /// Stage 4.3a bridge contract: the control thread keeps the handle while
+    /// the render slot owns the shared render-side state.
+    pub(crate) fn prepare_payload_with_control<S>(
+        &self,
+        source: S,
+        routes: &[ChannelRoute],
+        cue_output_gains_db: &[f32],
+        cue_trim: f32,
+        control: SparseCueRenderControl,
+    ) -> SparseRendererPayload
+    where
+        S: Source<Item = f32> + Send + 'static,
+    {
+        self.prepare_payload_inner(source, routes, cue_output_gains_db, cue_trim, Some(control))
+    }
+
+    fn prepare_payload_inner<S>(
+        &self,
+        source: S,
+        routes: &[ChannelRoute],
+        cue_output_gains_db: &[f32],
+        cue_trim: f32,
+        control: Option<SparseCueRenderControl>,
+    ) -> SparseRendererPayload
+    where
+        S: Source<Item = f32> + Send + 'static,
+    {
         let source_channels = source.channels();
         let resources = SparseCueRenderResources::new(
             source_channels.get() as usize,
@@ -249,6 +306,7 @@ impl SparseRuntimeRenderer {
             routes,
             cue_output_gains_db,
             cue_trim,
+            control,
         );
         let endpoint_rate = NonZeroU32::new(self.sample_rate)
             .expect("SparseRuntimeRenderer validates a non-zero sample rate");

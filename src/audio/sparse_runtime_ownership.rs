@@ -759,7 +759,23 @@ mod tests {
             assert_eq!(thread_name, REAPER_THREAD_NAME);
         }
 
-        let acknowledgements = owner.poll_reaper_acknowledgements();
+        // DropProbe reports from inside each destructor, before the
+        // RetirementEnvelope sends its acknowledgement. The Reaper can
+        // therefore still be finishing the handoff when the second drop
+        // notification reaches this test thread. Poll until the ordered ack
+        // arrives instead of assuming it is already queued.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let acknowledgements = loop {
+            let report = owner.poll_reaper_acknowledgements();
+            if report.received != 0 {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Reaper did not acknowledge the slot after destroying its payload"
+            );
+            thread::yield_now();
+        };
         assert_eq!(acknowledgements.received, 1);
         assert_eq!(acknowledgements.acknowledged, 1);
         assert_eq!(acknowledgements.stale_or_invalid, 0);

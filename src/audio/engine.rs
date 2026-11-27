@@ -11000,3 +11000,8 @@ mod sparse_runtime_ownership;
 #[cfg(test)]
 #[path = "sparse_runtime_renderer.rs"]
 mod sparse_runtime_renderer;
+
+// Stage 4.3a atomic Cue control bridge. Test-only: no production integration.
+#[cfg(test)]
+#[path = "sparse_runtime_control.rs"]
+mod sparse_runtime_control;

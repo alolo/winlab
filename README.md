@@ -65,6 +65,11 @@ ignored. Полная suite: 340 discovered, 338 passed, 0 failed,
 воспроизведения: production Audio Engine и поведение DVS не менялись;
 проблема DVS не считается исправленной.
 
+Начат Stage 4.3a — test-only Sparse Cue Control Bridge. Он проверяет
+атомарное управление Cue для будущей интеграции Sparse Renderer. Этап
+пока не прошёл Windows-проверку, не меняет обычное воспроизведение и не
+является исправлением DVS.
+
 **О маршрутизации:** для проектируемого Sparse Mixer 16 выходов —
 обязательный сценарий проверки, а не программный максимум. Искусственное
 ограничение в 16 выходов не планируется: число доступных направлений должно
@@ -185,6 +190,11 @@ ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`, and `cargo build`
 succeeded. These stages remain outside normal playback: the production
 Audio Engine and DVS behavior have not changed, and the DVS issue is not
 considered fixed.
+
+Stage 4.3a — the test-only Sparse Cue Control Bridge — has started. It
+validates atomic Cue control for a future Sparse Renderer integration.
+Windows validation is pending. It does not change normal playback and
+does not constitute a DVS fix.
 
 **About routing scalability:** 16 output destinations are a mandatory
 validation scenario for the planned Sparse Mixer, not a software maximum.

@@ -52,6 +52,11 @@ suite — 340 discovered, 338 passed, 0 failed, 2 intentionally ignored.
 Все эти модули подключаются только в `#[cfg(test)]` и не участвуют в
 обычном воспроизведении TaSQ.
 
+Stage 4.3a — Sparse Cue Control Bridge — подготовлен в test-only виде.
+Он моделирует атомарные команды управления Cue для будущего Sparse
+Renderer. Проверка на Windows ещё не выполнена; production playback path
+не менялся, а проблема DVS остаётся открытой.
+
 **Важно о количестве выходов:** 16 destinations — обязательный сценарий
 проверки маршрутизации, а не планируемый программный предел. Искусственный
 лимит в 16 выходов не закладывается. Будущая реализация должна
@@ -185,6 +190,11 @@ Runtime Pump 13/13; Runtime Contract 19/19; Sparse Mixer 11 passed and
 and 2 intentionally ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`,
 and `cargo build` succeeded. All these modules are included only in
 `#[cfg(test)]` and do not participate in normal TaSQ playback.
+
+Stage 4.3a — Sparse Cue Control Bridge — has been prepared in test-only
+form. It models atomic Cue control commands for a future Sparse Renderer.
+Windows validation has not yet been performed; the production playback
+path is unchanged and the DVS issue remains open.
 
 **Output-count clarification:** 16 destinations are a mandatory routing
 validation scenario, not an intended software limit. No artificial

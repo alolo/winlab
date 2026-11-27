@@ -6,8 +6,12 @@
 
 В этом файле публикуются пользовательские изменения между версиями TaSQ.
 
-### Unreleased — внутренняя разработка Stage 4.2b (не часть релиза 0.9.1)
+### Unreleased — внутренняя разработка Stage 4.2b / 4.3a (не часть релиза 0.9.1)
 
+-   Начат Stage 4.3a Sparse Cue Control Bridge: добавлен test-only
+    атомарный control handle для Pause / Resume / Set Volume / Stop и
+    публикации Finished state из Sparse Renderer. Production Audio Engine
+    не менялся; Windows-проверка ожидается. Это не исправление DVS.
 -   Stage 4.2b1 Bounded Reaper Handoff прошёл пользовательскую проверку
     на Windows: 7/7 новых тестов; полная suite — 313 passed и 2
     намеренно ignored.
@@ -100,8 +104,13 @@
 
 This file records user-facing changes between TaSQ releases.
 
-### Unreleased — Stage 4.2b Internal Development (Not Part of Release 0.9.1)
+### Unreleased — Stage 4.2b / 4.3a Internal Development (Not Part of Release 0.9.1)
 
+-   Stage 4.3a Sparse Cue Control Bridge has started: a test-only atomic
+    control handle was added for Pause / Resume / Set Volume / Stop and
+    Finished-state publication from the Sparse Renderer. The production
+    Audio Engine is unchanged; Windows validation is pending. This is not
+    a DVS fix.
 -   Stage 4.2b1 Bounded Reaper Handoff passed user-run Windows validation:
     7/7 new tests; the full suite reported 313 passed and 2 intentionally
     ignored.

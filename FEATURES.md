@@ -89,8 +89,12 @@ Preview-сборке:
     338 passed, 0 failed, 2 intentionally ignored. `cargo fmt`,
     `cargo fmt --check`, `cargo check` и `cargo build` прошли. Все этапы
     остаются test-only и не подключены к обычному воспроизведению.
-    **Масштабирование Routing:** 16 output destinations — обязательный
-    тестовый сценарий, а не программный лимит. В Stage 4.2b3 синтетические тесты 16 / 32 / 64 / 128 destinations
+    Stage 4.3a — Sparse Cue Control Bridge — подготовлен как отдельный
+    test-only контракт с атомарными Pause / Resume / Volume / Stop и
+    Finished state; пользовательская Windows-проверка ещё ожидается.
+    Это не интеграция с production Audio Engine и не подтверждение
+    улучшения DVS. **Масштабирование Routing:** 16 output destinations —
+    обязательный тестовый сценарий, а не программный лимит. В Stage 4.2b3 синтетические тесты 16 / 32 / 64 / 128 destinations
     прошли; это не подтверждение аппаратной поддержки. Искусственный
     предел в 16 выходов не планируется; фактическое число должно
     определяться возможностями endpoint/backend.
@@ -262,7 +266,11 @@ Preview build:
     suite reported 340 discovered, 338 passed, 0 failed, and 2
     intentionally ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`,
     and `cargo build` succeeded. All these stages remain test-only and
-    are not connected to normal playback. **Routing scalability:** 16 output
+    are not connected to normal playback. Stage 4.3a — Sparse Cue Control
+    Bridge — has been prepared as a separate test-only contract for atomic
+    Pause / Resume / Volume / Stop and Finished state; user-run Windows
+    validation is pending. It is not a production Audio Engine integration
+    and does not confirm a DVS improvement. **Routing scalability:** 16 output
     destinations are a mandatory test scenario, not a software limit.
     Stage 4.2b3 synthetic tests for 16 / 32 / 64 / 128 destinations passed;
     this does not establish hardware support. No artificial 16-output cap
