@@ -8,10 +8,13 @@
 
 ### Unreleased — внутренняя разработка Stage 4.2b / 4.3a (не часть релиза 0.9.1)
 
--   Начат Stage 4.3a Sparse Cue Control Bridge: добавлен test-only
-    атомарный control handle для Pause / Resume / Set Volume / Stop и
-    публикации Finished state из Sparse Renderer. Production Audio Engine
-    не менялся; Windows-проверка ожидается. Это не исправление DVS.
+-   Stage 4.3a Sparse Cue Control Bridge принят после пользовательской
+    Windows-проверки Fix1, но остаётся test-only; production Audio Engine
+    не менялся. Проблемный Reaper acknowledgement test прошёл 20/20
+    последовательных запусков; Ownership — 15/15; полная suite —
+    342 passed, 0 failed, 2 intentionally ignored. `cargo check` и
+    `cargo build` прошли. Fix1 устраняет timing race в синхронизации
+    теста; это не исправление DVS и не production integration.
 -   Stage 4.2b1 Bounded Reaper Handoff прошёл пользовательскую проверку
     на Windows: 7/7 новых тестов; полная suite — 313 passed и 2
     намеренно ignored.
@@ -106,11 +109,13 @@ This file records user-facing changes between TaSQ releases.
 
 ### Unreleased — Stage 4.2b / 4.3a Internal Development (Not Part of Release 0.9.1)
 
--   Stage 4.3a Sparse Cue Control Bridge has started: a test-only atomic
-    control handle was added for Pause / Resume / Set Volume / Stop and
-    Finished-state publication from the Sparse Renderer. The production
-    Audio Engine is unchanged; Windows validation is pending. This is not
-    a DVS fix.
+-   Stage 4.3a Sparse Cue Control Bridge was accepted after user-run
+    Windows validation of Fix1, but remains test-only; the production Audio
+    Engine is unchanged. The Reaper acknowledgement test passed 20/20
+    consecutive runs; Ownership passed 15/15; the full suite reported
+    342 passed, 0 failed, and 2 intentionally ignored. `cargo check` and
+    `cargo build` succeeded. Fix1 resolves a timing race in the test
+    synchronization; it is not a DVS fix or production integration.
 -   Stage 4.2b1 Bounded Reaper Handoff passed user-run Windows validation:
     7/7 new tests; the full suite reported 313 passed and 2 intentionally
     ignored.

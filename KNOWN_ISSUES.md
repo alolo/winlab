@@ -52,10 +52,11 @@ suite — 340 discovered, 338 passed, 0 failed, 2 intentionally ignored.
 Все эти модули подключаются только в `#[cfg(test)]` и не участвуют в
 обычном воспроизведении TaSQ.
 
-Stage 4.3a — Sparse Cue Control Bridge — подготовлен в test-only виде.
-Он моделирует атомарные команды управления Cue для будущего Sparse
-Renderer. Проверка на Windows ещё не выполнена; production playback path
-не менялся, а проблема DVS остаётся открытой.
+Stage 4.3a — Sparse Cue Control Bridge — принят после пользовательской
+Windows-проверки Fix1: Reaper acknowledgement test прошёл 20/20 запусков;
+Ownership — 15/15; полная suite — 342 passed, 0 failed, 2 intentionally
+ignored. `cargo check` и `cargo build` прошли. Модули остаются test-only:
+production playback path не менялся. Проблема DVS остаётся открытой.
 
 **Важно о количестве выходов:** 16 destinations — обязательный сценарий
 проверки маршрутизации, а не планируемый программный предел. Искусственный
@@ -191,10 +192,12 @@ and 2 intentionally ignored. `cargo fmt`, `cargo fmt --check`, `cargo check`,
 and `cargo build` succeeded. All these modules are included only in
 `#[cfg(test)]` and do not participate in normal TaSQ playback.
 
-Stage 4.3a — Sparse Cue Control Bridge — has been prepared in test-only
-form. It models atomic Cue control commands for a future Sparse Renderer.
-Windows validation has not yet been performed; the production playback
-path is unchanged and the DVS issue remains open.
+Stage 4.3a — Sparse Cue Control Bridge — was accepted after user-run
+Windows validation of Fix1: the Reaper acknowledgement test passed 20
+runs; Ownership passed 15/15; the full suite reported 342 passed, 0 failed,
+and 2 intentionally ignored. `cargo check` and `cargo build` succeeded.
+The modules remain test-only: the production playback path is unchanged.
+The DVS issue remains open.
 
 **Output-count clarification:** 16 destinations are a mandatory routing
 validation scenario, not an intended software limit. No artificial

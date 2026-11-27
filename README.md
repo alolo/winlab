@@ -65,10 +65,13 @@ ignored. Полная suite: 340 discovered, 338 passed, 0 failed,
 воспроизведения: production Audio Engine и поведение DVS не менялись;
 проблема DVS не считается исправленной.
 
-Начат Stage 4.3a — test-only Sparse Cue Control Bridge. Он проверяет
-атомарное управление Cue для будущей интеграции Sparse Renderer. Этап
-пока не прошёл Windows-проверку, не меняет обычное воспроизведение и не
-является исправлением DVS.
+Stage 4.3a — test-only Sparse Cue Control Bridge — принят после
+пользовательской Windows-проверки Fix1: Reaper acknowledgement test
+прошёл 20/20 последовательных запусков; Ownership — 15/15; полная suite —
+342 passed, 0 failed, 2 intentionally ignored. `cargo check` и
+`cargo build` завершились успешно. Этап проверяет control contract для
+будущего Sparse Renderer, но остаётся test-only: production Audio Engine
+и обычное воспроизведение не менялись. Это не исправление DVS.
 
 **О маршрутизации:** для проектируемого Sparse Mixer 16 выходов —
 обязательный сценарий проверки, а не программный максимум. Искусственное
@@ -191,10 +194,13 @@ succeeded. These stages remain outside normal playback: the production
 Audio Engine and DVS behavior have not changed, and the DVS issue is not
 considered fixed.
 
-Stage 4.3a — the test-only Sparse Cue Control Bridge — has started. It
-validates atomic Cue control for a future Sparse Renderer integration.
-Windows validation is pending. It does not change normal playback and
-does not constitute a DVS fix.
+Stage 4.3a — the test-only Sparse Cue Control Bridge — was accepted
+after user-run Windows validation of Fix1: the Reaper acknowledgement
+test passed 20/20 consecutive runs; Ownership passed 15/15; the full suite
+reported 342 passed, 0 failed, and 2 intentionally ignored. `cargo check`
+and `cargo build` succeeded. The stage validates the control contract for
+a future Sparse Renderer, but remains test-only: the production Audio
+Engine and normal playback were not changed. This is not a DVS fix.
 
 **About routing scalability:** 16 output destinations are a mandatory
 validation scenario for the planned Sparse Mixer, not a software maximum.
